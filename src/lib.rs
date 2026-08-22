@@ -656,14 +656,19 @@ fn plan_replacement(
     let over_resolution =
         eff_dpi_w.max(eff_dpi_h) > target_dpi * dpi_margin && target_w < px_w && target_h < px_h;
 
-    // D-M1 / D-M2 masked-JPEG handling. FlateDecode bases carrying `/SMask`
-    // are deferred to D-M3. For DCTDecode bases:
-    //   - OVER-RESOLUTION pairs are downsampled as a unit (D-M2): base and
-    //     `/SMask` are resampled to the SAME target geometry and replaced
-    //     together (atomic — never one side alone);
-    //   - pairs at/below the target take the dimension-preserving D-M1
+    // D-M1 / D-M2 / D-M3 masked-image handling.
+    //   - DCTDecode bases: OVER-RESOLUTION pairs are downsampled as a unit
+    //     (D-M2): base and `/SMask` are resampled to the SAME target geometry
+    //     and replaced together (atomic — never one side alone); pairs
+    //     at/below the target take the dimension-preserving D-M1
     //     requantization: the base is decoded at its own size, re-encoded at
     //     the configured quality, and the `/SMask` stream is never modified.
+    //   - FlateDecode bases (D-M3): OVER-RESOLUTION pairs take the same
+    //     atomic coupled downsample, with the base going through the
+    //     format-preserving Flate→Flate path; pairs at/below the target are
+    //     left untouched — there is no requantization analogue for lossless
+    //     payloads (that would be a lossy re-encode, which has no consent
+    //     surface yet).
     //
     // Idempotence guard (D-M1, % ported to the D-M2 pair below): requantization
     // is lossy, so re-running it on an already-requantized payload keeps
@@ -674,10 +679,18 @@ fn plan_replacement(
     // churn is 1-4% and decays each pass. This makes optimize(optimize(x)) a
     // no-op in practice without blocking genuine wins.
     if smask_present {
-        if !matches!(class, FilterClass::DctOnly) {
-            return None;
-        }
         let mask_id = smask_id.expect("smask_id is set whenever smask_present");
+        if matches!(class, FilterClass::FlateOnly) {
+            // D-M3: the masked-Flate pair. Only the over-resolution coupled
+            // downsample exists on this branch, gated by the same consent
+            // flag as the unmasked Flate path.
+            if !over_resolution || !options.downsample_flate_images {
+                return None;
+            }
+            return plan_flate_smask_pair_downsample(
+                doc, id, mask_id, stream, px_w, px_h, target_w, target_h,
+            );
+        }
         if over_resolution {
             // The base is over-resolution, so the whole pair earns a
             // downsample. ATOMICITY (hard rule): plan both streams together
@@ -1046,6 +1059,61 @@ fn plan_smask_pair_downsample(
         width: target_w as i64,
         height: target_h as i64,
         dict_update: DictUpdate::Dct, // base keeps its existing form (/Filter, /ColorSpace, ...)
+        smask: Some(MaskReplacement {
+            mask_id,
+            content: mask_out,
+            width: target_w as i64,
+            height: target_h as i64,
+        }),
+    })
+}
+
+/// Phase 5 D-M3: coupled downsampling of an over-resolution FlateDecode base
+/// and its eligible `/SMask` — the same atomicity structure as the D-M2 JPEG
+/// pair, with the base going through the format-preserving Flate→Flate path
+/// (`plan_flate`: same `/ColorSpace`, predictor handling unchanged) instead of
+/// a JPEG re-encode. Both streams are planned together and carried by the
+/// single returned `Replacement` so the apply pass replaces them together.
+/// Any doubt on either side, or a COMBINED size that fails the never-larger /
+/// 5% minimum-savings guard, returns `None` and the whole pair stays untouched.
+#[allow(clippy::too_many_arguments)] // mirrors plan_smask_pair_downsample's flat signature
+fn plan_flate_smask_pair_downsample(
+    doc: &Document,
+    id: ObjectId,
+    mask_id: ObjectId,
+    base_stream: &lopdf::Stream,
+    px_w: u32,
+    px_h: u32,
+    target_w: u32,
+    target_h: u32,
+) -> Option<Replacement> {
+    // Base: the exact eligibility gates and re-encode variants of the unmasked
+    // Flate route (8bpc only, no /Decode, capped inflate + exact length check,
+    // plain-vs-Up-predictor output selection). Flate is lossless, so the
+    // deflate round trip needs no MAD-style decode-back of its own.
+    let (base_out, decode_parms) = plan_flate(doc, base_stream, px_w, px_h, target_w, target_h)?;
+
+    // Mask: decode (JPEG or Flate) + resample to the SAME geometry + Flate
+    // re-encode, verified by its own exact decode-back.
+    let mask_stream = doc.get_object(mask_id).ok()?.as_stream().ok()?;
+    let mask_out = plan_mask_resample(doc, mask_stream, px_w, px_h, target_w, target_h)?;
+
+    // ATOMICITY + idempotence, evaluated over the COMBINED pair — the same
+    // arithmetic as the D-M2 guard (see plan_smask_pair_downsample): the
+    // candidate, including the mask's dict-token overhead, must beat the
+    // pair's original size by the full 5% to replace both streams.
+    let combined_original = base_stream.content.len() + mask_stream.content.len();
+    let combined_candidate = base_out.len() + mask_out.len() + MASK_DICT_OVERHEAD;
+    if combined_candidate * 100 >= combined_original * 95 {
+        return None;
+    }
+
+    Some(Replacement {
+        id,
+        content: base_out,
+        width: target_w as i64,
+        height: target_h as i64,
+        dict_update: DictUpdate::Flate { decode_parms },
         smask: Some(MaskReplacement {
             mask_id,
             content: mask_out,
@@ -2394,24 +2462,8 @@ mod tests {
                     d.set("BitsPerComponent", 16_i64);
                 }),
             ),
-            (
-                "SMask present",
-                build_flate_pdf_with_dict(400, 3, |doc, d| {
-                    let mask = doc.add_object(Stream::new(
-                        dictionary! {
-                            "Type" => "XObject",
-                            "Subtype" => "Image",
-                            "Width" => 400_i64,
-                            "Height" => 400_i64,
-                            "ColorSpace" => "DeviceGray",
-                            "BitsPerComponent" => 8_i64,
-                            "Filter" => "FlateDecode",
-                        },
-                        deflate_level9(&flate_pixels(400, 400, 1)).unwrap(),
-                    ));
-                    d.set("SMask", mask);
-                }),
-            ),
+            // (An eligible "/SMask present" shape used to sit in this list;
+            // since D-M3 it is a POSITIVE case — see the masked-Flate battery.)
             (
                 "/Decode array present",
                 build_flate_pdf_with_dict(400, 3, |_, d| {
@@ -3532,31 +3584,337 @@ mod tests {
         }
     }
 
+    // ---- D-M3: SMask-coupled Flate-base downsampling (Phase 5) -------------
+
+    /// Build a one-page PDF embedding a `px`×`px` FlateDecode RGB noise image
+    /// WITH a plain 8-bit DeviceGray FlateDecode `/SMask`, drawn into a
+    /// `draw_pts` square — the D-M3 positive fixture shape (noise, so the
+    /// downsampled re-encode is reliably smaller; see `flate_pixels`).
+    fn build_pdf_smask_flate(px: u32, draw_pts: i64) -> Vec<u8> {
+        let base = flate_pixels(px, px, 3);
+        let mask = flate_pixels(px, px, 1);
+        build_pdf_smask_flate_ext(px, draw_pts, &base, &mask, |_| {}, |_| {})
+    }
+
+    /// The same, with explicit raw pixel buffers and `base_mutate`/`mask_mutate`
+    /// dict hooks — for the combined-guard and skip cases.
+    fn build_pdf_smask_flate_ext(
+        px: u32,
+        draw_pts: i64,
+        base_raw: &[u8],
+        mask_raw: &[u8],
+        base_mutate: impl FnOnce(&mut lopdf::Dictionary),
+        mask_mutate: impl FnOnce(&mut lopdf::Dictionary),
+    ) -> Vec<u8> {
+        let mut doc = Document::with_version("1.5");
+        let mask_id = doc.add_object(Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Image",
+                "Width" => px as i64,
+                "Height" => px as i64,
+                "ColorSpace" => "DeviceGray",
+                "BitsPerComponent" => 8_i64,
+                "Filter" => "FlateDecode",
+            },
+            deflate_level9(mask_raw).unwrap(),
+        ));
+        if let Ok(Object::Stream(s)) = doc.get_object_mut(mask_id) {
+            mask_mutate(&mut s.dict);
+        }
+        let img_id = doc.add_object(Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Image",
+                "Width" => px as i64,
+                "Height" => px as i64,
+                "ColorSpace" => "DeviceRGB",
+                "BitsPerComponent" => 8_i64,
+                "Filter" => "FlateDecode",
+                "SMask" => mask_id,
+            },
+            deflate_level9(base_raw).unwrap(),
+        ));
+        if let Ok(Object::Stream(s)) = doc.get_object_mut(img_id) {
+            base_mutate(&mut s.dict);
+        }
+        wrap_image_pdf(&mut doc, img_id, draw_pts)
+    }
+
+    /// A `px`-square checkerboard with `cell`-pixel cells: perfectly periodic
+    /// input that deflates to almost nothing, while its Lanczos-downsampled
+    /// counterpart (non-integer scale → aperiodic anti-aliased edges) deflates
+    /// far worse — reliably tripping the combined never-larger/5% guard.
+    fn checkerboard_pixels(px: u32, cell: u32, channels: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(px as usize * px as usize * channels);
+        for y in 0..px {
+            for x in 0..px {
+                let v = if ((x / cell) + (y / cell)).is_multiple_of(2) {
+                    0u8
+                } else {
+                    255u8
+                };
+                out.extend(std::iter::repeat_n(v, channels));
+            }
+        }
+        out
+    }
+
     #[test]
-    fn masked_flate_base_is_deferred_to_dm3() {
-        // A FlateDecode base carrying the SAME eligible SMask shape: D-M1 only
-        // opens eligibility for DCTDecode bases; the Flate counterpart is the
-        // future D-M3 milestone. Whole image untouched.
-        let pdf = build_flate_pdf_with_dict(400, 3, |doc, d| {
-            let mask = doc.add_object(Stream::new(
-                dictionary! {
-                    "Type" => "XObject",
-                    "Subtype" => "Image",
-                    "Width" => 400_i64,
-                    "Height" => 400_i64,
-                    "ColorSpace" => "DeviceGray",
-                    "BitsPerComponent" => 8_i64,
-                    "Filter" => "FlateDecode",
-                },
-                deflate_level9(&flate_pixels(400, 400, 1)).unwrap(),
-            ));
-            d.set("SMask", mask);
-        });
+    fn smask_flate_pair_downsamples_atomically_dimensions_identical() {
+        // Positive D-M3 case: a 400px FlateDecode RGB base with a plain 8-bit
+        // DeviceGray Flate /SMask drawn at 100 pt (≈288 DPI, over-resolution).
+        // Both streams must land at the SAME target geometry (181 px at the
+        // default 130 DPI), the base must still be FlateDecode (format
+        // preserved), and the /SMask reference must stay intact.
+        let pdf = build_pdf_smask_flate(400, 100);
+        let (base_before, iw, ih, smask_before) = smask_base_info(&pdf);
+        let mask_before = smask_stream_bytes(&pdf, smask_before);
+        assert_eq!((iw, ih), (400, 400), "fixture base must be 400x400");
+
+        let out = optimize(&pdf);
+
+        assert!(out.len() < pdf.len(), "downsampled output must be smaller");
+        let (base_after, aw, ah, smask_after) = smask_base_info(&out);
+        assert_eq!((aw, ah), (181, 181), "base must land at the 130-DPI target");
+        assert_ne!(base_after, base_before, "the base must be re-encoded");
+        assert_eq!(
+            smask_after, smask_before,
+            "/SMask reference must stay intact"
+        );
+        assert_ne!(
+            smask_stream_bytes(&out, smask_after),
+            mask_before,
+            "the mask must be re-encoded alongside the base"
+        );
+        let doc = Document::load_mem(&out).unwrap();
+        let mask_dict = &doc
+            .get_object(smask_after)
+            .unwrap()
+            .as_stream()
+            .unwrap()
+            .dict;
+        assert_eq!(
+            (
+                mask_dict.get(b"Width").unwrap().as_i64().unwrap(),
+                mask_dict.get(b"Height").unwrap().as_i64().unwrap(),
+            ),
+            (aw, ah),
+            "mask geometry must be identical to the base's (the unit rule)"
+        );
+        for obj in doc.objects.values() {
+            if let Object::Stream(s) = obj {
+                if s.dict.get(b"SMask").is_ok() {
+                    assert!(
+                        matches!(s.dict.get(b"Filter"), Ok(Object::Name(n)) if n == b"FlateDecode"),
+                        "base must remain FlateDecode (format-preserving path)"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn smask_flate_under_resolution_pair_is_untouched() {
+        // 400px drawn at 240 pt ≈ 120 DPI — inside the threshold. There is no
+        // requantization analogue for lossless Flate bases in D-M3, so the
+        // pair must come back byte-for-byte.
+        let pdf = build_pdf_smask_flate(400, 240);
         let out = optimize(&pdf);
         assert_eq!(
             out, pdf,
-            "masked Flate images are D-M3, must stay untouched"
+            "under-resolution masked Flate pair must be untouched"
         );
+    }
+
+    #[test]
+    fn corrupt_masked_flate_streams_return_exact_original_bytes() {
+        // Atomicity under corruption: truncating EITHER half of the pair must
+        // return the exact input bytes — never a one-sided replacement.
+        for corrupt_mask in [false, true] {
+            let mut doc = Document::load_mem(&build_pdf_smask_flate(400, 100)).unwrap();
+            for obj in doc.objects.values_mut() {
+                if let Object::Stream(s) = obj {
+                    // The base carries /SMask; the mask is the image without it.
+                    if matches!(s.dict.get(b"Subtype"), Ok(Object::Name(n)) if n == b"Image")
+                        && s.dict.get(b"SMask").is_ok() != corrupt_mask
+                    {
+                        let half = s.content.len() / 2;
+                        let truncated = s.content[..half].to_vec();
+                        s.set_content(truncated);
+                    }
+                }
+            }
+            let mut input: Vec<u8> = Vec::new();
+            doc.save_to(&mut input).unwrap();
+            let out = optimize(&input);
+            assert_eq!(
+                out,
+                input,
+                "corrupt {} must return original bytes for the whole pair",
+                if corrupt_mask { "mask" } else { "base" }
+            );
+        }
+    }
+
+    #[test]
+    fn smask_flate_combined_guard_skips_never_larger_pair() {
+        // A periodic checkerboard deflates to almost nothing, but its
+        // downsampled (aperiodic, anti-aliased) counterpart deflates far
+        // worse: the combined candidate cannot beat the pair's original size
+        // by 5%, so the guard must skip the whole pair byte-for-byte.
+        let base = checkerboard_pixels(400, 8, 3);
+        let mask = checkerboard_pixels(400, 8, 1);
+        let pdf = build_pdf_smask_flate_ext(400, 100, &base, &mask, |_| {}, |_| {});
+        let out = optimize(&pdf);
+        assert_eq!(out, pdf, "never-larger pair must be skipped atomically");
+    }
+
+    #[test]
+    fn smask_flate_optimize_is_idempotent() {
+        // First pass: coupled downsample to 181 px. Second pass: the pair sits
+        // at ~130 DPI (inside the margin) and Flate has no dimension-preserving
+        // transform, so nothing is planned — byte-stable.
+        let pdf = build_pdf_smask_flate(400, 100);
+        let once = optimize(&pdf);
+        assert!(once.len() < pdf.len(), "first pass must shrink");
+        let twice = optimize(&once);
+        assert_eq!(twice, once, "second pass must be byte-stable");
+    }
+
+    #[test]
+    fn shared_smask_flate_pair_is_never_resized() {
+        // Two DIFFERENT Flate bases referencing one /SMask id: the refcount
+        // guard in eligible_smask must disqualify both pairs (resizing the
+        // shared mask for one base's geometry would break the other's).
+        let mut doc = Document::load_mem(&build_pdf_smask_flate(400, 100)).unwrap();
+        let (img_a_id, mask_a) = doc
+            .objects
+            .iter()
+            .find_map(|(id, obj)| match obj {
+                Object::Stream(s)
+                    if matches!(
+                        s.dict.get(b"Subtype"),
+                        Ok(Object::Name(n)) if n == b"Image"
+                    ) && s.dict.get(b"SMask").is_ok() =>
+                {
+                    let mask = match s.dict.get(b"SMask").unwrap() {
+                        Object::Reference(r) => *r,
+                        _ => panic!("fixture uses direct refs"),
+                    };
+                    Some((*id, mask))
+                }
+                _ => None,
+            })
+            .expect("fixture has one masked image");
+        // Different pixels, so dedup does not merge the BASES.
+        let mut raw_b = flate_pixels(400, 400, 3);
+        for b in &mut raw_b {
+            *b = !*b;
+        }
+        let img_b_id = doc.add_object(Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Image",
+                "Width" => 400_i64,
+                "Height" => 400_i64,
+                "ColorSpace" => "DeviceRGB",
+                "BitsPerComponent" => 8_i64,
+                "Filter" => "FlateDecode",
+                "SMask" => mask_a,
+            },
+            deflate_level9(&raw_b).unwrap(),
+        ));
+        let content_id = doc.add_object(Stream::new(
+            dictionary! {},
+            b"q 100 0 0 100 0 0 cm /Im0 Do Q q 100 0 0 100 150 0 cm /Im1 Do Q".to_vec(),
+        ));
+        let page_resources = dictionary! {
+            "XObject" => dictionary! {
+                "Im0" => Object::Reference(img_a_id),
+                "Im1" => Object::Reference(img_b_id),
+            },
+        };
+        for obj in doc.objects.values_mut() {
+            if let Object::Dictionary(d) = obj {
+                if matches!(
+                    d.get(b"Type").map(|t| t.as_name()),
+                    Ok(Ok(name)) if name == b"Page"
+                ) {
+                    d.set("Resources", page_resources.clone());
+                    d.set("Contents", Object::Reference(content_id));
+                }
+            }
+        }
+        let mut input: Vec<u8> = Vec::new();
+        doc.save_to(&mut input).unwrap();
+
+        let out = optimize(&input);
+        assert_eq!(out.len(), input.len(), "shared-mask pairs must not change");
+    }
+
+    #[test]
+    fn smask_flate_matte_and_stencil_are_skipped() {
+        // The D-M1 skip rules carry over unchanged to Flate bases: /Matte on
+        // either side of the pair, and an /ImageMask stencil as the /SMask,
+        // all leave the pair byte-for-byte untouched.
+        let base = flate_pixels(400, 400, 3);
+        let mask = flate_pixels(400, 400, 1);
+        let cases: Vec<(&str, Vec<u8>)> = vec![
+            (
+                "/Matte on the mask",
+                build_pdf_smask_flate_ext(
+                    400,
+                    100,
+                    &base,
+                    &mask,
+                    |_| {},
+                    |m| {
+                        m.set("Matte", vec![23.into(), 128.into(), 240.into()]);
+                    },
+                ),
+            ),
+            (
+                "/Matte on the base",
+                build_pdf_smask_flate_ext(
+                    400,
+                    100,
+                    &base,
+                    &mask,
+                    |b| {
+                        b.set("Matte", vec![23.into(), 128.into(), 240.into()]);
+                    },
+                    |_| {},
+                ),
+            ),
+            (
+                "/ImageMask stencil as the /SMask",
+                build_pdf_smask_flate_ext(
+                    400,
+                    100,
+                    &base,
+                    &mask,
+                    |_| {},
+                    |m| {
+                        m.set("ImageMask", Object::Boolean(true));
+                    },
+                ),
+            ),
+        ];
+        for (label, pdf) in cases {
+            let out = optimize(&pdf);
+            assert_eq!(out, pdf, "{label}: must leave the masked pair untouched");
+        }
+    }
+
+    #[test]
+    fn downsample_flate_images_off_leaves_masked_pair_untouched() {
+        // The masked-Flate coupled downsample honors the same consent flag as
+        // the unmasked Flate path.
+        let pdf = build_pdf_smask_flate(400, 100);
+        let opts = OptimizeOptions::default().with_downsample_flate_images(false);
+        let out = optimize_with_options(&pdf, opts);
+        assert_eq!(out, pdf, "flag off must leave the masked pair untouched");
     }
 
     #[test]
