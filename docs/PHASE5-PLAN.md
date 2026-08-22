@@ -134,6 +134,24 @@ Currently skipped (src/lib.rs:633 M1 scope note). GS re-encodes these too.
 Palette-preserving downsample requires nearest-palette mapping — nontrivial
 color science, do only after D-M1..3 land and re-measure.
 
+**D-M4 CLOSED WITHOUT IMPLEMENTATION** (2026-08-22 re-measurement): the plan's
+own gate ("do only after D-M1..3 land and re-measure") was applied and the
+measured pool is empty. Census of every real corpus on hand — the 16.8 MB NASA
+report (original AND amatl-optimized), both watch-repair one-pagers, the amatl
+fixture, and Ghostscript's own outputs — found ZERO `/Indexed` images and
+zero non-8-bit-per-component images. The palette images seen in earlier
+`pdfimages -list` output were Ghostscript's *output* conversions (26 gray→
+indexed streams totaling ~15 KB), never inputs. Building nearest-palette
+resampling for a class that does not occur in any observed document would be
+unmeasured complexity; if a palette-heavy corpus ever shows up, reopen with
+that corpus as the benchmark.
+
+Where the remaining gap to Ghostscript actually lives (amatl 5.55 MB output
+census): FlateDecode images 2.54 MB (122 streams, already at 130 DPI,
+lossless-by-contract) + JPEG 2.12 MB + fonts/structure 0.64 MB. GS's edge is
+its conversion of lossless image payloads to JPEG — exactly the consent-gated
+`allow_lossy_reencode` surface reserved as a separate future milestone.
+
 ## Explicitly out of scope (unchanged commitments)
 
 - Symbol-mode JBIG2, perceptual quantization tricks: permanently out.
