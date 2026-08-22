@@ -49,9 +49,10 @@ exported bitmaps, lossless scans — the PNG-like class) are downsampled by
 default too, *in the same format*: decoded (including PNG predictors), resized
 with Lanczos3, and re-deflated at maximum compression, with `/ColorSpace`
 untouched. Because the format never changes, no JPEG ringing is ever
-introduced on the flat-color/line-art content Flate typically holds. Callers
-who need the previous behavior can opt out with
-`with_downsample_flate_images(false)`.
+introduced on the flat-color/line-art content Flate typically holds. Flate
+images run through the same effective-DPI placement analysis as JPEGs, under
+the same never-larger / never-corrupt contract. Callers who need the previous
+behavior can opt out with `with_downsample_flate_images(false)`.
 
 [mozjpeg]: https://github.com/mozilla/mozjpeg
 
@@ -96,6 +97,13 @@ opt-in for callers who know their audience (it buys roughly 18 percentage
 points of additional reduction on structure-heavy documents, and degrades the
 file from tagged to untagged).
 
+**Amatl will never lossy-symbol-encode your scans.** Symbol-mode JBIG2 — the
+encoding behind the Xerox scanner scandal, where visually plausible character
+substitution silently turned 6s into 8s in scanned documents — is permanently
+out of scope, as a commitment rather than a missing feature. Any future
+bitonal recompression work is restricted to lossless encodings whose output
+can be verified by exact decode-back comparison.
+
 ## Measured results
 
 On the committed synthetic fixture (`fixtures/sample.pdf`, four pages as of
@@ -103,6 +111,9 @@ On the committed synthetic fixture (`fixtures/sample.pdf`, four pages as of
 `scripts/bench-vs-gs.sh`): amatl (strip, no packing) takes 662,107 bytes to
 123,948 bytes (**18% of input**), downsampling the over-resolution JPEG *and*
 Flate images while leaving both under-resolution pages byte-for-byte alone.
+(The Ghostscript comparison against this four-page fixture is pending
+re-measurement; the table below was measured against the previous fixture and
+the two must not be mixed.)
 
 On the previous JPEG-only two-page fixture (Ghostscript 10.07.1 at mirrored
 settings — 130 DPI, 1.15 threshold, DCTEncode QFactor 0.4):
@@ -115,10 +126,16 @@ settings — 130 DPI, 1.15 threshold, DCTEncode QFactor 0.4):
 
 On a public real-world document —
 [NASA TM-20210010291](https://ntrs.nasa.gov/citations/20210010291), a 16.8 MB
-technical report — amatl (strip, no packing) takes 16,804,107 bytes to
-12,685,614 bytes, a 24.5% reduction. Much of that document's image payload is
-already near the target DPI, so amatl conservatively leaves it alone — the
-fail-safe side of the contract, shown honestly.
+58-page technical report — amatl 0.2.0 (strip, no packing) takes 16,804,107
+bytes to 11,353,517 bytes, a 32% reduction (0.1.x, JPEG-only, managed 24.5%
+on the same file). Ghostscript 10.07.1 (`/ebook` with
+`-dDetectDuplicateImages=true`) takes the same file to 4,931,402 bytes —
+clearly ahead on raw ratio for this corpus. Most of that gap is Ghostscript's
+willingness to re-encode lossless images as JPEG (an artifact-class change
+amatl treats as a future explicit opt-in, not a default), plus font
+subsetting and structural micro-optimization. Shown honestly: on
+scan-heavy/lossless-image corpora, Ghostscript currently wins on ratio; amatl
+wins on the contract, the license, and the security surface.
 
 On a real-world retail promotion flyer (1,376 KB, image-heavy, ~2,000
 structure-tree objects) — **from a private corpus, not redistributable**:
@@ -147,9 +164,13 @@ Amatl exists because shelling out to `gs` was evaluated and rejected:
   wrapped in a fail-safe boundary, not a PostScript interpreter.
 - **Bundling cost.** Portable static `gs` builds and per-platform signing are
   an ongoing tax. Amatl is a Cargo dependency with no runtime dependencies.
-- **Marginal upside.** With images already matched byte-for-byte, Ghostscript's
-  remaining ~3-4 point advantage on typical image-heavy documents is structural
-  micro-optimization — not worth AGPL + an RCE surface + bundling.
+- **Marginal upside on the target corpus.** With JPEG payloads already matched
+  byte-for-byte, Ghostscript's remaining ~3-4 point advantage on
+  JPEG-dominated business documents is structural micro-optimization — not
+  worth AGPL + an RCE surface + bundling. (On lossless-image-heavy corpora
+  Ghostscript's ratio lead is real and larger — see the NASA numbers above —
+  because it converts those images to JPEG by default, a trade amatl only
+  ever makes as an explicit opt-in.)
 
 ## Scope
 
@@ -163,6 +184,16 @@ untouched. It does not (yet) recompress `CCITT`/`JBIG2` images or subset
 fonts — on text-heavy PDFs with no large images it will honestly do very
 little, and by contract it returns the input unchanged rather than a worse
 file.
+
+On fonts, two limitations are permanent by design, not roadmap gaps:
+**simple-font (non-Type0) subsetting is out of scope** — subsetting a simple
+TrueType or Type1 font would require converting it to Type0 and rewriting
+every text-show string in the document, which is exactly the
+"silently rewrote your text wrong" bug class amatl refuses to ship — and
+**predefined CJK CMaps** (`UniGB-UCS2-H` and friends) are unsupported, since
+supporting them means bundling megabytes of Adobe mapping tables for a
+shrinking legacy corpus. In both cases the affected fonts are left entirely
+untouched and the output is always a valid PDF.
 
 ## Maintenance notes & constraints
 
