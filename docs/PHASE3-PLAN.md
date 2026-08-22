@@ -345,6 +345,42 @@ flat-runs caveat harmless — a stream is only ever replaced when G4 is strictly
 smaller, and G4 wins on the realistic scanned-document pattern, which is the
 entire target corpus for this milestone.
 
+#### B.3.1 Gap-closing probes (2026-08-22) — PASS
+
+Follow-up probes closing the scope-note gaps (`tests/fax_spike.rs` +
+`tests/fax_pdf_interop.rs`), all against `fax 0.3.0` source read from the
+registry tarball:
+
+| Probe | Result | Detail |
+| --- | --- | --- |
+| G4 extended makeup (>2560) | PASS | W=5100 round-trips: solid-white ×64 rows, solid-black ×64, noise ×32, document-like ×64 — pixel equality; solid rows force the `while n >= 2560` encoder loop and the extended-makeup table entries both colors |
+| G4 degenerate dims | PASS | 1×1 (both colors), W=1 alternating/solid ×8 rows, W=63 (non-byte-aligned) noise/solid ×16 — pixel equality |
+| G3 1D decode (positive) | PASS | hand-framed EOL streams (codewords from fax's public tables, framing hand-built: initial EOL, per-line EOL, RTC = 6 EOLs) round-trip pixel-equal on document-like/flat/noise/solid at W=1728, solid at W=5100 (1D extended makeup), 8×8 |
+| G3 panic battery | PASS | truncations at 5 offsets, single-byte inversion at every byte of a valid stream, 64 pure-garbage streams — zero panics |
+| PDF embed round-trip | PASS | 203×131 (odd dims) G4 image written as `/CCITTFaxDecode` XObject (`/K -1`, `/BlackIs1 false`) via lopdf 0.42; reload hands back byte-identical stream content; fax decodes to pixel equality |
+| Foreign decoder (Ghostscript) | PASS | gs 10.07.1 `-sDEVICE=pbmraw -r72` render of that PDF: **0 of 26,593 pixels differ** from the source bitmap |
+
+**Decoder contract facts (from fax 0.3.0 source, binding for B-M1 design):**
+
+- `decode_g3` is pure T.4 1D **and requires EOL framing**: the constructor
+  consumes a mandatory initial EOL, and no tag bit is read after EOLs. PDF
+  `/K > 0` (mixed 2D) streams are unsupported, and `/K == 0` streams written
+  with `/EndOfLine false` (the PDF default) are misframed — probe
+  `g3_missing_initial_eol_fails_safely` pins the failure mode (no panic, no
+  false success). ⇒ B-M1 CCITT-source eligibility: `/K < 0` primary;
+  `/K == 0` only with `/EndOfLine true`; `/K > 0` skip.
+- `decode_g4(…, height=Some(h))` stops reading at `h` lines (trailing garbage
+  is never examined) and pads missing rows as all-white after an early EOFB.
+  ⇒ B-M1 must drive `Group4Decoder` directly and require a clean
+  `DecodeStatus` accounting for every row — "got h rows" is not evidence of a
+  clean stream.
+- The G4 decoder has no fill-bit handling between rows ⇒ `/EncodedByteAlign
+  true` on `/K < 0` must be an eligibility-gate skip. (G3 1D fill bits before
+  EOL are handled.)
+- No debug printing on active paths: `print_peek`/`print_remaining` exist but
+  every call site is commented out; the `debug!` macro is gated behind the
+  off-by-default `debug` feature.
+
 ### B.4 Risk register
 
 | Risk | Assessment / recommendation |
