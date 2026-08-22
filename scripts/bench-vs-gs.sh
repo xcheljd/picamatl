@@ -30,8 +30,9 @@
 # Measured baseline (2026-08-21, 4-page fixtures/sample.pdf with Flate pages):
 #   input:  662107 bytes
 #   amatl:  123948 bytes (18% of input)
-#   gs:     re-measure with `scripts/bench-vs-gs.sh` (not runnable in the
-#           sandboxed session that regenerated the fixture)
+#   gs:      71742 bytes (11% of input; gs 10.07.1 — its forced DCTEncode
+#            converts the Flate noise pages to JPEG, which amatl refuses by
+#            design, so the gap overstates typical documents)
 #
 # Previous 2-page JPEG-only fixture (gs 10.07.1): 193668 -> amatl 27087 (13%),
 # gs 43722 (22%).

@@ -111,9 +111,11 @@ On the committed synthetic fixture (`fixtures/sample.pdf`, four pages as of
 `scripts/bench-vs-gs.sh`): amatl (strip, no packing) takes 662,107 bytes to
 123,948 bytes (**18% of input**), downsampling the over-resolution JPEG *and*
 Flate images while leaving both under-resolution pages byte-for-byte alone.
-(The Ghostscript comparison against this four-page fixture is pending
-re-measurement; the table below was measured against the previous fixture and
-the two must not be mixed.)
+Ghostscript 10.07.1 at the same mirrored settings takes the four-page fixture
+to 71,742 bytes (11%): its forced `DCTEncode` re-encodes the two Flate pages
+as JPEG, and the fixture's Flate content is synthetic noise — the class JPEG
+compresses best and Flate compresses worst — so the gap overstates the
+typical case. Amatl keeps Flate images Flate by design (see Scope).
 
 On the previous JPEG-only two-page fixture (Ghostscript 10.07.1 at mirrored
 settings — 130 DPI, 1.15 threshold, DCTEncode QFactor 0.4):
@@ -180,10 +182,21 @@ path), and — since 0.2.0 — 8-bit `FlateDecode` raster images in
 DeviceRGB/DeviceGray/ICCBased(N=1,3), downsampled in place with the format and
 color space preserved. Flate images that are Indexed, 1/2/4/16-bit,
 soft-masked, `/Decode`-remapped, or TIFF-predicted are deliberately left
-untouched. It does not (yet) recompress `CCITT`/`JBIG2` images or subset
-fonts — on text-heavy PDFs with no large images it will honestly do very
-little, and by contract it returns the input unchanged rather than a worse
-file.
+untouched. It does not (yet) recompress `CCITT`/`JBIG2` images. On
+text-heavy PDFs with default options it will honestly do very little, and by
+contract it returns the input unchanged rather than a worse file.
+
+Since 0.3.0 (unreleased), embedded Type0/CIDFontType2 (Identity-H/V) fonts
+can be subset to the glyphs actually shown via the opt-in
+`with_subset_fonts(true)`. The implementation replaces only `/FontFile2` and
+`/CIDToGIDMap` (as an old-CID → new-GID stream), so content-stream text
+bytes are never rewritten, `/W`/`/DW`/`/ToUnicode` stay untouched, and text
+extraction is bit-identical pre/post — the "rewrote your text wrong" bug
+class is structurally impossible. Any parse uncertainty anywhere disables
+subsetting for the affected font or the whole document; PDF/A-declared and
+encrypted documents are skipped. The flag stays opt-in until it has soaked
+against real corpora (Ghostscript subsets by default; default-ON is the
+explicit target).
 
 On fonts, two limitations are permanent by design, not roadmap gaps:
 **simple-font (non-Type0) subsetting is out of scope** — subsetting a simple
