@@ -186,7 +186,7 @@ untouched. It does not (yet) recompress `CCITT`/`JBIG2` images. On
 text-heavy PDFs with default options it will honestly do very little, and by
 contract it returns the input unchanged rather than a worse file.
 
-Since 0.3.0 (unreleased), embedded Type0/CIDFontType2 (Identity-H/V) fonts
+Since 0.2.1, embedded Type0/CIDFontType2 (Identity-H/V) fonts
 can be subset to the glyphs actually shown via the opt-in
 `with_subset_fonts(true)`. The implementation replaces only `/FontFile2` and
 `/CIDToGIDMap` (as an old-CID → new-GID stream), so content-stream text
