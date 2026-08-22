@@ -99,6 +99,13 @@ On the committed synthetic fixture (`fixtures/sample.pdf`, reproducible via
 | **amatl** (strip, no packing) | **27,087** | **13%** |
 | Ghostscript pdfwrite | 43,722 | 22% |
 
+On a public real-world document —
+[NASA TM-20210010291](https://ntrs.nasa.gov/citations/20210010291), a 16.8 MB
+technical report — amatl (strip, no packing) takes 16,804,107 bytes to
+12,685,614 bytes, a 24.5% reduction. Much of that document's image payload is
+already near the target DPI, so amatl conservatively leaves it alone — the
+fail-safe side of the contract, shown honestly.
+
 On a real-world retail promotion flyer (1,376 KB, image-heavy, ~2,000
 structure-tree objects) — **from a private corpus, not redistributable**:
 
