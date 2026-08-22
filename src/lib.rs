@@ -32,6 +32,7 @@
 //!   - A re-encode that isn't smaller is discarded.
 //!   - Any failure (parse, decode, save) falls back to the original bytes.
 
+mod bitonal;
 mod fonts;
 
 use std::collections::HashMap;
@@ -124,6 +125,18 @@ pub struct OptimizeOptions {
     /// always valid. PDF/A-declared and encrypted documents are skipped.
     /// Default: `false` (opt-in for at least one release cycle).
     pub subset_fonts: bool,
+
+    /// Losslessly recompress bitonal (1-bit) images to CCITT G4: CCITT-stored
+    /// sources (G4 `/K -1`, or EOL-framed G3 `/K 0` with `/EndOfLine true`)
+    /// and Flate-stored 1-bit images. Pixels are never resampled and
+    /// `/Width`/`/Height` never change; `/BlackIs1` polarity is normalized at
+    /// the sample level so rendered output is bit-identical. A stream is
+    /// replaced only when the G4 payload is strictly smaller AND a decode-back
+    /// pass reproduces the source samples exactly; every parse or parameter
+    /// doubt (`/EncodedByteAlign true`, `/K > 0`, non-identity `/Decode`, …)
+    /// leaves the image untouched. Default: `false` (opt-in for at least one
+    /// release cycle).
+    pub recompress_bitonal_images: bool,
 }
 
 /// Written by hand, NOT derived: a derived `Default` would zero the numeric
@@ -140,6 +153,7 @@ impl Default for OptimizeOptions {
             pack_object_streams: false,
             downsample_flate_images: true,
             subset_fonts: false,
+            recompress_bitonal_images: false,
         }
     }
 }
@@ -197,6 +211,14 @@ impl OptimizeOptions {
     #[must_use]
     pub fn with_subset_fonts(mut self, subset: bool) -> Self {
         self.subset_fonts = subset;
+        self
+    }
+
+    /// Enable/disable lossless G4 recompression of bitonal images
+    /// (off by default). See [`OptimizeOptions::recompress_bitonal_images`].
+    #[must_use]
+    pub fn with_recompress_bitonal_images(mut self, recompress: bool) -> Self {
+        self.recompress_bitonal_images = recompress;
         self
     }
 }
@@ -427,16 +449,20 @@ struct Replacement {
     dict_update: DictUpdate,
 }
 
-/// The single-filter classes `plan_replacement` knows how to re-encode.
+/// The single-filter classes the re-encode paths know how to handle.
+/// `plan_replacement` (downsampling) consumes Dct/Flate; the lossless bitonal
+/// pass (`bitonal::plan_bitonal_recompressions`) consumes Ccitt/Flate.
 enum FilterClass {
     DctOnly,
     FlateOnly,
+    CcittOnly,
     Other,
 }
 
 /// Classify a stream's `/Filter`: exactly DCTDecode (raw JPEG payload),
-/// exactly FlateDecode (deflated raster data), or anything else (untouched).
-/// Both the scalar-name and one-element-array forms are recognized.
+/// exactly FlateDecode (deflated raster data), exactly CCITTFaxDecode (raw
+/// CCITT bitstream), or anything else (untouched). Both the scalar-name and
+/// one-element-array forms are recognized.
 fn classify_filter(doc: &Document, filter: &Object) -> FilterClass {
     let name = match resolve(doc, filter) {
         Object::Name(n) => n.as_slice(),
@@ -449,6 +475,7 @@ fn classify_filter(doc: &Document, filter: &Object) -> FilterClass {
     match name {
         b"DCTDecode" => FilterClass::DctOnly,
         b"FlateDecode" => FilterClass::FlateOnly,
+        b"CCITTFaxDecode" => FilterClass::CcittOnly,
         _ => FilterClass::Other,
     }
 }
@@ -487,7 +514,9 @@ fn plan_replacement(
     }
     let filter = dict.get(b"Filter").ok()?;
     let class = classify_filter(doc, filter);
-    if matches!(class, FilterClass::Other) {
+    // CCITT streams are bitonal: never resampled here (quality trap — plan §B).
+    // Their lossless G4 recompression lives in the dedicated bitonal pass.
+    if matches!(class, FilterClass::Other | FilterClass::CcittOnly) {
         return None;
     }
 
@@ -527,7 +556,7 @@ fn plan_replacement(
             let (out, decode_parms) = plan_flate(doc, stream, px_w, px_h, target_w, target_h)?;
             (out, DictUpdate::Flate { decode_parms })
         }
-        FilterClass::Other => return None,
+        FilterClass::CcittOnly | FilterClass::Other => return None,
     };
 
     if out.len() >= stream.content.len() {
@@ -1143,6 +1172,16 @@ fn try_optimize(input: &[u8], options: OptimizeOptions) -> Result<Option<Vec<u8>
         Vec::new()
     };
 
+    // Plan lossless bitonal→G4 recompression (read-only; empty when the
+    // option is off or nothing qualified). No overlap with `replacements`:
+    // the downsample paths require 8-bit samples or DCT payloads, the bitonal
+    // pass requires 1-bit ones.
+    let bitonal_plans = if options.recompress_bitonal_images {
+        bitonal::plan_bitonal_recompressions(&doc)
+    } else {
+        Vec::new()
+    };
+
     // If we have no work to do at all, hand back the original bytes.
     // Note: pack_object_streams alone is not sufficient reason to write a new
     // file — packing only helps when there are objects to pack, and the
@@ -1152,6 +1191,7 @@ fn try_optimize(input: &[u8], options: OptimizeOptions) -> Result<Option<Vec<u8>
     // throw away a real size win.
     if replacements.is_empty()
         && font_plans.is_empty()
+        && bitonal_plans.is_empty()
         && !options.strip_accessibility
         && !merged_streams
     {
@@ -1176,6 +1216,26 @@ fn try_optimize(input: &[u8], options: OptimizeOptions) -> Result<Option<Vec<u8>
                     }
                 }
             }
+        }
+    }
+
+    // Apply bitonal replacements: new G4 payload plus normalized filter and
+    // parms. `/Width`/`/Height` are untouched — the transform never resamples.
+    for r in bitonal_plans {
+        if let Ok(Object::Stream(stream)) = doc.get_object_mut(r.id) {
+            stream.set_content(r.content);
+            stream
+                .dict
+                .set("Filter", Object::Name(b"CCITTFaxDecode".to_vec()));
+            stream.dict.set(
+                "DecodeParms",
+                Object::Dictionary(dictionary! {
+                    "K" => -1_i64,
+                    "Columns" => r.columns,
+                    "Rows" => r.rows,
+                    "BlackIs1" => false,
+                }),
+            );
         }
     }
 
@@ -2159,6 +2219,10 @@ mod tests {
             "Flate downsampling is default-ON (0.2.0)"
         );
         assert!(!d.subset_fonts, "font subsetting is opt-in (decision #3)");
+        assert!(
+            !d.recompress_bitonal_images,
+            "bitonal G4 recompression is opt-in (B-M1)"
+        );
     }
 
     #[test]
@@ -2170,7 +2234,8 @@ mod tests {
             .with_strip_accessibility(true)
             .with_pack_object_streams(true)
             .with_downsample_flate_images(false)
-            .with_subset_fonts(true);
+            .with_subset_fonts(true)
+            .with_recompress_bitonal_images(true);
         assert_eq!(o.target_dpi, 96.0);
         assert_eq!(o.jpeg_quality, 60);
         assert_eq!(o.dpi_margin, 1.5);
@@ -2178,6 +2243,7 @@ mod tests {
         assert!(o.pack_object_streams);
         assert!(!o.downsample_flate_images);
         assert!(o.subset_fonts);
+        assert!(o.recompress_bitonal_images);
     }
 
     #[test]

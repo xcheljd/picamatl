@@ -34,9 +34,12 @@ rayon = "1"
 # (rustc-hash); the `variable-fonts` feature (skrifa & co.) is deliberately
 # off — variable fonts then fail subsetting and are skipped, fail-safe.
 subsetter = { version = "0.2.6", default-features = false }
+# CCITT G3/G4 codec for lossless bitonal image recompression (B-M1). Vetted in
+# docs/PHASE3-PLAN.md §B.3: MIT, #![deny(unsafe_code)], rust-version 1.71,
+# zero transitive dependencies.
+fax = "0.3.0"
 
 [dev-dependencies]
-fax = "0.3.0"
 # Test-only verification oracle for the font-subsetting path: per-glyph
 # outline + advance equality between the original and subset font programs.
 # Never a runtime dependency.
