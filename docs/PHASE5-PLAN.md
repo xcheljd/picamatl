@@ -56,6 +56,18 @@ Why first: zero geometric risk, attacks 9.16 MB on the reference corpus.
 Estimated saving at q78 on already-q75-ish NASA scans: modest per-image (~10-
 20%), but it also unlocks...
 
+**D-M1 SHIPPED** (0.2.1-dev, 2026-08-22): soft-mask-aware JPEG requantization
+in `src/lib.rs` (`plan_replacement` → `plan_dct_requant`, `eligible_smask`).
+Eligibility is exactly as scoped: `/SMask` resolving to a plain 8-bit
+DeviceGray image stream, no `/Matte` anywhere in the pair, no `/ImageMask`
+stencil; `/Mask` remains a hard skip; FlateDecode bases deferred to D-M3. The
+base is decoded at its own dimensions and re-encoded at
+`OptimizeOptions::jpeg_quality`, replaced only when strictly smaller and after
+a decode-back pixel verification (geometry + channel count + MAD ceiling).
+Since the transform never resizes, the effective-DPI margin of the resize
+pipeline is intentionally not applied to masked JPEGs — mask alignment is
+preserved by construction.
+
 ## D-M2 — SMask-coupled downsampling (the big one)
 
 Scope: same eligibility as D-M1 plus over-resolution pairs (effective DPI >

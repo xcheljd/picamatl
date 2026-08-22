@@ -21,6 +21,14 @@
 //!      JPEG artifacts are ever introduced on that content class.
 //!   3. Replace the stream only when the result is actually smaller.
 //!
+//!   Soft-masked DCTDecode images (`/SMask`) follow a separate,
+//!   dimension-preserving rule (Phase 5 D-M1): when the mask is a plain 8-bit
+//!   DeviceGray image stream with no `/Matte`, the base is re-encoded at the
+//!   configured JPEG quality at its OWN dimensions — never resized, so mask
+//!   alignment is untouched by construction — and the `/SMask` stream is never
+//!   modified. `/Mask` (stencil/color-key) images and any ineligible `/SMask`
+//!   stay untouched.
+//!
 //! Optionally (opt-in via [`OptimizeOptions::subset_fonts`]), embedded
 //! Type0/CIDFontType2 (Identity-H/V) fonts are subset to the glyphs actually
 //! shown, using a `/CIDToGIDMap`-stream technique that never rewrites
@@ -480,6 +488,56 @@ fn classify_filter(doc: &Document, filter: &Object) -> FilterClass {
     }
 }
 
+/// Phase 5 D-M1: return the mask's object id when the `/SMask` value resolves
+/// to a plain 8-bit DeviceGray image stream — `/ImageMask` stencil unset, no
+/// `/Matte` (premultiplied color semantics are not understood), exactly 8 bits
+/// per component. Any doubt returns `None` (unresolvable reference, not an
+/// image object, other color space, other bpc, stencil flag set), leaving the
+/// masked pair untouched.
+fn eligible_smask(doc: &Document, smask: &Object) -> Option<ObjectId> {
+    // The `/SMask` value is normally a direct reference. Take the id from the
+    // RAW value (not `resolve`, which would already have dereferenced it to
+    // the mask stream itself) and only then look the stream up.
+    let mask_id = match smask {
+        Object::Reference(id) => *id,
+        _ => return None,
+    };
+    let stream = doc.get_object(mask_id).ok()?.as_stream().ok()?;
+    let dict = &stream.dict;
+
+    if !matches!(
+        dict.get(b"Subtype").map(|s| resolve(doc, s)),
+        Ok(Object::Name(n)) if n == b"Image"
+    ) {
+        return None;
+    }
+    // Stencil masks (/ImageMask true) are bilevel sampling masks — skip.
+    if matches!(dict.get(b"ImageMask"), Ok(Object::Boolean(true))) {
+        return None;
+    }
+    // /Matte premultiplies the mask samples against a background color;
+    // requantizing the base under that interpretation is not supported.
+    if dict.get(b"Matte").is_ok() {
+        return None;
+    }
+    // Plain DeviceGray only (an array-wrapped or ICCBased gray is out of scope).
+    if !matches!(
+        dict.get(b"ColorSpace").map(|c| resolve(doc, c)),
+        Ok(Object::Name(n)) if n == b"DeviceGray"
+    ) {
+        return None;
+    }
+    if dict
+        .get(b"BitsPerComponent")
+        .ok()
+        .and_then(|b| b.as_i64().ok())
+        != Some(8)
+    {
+        return None;
+    }
+    Some(mask_id)
+}
+
 /// Decode, resize, and re-encode one image if it's an over-resolution JPEG or
 /// Flate raster. Returns `None` to leave the image untouched.
 fn plan_replacement(
@@ -504,12 +562,28 @@ fn plan_replacement(
     let stream = doc.get_object(id).ok()?.as_stream().ok()?;
     let dict = &stream.dict;
 
-    // Must be an image with no soft mask (we don't touch transparency).
+    // Must be an image.
     if !matches!(dict.get(b"Subtype").map(|s| resolve(doc, s)), Ok(Object::Name(n)) if n == b"Image")
     {
         return None;
     }
-    if dict.get(b"SMask").is_ok() || dict.get(b"Mask").is_ok() {
+
+    // Transparency handling (Phase 5 D-M1). A `/Mask` (stencil / color-key) is
+    // always a hard skip; only `/SMask` soft masks open eligibility, and only
+    // for the dimension-preserving JPEG requantization branch below — the
+    // `/SMask` stream itself is never modified in D-M1. An ineligible `/SMask`
+    // (unresolvable reference, non-image object, `/ImageMask` stencil,
+    // non-DeviceGray color space, `BitsPerComponent` other than 8, or a
+    // `/Matte` anywhere in the pair) leaves the whole image untouched.
+    let smask_present = dict.get(b"SMask").is_ok();
+    if dict.get(b"Mask").is_ok() || (smask_present && dict.get(b"Matte").is_ok()) {
+        return None;
+    }
+    let smask_eligible = match dict.get(b"SMask") {
+        Ok(smask_value) => eligible_smask(doc, smask_value).is_some(),
+        Err(_) => false,
+    };
+    if smask_present && !smask_eligible {
         return None;
     }
     let filter = dict.get(b"Filter").ok()?;
@@ -524,6 +598,39 @@ fn plan_replacement(
     let px_h = dict.get(b"Height").ok().and_then(|o| o.as_i64().ok())? as u32;
     if px_w == 0 || px_h == 0 {
         return None;
+    }
+
+    // D-M1: soft-mask-aware JPEG requantization. When the base carries an
+    // eligible `/SMask`, the only allowed transform is dimension-preserving:
+    // decode the base at its own size and re-encode at the configured quality.
+    // Never resized, so soft-mask alignment is untouched by construction.
+    // FlateDecode bases are deferred to D-M3; the `/SMask` stream itself is
+    // never modified here.
+    //
+    // Idempotence guard: requantization is lossy, so re-running it on an
+    // already-requantized payload keeps shrinking by a fraction of a percent
+    // each pass (generation loss). A stream is only requantized when the
+    // candidate saves at least 5% — a real first-time requant of an
+    // over-quality scan saves far more (the NASA corpus measured 40-55% per
+    // stream), while same-quality generation-loss churn is 1-4% and decays
+    // each pass. This makes optimize(optimize(x)) a no-op in practice without
+    // blocking genuine wins.
+    if smask_present {
+        if !matches!(class, FilterClass::DctOnly) {
+            return None;
+        }
+        let out = plan_dct_requant(stream, options, px_w, px_h)?;
+        let original = stream.content.len();
+        if out.len() * 100 >= original * 95 {
+            return None;
+        }
+        return Some(Replacement {
+            id,
+            content: out,
+            width: px_w as i64,
+            height: px_h as i64,
+            dict_update: DictUpdate::Dct,
+        });
     }
 
     // Effective DPI = pixels / inches displayed, evaluated on BOTH axes. A
@@ -599,6 +706,113 @@ fn plan_dct(
     // Preserve the original component count so the PDF /ColorSpace (which we
     // leave unchanged) still matches: gray -> 1 channel, else RGB -> 3.
     encode_jpeg(resized, is_gray, quality)
+}
+
+/// Mean-absolute-difference ceiling for the D-M1 decode-back verification.
+/// Deliberately loose: a JPEG requantization is lossy by design, so this gate
+/// catches catastrophes (wrong component mix, stale/scrambled payloads,
+/// shifted geometry), never ordinary quality loss — q78 round trips land at
+/// single-digit MAD on document-like content.
+const DECODE_BACK_MAX_MAD: f64 = 96.0;
+
+/// Decode a JPEG at (at least) the requested target geometry: mozjpeg's
+/// DCT-scaled path first (never materializing the full image when a smaller
+/// scale covers the target), falling back to a full decode for color spaces
+/// the scaled path declines (CMYK/YCCK) or streams libjpeg refuses. Returns
+/// `(image, is_grayscale)`, or `None` on any decode doubt.
+fn decode_jpeg(data: &[u8], target_w: u32, target_h: u32) -> Option<(DynamicImage, bool)> {
+    decode_jpeg_scaled(data, target_w, target_h).or_else(|| {
+        let decoded = image::load_from_memory_with_format(data, ImageFormat::Jpeg).ok()?;
+        let is_gray = matches!(
+            decoded,
+            DynamicImage::ImageLuma8(_) | DynamicImage::ImageLuma16(_)
+        );
+        Some((decoded, is_gray))
+    })
+}
+
+/// Phase 5 D-M1: dimension-preserving JPEG requantization for a base image
+/// carrying an eligible `/SMask`. The base is decoded at its OWN dimensions
+/// (never resized → soft-mask alignment untouched by construction), re-encoded
+/// at `OptimizeOptions::jpeg_quality`, and the candidate payload must pass a
+/// decode-back verification before it is returned. Any doubt — decode failure,
+/// lying stream geometry, or a divergent decode-back — returns `None`.
+fn plan_dct_requant(
+    stream: &lopdf::Stream,
+    options: OptimizeOptions,
+    px_w: u32,
+    px_h: u32,
+) -> Option<Vec<u8>> {
+    let quality = options.jpeg_quality.clamp(1, 100);
+
+    // Full decode: same path as the resize pipeline, with the target set to
+    // the stream's own geometry (libjpeg then picks the unscaled 8/8 DCT
+    // size), so the ordinary decoding machinery is reused as-is.
+    let (img, is_gray) = decode_jpeg(&stream.content, px_w, px_h)?;
+
+    // Dimension-preserving contract: the decoded pixel buffer must be EXACTLY
+    // the declared geometry. If /Width//Height lie, any re-declaration or
+    // implied scale would break mask alignment — fail-safe skip.
+    if img.width() != px_w || img.height() != px_h {
+        return None;
+    }
+
+    // Reference pixels are captured BEFORE the buffer is moved into the
+    // encoder; the decode-back verification below compares against these.
+    let reference_pixels = if is_gray {
+        img.to_luma8().into_raw()
+    } else {
+        img.to_rgb8().into_raw()
+    };
+
+    let out = encode_jpeg(img, is_gray, quality)?;
+
+    // Decode-back verification of the re-encoded base (hard rule): re-decoding
+    // the candidate must reproduce the same geometry, channel count, and
+    // nearby pixels before it is allowed to replace the original bytes.
+    if !decode_back_matches(
+        &out,
+        &reference_pixels,
+        is_gray,
+        px_w,
+        px_h,
+        DECODE_BACK_MAX_MAD,
+    ) {
+        return None;
+    }
+    Some(out)
+}
+
+/// True if re-decoding `out` reproduces the reference's geometry, channel
+/// count, and pixels (mean absolute difference ≤ `max_mad`).
+fn decode_back_matches(
+    out: &[u8],
+    reference_pixels: &[u8],
+    reference_is_gray: bool,
+    w: u32,
+    h: u32,
+    max_mad: f64,
+) -> bool {
+    let Some((decoded, is_gray)) = decode_jpeg(out, w, h) else {
+        return false;
+    };
+    if is_gray != reference_is_gray {
+        return false;
+    }
+    let actual = if is_gray {
+        decoded.to_luma8().into_raw()
+    } else {
+        decoded.to_rgb8().into_raw()
+    };
+    if actual.len() != reference_pixels.len() {
+        return false;
+    }
+    let sad: u64 = reference_pixels
+        .iter()
+        .zip(&actual)
+        .map(|(a, b)| u64::from(a.abs_diff(*b)))
+        .sum();
+    sad as f64 / reference_pixels.len() as f64 <= max_mad
 }
 
 /// Raw pixel budget above which a Flate image is never decoded: 256 MiB
@@ -2657,6 +2871,339 @@ mod tests {
         if let Ok(dest) = std::env::var("AMATL_TEST_OUT") {
             std::fs::write(&dest, &out).unwrap();
         }
+    }
+
+    // ---- D-M1: SMask-aware JPEG requantization (Phase 5) -------------------
+
+    /// Build a one-page PDF embedding a `px`×`px` RGB JPEG WITH a plain 8-bit
+    /// DeviceGray `/SMask` soft mask, drawn into a `draw_pts` square — the
+    /// D-M1 positive fixture shape.
+    fn build_pdf_smask(px: u32, draw_pts: i64, jpeg_quality: u8) -> Vec<u8> {
+        build_pdf_smask_ext(px, draw_pts, jpeg_quality, |_| {}, |_| {})
+    }
+
+    /// The same, with `base_mutate`/`mask_mutate` applied to the base and mask
+    /// stream dicts before draw — for the ineligible-mask skip cases.
+    fn build_pdf_smask_ext(
+        px: u32,
+        draw_pts: i64,
+        jpeg_quality: u8,
+        base_mutate: impl FnOnce(&mut lopdf::Dictionary),
+        mask_mutate: impl FnOnce(&mut lopdf::Dictionary),
+    ) -> Vec<u8> {
+        let mut img = image::RgbImage::new(px, px);
+        for (x, y, pixel) in img.enumerate_pixels_mut() {
+            *pixel = image::Rgb([(x % 256) as u8, (y % 256) as u8, ((x + y) % 256) as u8]);
+        }
+        let mut jpeg: Vec<u8> = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, jpeg_quality)
+            .encode_image(&img)
+            .unwrap();
+        let mask_payload = deflate_level9(&flate_pixels(px, px, 1)).unwrap();
+
+        let mut doc = Document::with_version("1.5");
+        let mask_id = doc.add_object(Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Image",
+                "Width" => px as i64,
+                "Height" => px as i64,
+                "ColorSpace" => "DeviceGray",
+                "BitsPerComponent" => 8_i64,
+                "Filter" => "FlateDecode",
+            },
+            mask_payload,
+        ));
+        if let Ok(Object::Stream(s)) = doc.get_object_mut(mask_id) {
+            mask_mutate(&mut s.dict);
+        }
+        let img_id = doc.add_object(Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Image",
+                "Width" => px as i64,
+                "Height" => px as i64,
+                "ColorSpace" => "DeviceRGB",
+                "BitsPerComponent" => 8_i64,
+                "Filter" => "DCTDecode",
+                "SMask" => mask_id,
+            },
+            jpeg,
+        ));
+        if let Ok(Object::Stream(s)) = doc.get_object_mut(img_id) {
+            base_mutate(&mut s.dict);
+        }
+        wrap_image_pdf(&mut doc, img_id, draw_pts)
+    }
+
+    /// (base stream content, width, height, /SMask target object id) for the
+    /// single image stream carrying an /SMask in `pdf`.
+    fn smask_base_info(pdf: &[u8]) -> (Vec<u8>, i64, i64, ObjectId) {
+        let doc = Document::load_mem(pdf).unwrap();
+        for obj in doc.objects.values() {
+            if let Object::Stream(s) = obj {
+                if matches!(s.dict.get(b"Subtype"), Ok(Object::Name(n)) if n == b"Image")
+                    && s.dict.get(b"SMask").is_ok()
+                {
+                    let w = s.dict.get(b"Width").unwrap().as_i64().unwrap();
+                    let h = s.dict.get(b"Height").unwrap().as_i64().unwrap();
+                    let smask = match s.dict.get(b"SMask").unwrap() {
+                        Object::Reference(r) => *r,
+                        _ => panic!("SMask must be a reference in the fixture"),
+                    };
+                    return (s.content.clone(), w, h, smask);
+                }
+            }
+        }
+        panic!("no smask-carrying image stream found");
+    }
+
+    fn smask_stream_bytes(pdf: &[u8], smask_id: ObjectId) -> Vec<u8> {
+        let doc = Document::load_mem(pdf).unwrap();
+        match doc.get_object(smask_id) {
+            Ok(Object::Stream(s)) => s.content.clone(),
+            _ => panic!("smask id is not a stream"),
+        }
+    }
+
+    #[test]
+    fn smask_masked_jpeg_requantizes_smaller_dimensions_identical() {
+        // Positive D-M1 case: a q92 RGB JPEG with a plain 8-bit DeviceGray
+        // /SMask. The base must be re-encoded at jpeg_quality (78) WITHOUT
+        // resizing, replaced only because it is strictly smaller, and the
+        // /SMask must survive byte-for-byte pointing at the same mask stream.
+        let pdf = build_pdf_smask(400, 100, 92);
+        let (base_before, iw, ih, smask_before) = smask_base_info(&pdf);
+        let mask_before = smask_stream_bytes(&pdf, smask_before);
+        assert_eq!((iw, ih), (400, 400), "fixture base must be 400x400");
+
+        let out = optimize(&pdf);
+
+        assert!(out.len() < pdf.len(), "requantized output must be smaller");
+        let (base_after, aw, ah, smask_after) = smask_base_info(&out);
+        assert_eq!(
+            (aw, ah),
+            (iw, ih),
+            "base dimensions must be identical after D-M1"
+        );
+        assert_ne!(
+            base_after, base_before,
+            "the base must actually be re-encoded, not passed through"
+        );
+        assert_eq!(
+            smask_after, smask_before,
+            "/SMask reference must stay intact"
+        );
+        assert_eq!(
+            smask_stream_bytes(&out, smask_after),
+            mask_before,
+            "the /SMask stream itself must be untouched"
+        );
+        assert!(Document::load_mem(&out).is_ok());
+    }
+
+    #[test]
+    fn smask_masked_optimize_is_idempotent() {
+        let pdf = build_pdf_smask(400, 100, 92);
+        let once = optimize(&pdf);
+        assert!(once.len() < pdf.len(), "first pass must shrink");
+        let twice = optimize(&once);
+        assert_eq!(twice, once, "second pass must be byte-stable");
+    }
+
+    #[test]
+    fn corrupt_masked_jpeg_returns_exact_original_bytes() {
+        // Structurally valid PDF, corrupt base JPEG bytes, eligible /SMask:
+        // the decode fails → fail-safe returns the exact input bytes.
+        let mut doc = Document::load_mem(&build_pdf_smask(400, 100, 92)).unwrap();
+        for obj in doc.objects.values_mut() {
+            if let Object::Stream(s) = obj {
+                if matches!(s.dict.get(b"Subtype"), Ok(Object::Name(n)) if n == b"Image")
+                    && s.dict.get(b"SMask").is_ok()
+                {
+                    s.set_content(b"\xff\xd8\xff not a real jpeg payload".to_vec());
+                }
+            }
+        }
+        let mut input: Vec<u8> = Vec::new();
+        doc.save_to(&mut input).unwrap();
+
+        let out = optimize(&input);
+        assert_eq!(out, input, "corrupt masked JPEG must return original bytes");
+        assert!(Document::load_mem(&out).is_ok());
+    }
+
+    #[test]
+    fn smask_requantization_never_larger_guard_holds() {
+        // Re-encoding a masked base UP to quality 100 from its already-optimized
+        // q78 payload must grow the stream; the per-stream never-larger guard
+        // must discard the replacement and return the exact original bytes.
+        let pdf = build_pdf_smask(400, 100, 92);
+        let baseline = optimize(&pdf); // sits at the configured q78 after D-M1
+        assert!(baseline.len() < pdf.len(), "baseline must be smaller");
+        let opts = OptimizeOptions::default().with_jpeg_quality(100);
+        let out = optimize_with_options(&baseline, opts);
+        assert_eq!(out, baseline, "growing requantization must be discarded");
+    }
+
+    #[test]
+    fn smask_matte_anywhere_skips_the_pair() {
+        // /Matte (premultiplied background color) on either side of the pair
+        // is a hard skip in D-M1.
+        let cases: Vec<(&str, Vec<u8>)> = vec![
+            (
+                "/Matte on the mask",
+                build_pdf_smask_ext(
+                    400,
+                    100,
+                    92,
+                    |_| {},
+                    |m| {
+                        m.set("Matte", vec![23.into(), 128.into(), 240.into()]);
+                    },
+                ),
+            ),
+            (
+                "/Matte on the base",
+                build_pdf_smask_ext(
+                    400,
+                    100,
+                    92,
+                    |b| {
+                        b.set("Matte", vec![23.into(), 128.into(), 240.into()]);
+                    },
+                    |_| {},
+                ),
+            ),
+        ];
+        for (label, pdf) in cases {
+            let out = optimize(&pdf);
+            assert_eq!(out, pdf, "{label}: must leave the masked pair untouched");
+        }
+    }
+
+    #[test]
+    fn stencil_and_colorkey_masks_are_skipped() {
+        // An /ImageMask stencil used as the /SMask, and a /Mask color-key on
+        // the base: both remain hard skips in D-M1.
+        let cases: Vec<(&str, Vec<u8>)> = vec![
+            (
+                "/ImageMask stencil as the /SMask",
+                build_pdf_smask_ext(
+                    400,
+                    100,
+                    92,
+                    |_| {},
+                    |m| {
+                        m.set("ImageMask", Object::Boolean(true));
+                    },
+                ),
+            ),
+            (
+                "/Mask color-key on the base",
+                build_pdf_smask_ext(
+                    400,
+                    100,
+                    92,
+                    |b| {
+                        b.set("Mask", vec![Object::Integer(1), Object::Integer(255)]);
+                    },
+                    |_| {},
+                ),
+            ),
+        ];
+        for (label, pdf) in cases {
+            let out = optimize(&pdf);
+            assert_eq!(out, pdf, "{label}: must leave the masked pair untouched");
+        }
+    }
+
+    #[test]
+    fn ineligible_smask_variants_are_skipped() {
+        // Every mask-shape doubt rolls back to the untouched original:
+        // unresolvable reference, non-image SMask object, non-DeviceGray
+        // color space, and non-8-bit samples.
+        let cases: Vec<(&str, Vec<u8>)> = vec![
+            (
+                "unresolvable /SMask reference",
+                build_pdf_smask_ext(
+                    400,
+                    100,
+                    92,
+                    |b| {
+                        b.set("SMask", 9_999_999_i64);
+                    },
+                    |_| {},
+                ),
+            ),
+            (
+                "/SMask that is not an image object",
+                build_pdf_smask_ext(
+                    400,
+                    100,
+                    92,
+                    |b| {
+                        b.set("SMask", dictionary! { "Type" => "AnyObject" });
+                    },
+                    |_| {},
+                ),
+            ),
+            (
+                "mask color space /DeviceRGB",
+                build_pdf_smask_ext(
+                    400,
+                    100,
+                    92,
+                    |_| {},
+                    |m| {
+                        m.set("ColorSpace", "DeviceRGB");
+                    },
+                ),
+            ),
+            (
+                "mask /BitsPerComponent 1 (not 8)",
+                build_pdf_smask_ext(
+                    400,
+                    100,
+                    92,
+                    |_| {},
+                    |m| {
+                        m.set("BitsPerComponent", 1_i64);
+                    },
+                ),
+            ),
+        ];
+        for (label, pdf) in cases {
+            let out = optimize(&pdf);
+            assert_eq!(out, pdf, "{label}: must leave the image untouched");
+        }
+    }
+
+    #[test]
+    fn masked_flate_base_is_deferred_to_dm3() {
+        // A FlateDecode base carrying the SAME eligible SMask shape: D-M1 only
+        // opens eligibility for DCTDecode bases; the Flate counterpart is the
+        // future D-M3 milestone. Whole image untouched.
+        let pdf = build_flate_pdf_with_dict(400, 3, |doc, d| {
+            let mask = doc.add_object(Stream::new(
+                dictionary! {
+                    "Type" => "XObject",
+                    "Subtype" => "Image",
+                    "Width" => 400_i64,
+                    "Height" => 400_i64,
+                    "ColorSpace" => "DeviceGray",
+                    "BitsPerComponent" => 8_i64,
+                    "Filter" => "FlateDecode",
+                },
+                deflate_level9(&flate_pixels(400, 400, 1)).unwrap(),
+            ));
+            d.set("SMask", mask);
+        });
+        let out = optimize(&pdf);
+        assert_eq!(
+            out, pdf,
+            "masked Flate images are D-M3, must stay untouched"
+        );
     }
 
     #[test]

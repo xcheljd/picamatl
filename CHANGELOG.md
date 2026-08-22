@@ -10,6 +10,22 @@ and this project adheres to
 
 ### Added
 
+- **SMask-aware JPEG requantization (Phase 5 D-M1).** JPEG (`DCTDecode`)
+  images carrying an `/SMask` soft mask are no longer unconditionally skipped:
+  when the mask resolves to a plain 8-bit DeviceGray image stream with no
+  `/Matte` (and is not an `/ImageMask` stencil), the base JPEG is decoded at
+  its OWN dimensions and re-encoded at `OptimizeOptions::jpeg_quality` —
+  never resized, so mask alignment is untouched by construction, and the
+  `/SMask` stream itself is never modified. Every hard rule from the Phase 5
+  contract is enforced: strict smaller-only replacement (never-larger guard),
+  decode-back pixel verification of the re-encoded base before replacement,
+  `/Mask` color-key/stencil images and all ineligible `/SMask` shapes
+  (unresolvable reference, non-image object, non-DeviceGray color space,
+  non-8-bit samples, `/Matte` anywhere in the pair, FlateDecode bases — those
+  are D-M3) are left byte-for-byte untouched, and the panic-safe
+  `catch_unwind` boundary is unchanged. Attacks the 9.16 MB masked-JPEG class
+  on the reference corpus at zero geometric risk.
+
 - **`amatl` CLI.** The crate now ships a command-line binary (`src/main.rs`)
   over the same library API: positional input, `-o/--output` (default
   `<input>.optimized.pdf`, never overwriting without `--force`), and flags
