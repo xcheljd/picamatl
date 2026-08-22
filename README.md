@@ -104,6 +104,32 @@ out of scope, as a commitment rather than a missing feature. Any future
 bitonal recompression work is restricted to lossless encodings whose output
 can be verified by exact decode-back comparison.
 
+## CLI
+
+amatl ships as a library and a command-line binary:
+
+```sh
+# Install from source (crates.io publishing is a later roadmap phase)
+cargo install amatl
+
+# Optimize with accessibility-preserving defaults; writes sample.optimized.pdf
+amatl report.pdf
+
+# Choose the output path explicitly
+amatl report.pdf -o report.small.pdf
+
+# Overwrite in place, tune the pipeline
+amatl scan.pdf --force --target-dpi 150 --jpeg-quality 70 \
+  --recompress-bitonal-images --subset-fonts --pack-object-streams
+```
+
+Every flag maps 1:1 to an `OptimizeOptions` builder method, and all defaults —
+including the boolean flags' on/off state shown under `--help` — are read from
+`OptimizeOptions::default()` at runtime, so the CLI can never drift from the
+library. Non-PDF input is rejected by header sniffing; without `-o` or
+`--force` the input file is never overwritten. On success the CLI prints
+input → output size, percent saved, and elapsed time.
+
 ## Measured results
 
 On the committed synthetic fixture (`fixtures/sample.pdf`, four pages as of

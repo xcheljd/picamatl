@@ -38,6 +38,13 @@ subsetter = { version = "0.2.6", default-features = false }
 # docs/PHASE3-PLAN.md §B.3: MIT, #![deny(unsafe_code)], rust-version 1.71,
 # zero transitive dependencies.
 fax = "0.3.0"
+# CLI argument parsing for the `amatl` binary only; the library does not
+# depend on it. clap 4.6 declares rust-version 1.85, inside our 1.88 MSRV.
+clap = { version = "4.6.6", features = ["derive"] }
+
+[[bin]]
+name = "amatl"
+path = "src/main.rs"
 
 [dev-dependencies]
 # Test-only verification oracle for the font-subsetting path: per-glyph

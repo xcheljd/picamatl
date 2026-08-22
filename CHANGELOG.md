@@ -6,9 +6,27 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.2.1] - 2026-08-22
+## [Unreleased]
+
+### Added
+
+- **`amatl` CLI.** The crate now ships a command-line binary (`src/main.rs`)
+  over the same library API: positional input, `-o/--output` (default
+  `<input>.optimized.pdf`, never overwriting without `--force`), and flags
+  mapping 1:1 to every `OptimizeOptions` builder
+  (`--target-dpi`, `--jpeg-quality`, `--dpi-margin`, and `--flag` /
+  `--no-flag` pairs for all five boolean options). All defaults — including
+  the boolean on/off states printed under `--help` — are read from
+  `OptimizeOptions::default()` at runtime so CLI and library cannot drift.
+  Non-PDF input is rejected by `%PDF-` header sniffing; success reports
+  input → output bytes, percent saved, and elapsed time; failures exit
+  nonzero with a clean message (no panics on user-facing paths).
 
 [Unreleased]: nothing yet.
+
+## [0.2.1] - 2026-08-22
+
+[0.2.1]: nothing yet.
 
 ### Added
 
