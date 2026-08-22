@@ -1015,22 +1015,44 @@ fn remap_references(obj: &mut Object, remap: &HashMap<ObjectId, ObjectId>) {
     }
 }
 
+/// True for page-tree node dicts (`/Type /Page` or `/Type /Pages`), which
+/// must never be deduplicated even when byte-identical. A page object has
+/// IDENTITY semantics beyond its bytes: merging two identical blank pages
+/// puts the same object id in `/Kids` twice, which (a) changes what GoTo
+/// destinations and `/StructParents` resolve to, and (b) breaks lopdf 0.42's
+/// `renumber_objects_with` — its page-reordering pass assumes `page_iter()`
+/// yields distinct ids, and duplicated kids make it collide page objects onto
+/// one id, silently overwriting OTHER pages (verified on the NASA repro:
+/// merging two identical blank pages dropped a scanned page's dict and
+/// orphaned its 1.37 MB image subtree).
+fn is_page_node(obj: &Object) -> bool {
+    let Object::Dictionary(dict) = obj else {
+        return false;
+    };
+    matches!(dict.get(b"Type"), Ok(Object::Name(n)) if n == b"Page" || n == b"Pages")
+}
+
 /// Merge true duplicate non-stream objects. Two objects are duplicates when
 /// their serialized bytes are identical. For each duplicate group the lowest
 /// `ObjectId` is kept as canonical; all references to the others are
-/// redirected, and the duplicates are removed from the document.
+/// redirected, and the duplicates are removed from the document. Returns true
+/// if anything merged, so the caller can iterate to a fixpoint.
 ///
-/// This is always safe (identical objects produce identical results in all
-/// contexts) and reduces the object count before packing. On sparse documents
-/// (a few dozen duplicates among a few hundred objects) the gain is small; on
-/// denser documents it can be more significant.
-fn dedup_objects(doc: &mut Document) {
+/// Safe because identical objects produce identical results in all contexts —
+/// EXCEPT page-tree nodes, whose object identity is load-bearing (see
+/// [`is_page_node`]); those are never merged. Reduces the object count before
+/// packing. On sparse documents (a few dozen duplicates among a few hundred
+/// objects) the gain is small; on denser documents it can be more significant.
+fn dedup_objects(doc: &mut Document) -> bool {
     // Group non-stream objects by their exact serialized bytes. Keying the map
     // on the bytes themselves (not a 64-bit hash of them) means only genuinely
     // identical objects ever share a bucket, so a hash collision can never
     // cause two different objects to be merged.
     let mut by_bytes: HashMap<Vec<u8>, Vec<ObjectId>> = HashMap::new();
     for (&id, obj) in doc.objects.iter() {
+        if is_page_node(obj) {
+            continue;
+        }
         if let Some(bytes) = serialize_object(obj) {
             by_bytes.entry(bytes).or_default().push(id);
         }
@@ -1051,7 +1073,7 @@ fn dedup_objects(doc: &mut Document) {
     }
 
     if remap.is_empty() {
-        return;
+        return false;
     }
 
     // Rewrite all references throughout the document.
@@ -1070,6 +1092,7 @@ fn dedup_objects(doc: &mut Document) {
     for id in remap.keys() {
         doc.objects.remove(id);
     }
+    true
 }
 
 /// Merge byte-identical **stream** objects — in practice repeated images: a logo
@@ -1255,10 +1278,26 @@ fn try_optimize(input: &[u8], options: OptimizeOptions) -> Result<Option<Vec<u8>
         }
     }
 
-    // Merge true duplicate non-stream objects (identical serialized bytes ->
-    // same canonical id, references redirected, duplicates removed). Runs
-    // before prune so the orphan cleanup sees an already-compacted object set.
-    dedup_objects(&mut doc);
+    // Merge true duplicate objects (identical serialized bytes -> same
+    // canonical id, references redirected, duplicates removed) — iterated to a
+    // FIXPOINT, alternating the non-stream and stream passes. One generation
+    // is not enough: merging duplicate leaves remaps references, which can
+    // make their *parents* newly byte-identical. Real-world shape (the NASA
+    // repro): N byte-identical image streams that each referenced their own
+    // copy of a duplicated ColorSpace object — the streams' dicts only become
+    // identical after dedup_objects collapses the ColorSpaces, and merging the
+    // streams can in turn make dicts referencing them identical. A single
+    // generation per call left that cascade to the NEXT optimize call,
+    // breaking idempotence. Terminates: every iteration that continues has
+    // strictly removed at least one object. Runs before prune so the orphan
+    // cleanup sees an already-compacted object set.
+    loop {
+        let merged_dicts = dedup_objects(&mut doc);
+        let merged_more_streams = dedup_streams(&mut doc);
+        if !merged_dicts && !merged_more_streams {
+            break;
+        }
+    }
 
     // Drop orphaned objects, then Flate-compress any uncompressed content
     // streams (DCTDecode images are skipped — Stream::compress only touches
@@ -2442,6 +2481,150 @@ mod tests {
             first, second,
             "distinct objects must keep distinct references"
         );
+    }
+
+    #[test]
+    fn cascaded_duplicate_merges_reach_fixpoint_in_one_call() {
+        // Trimmed-down NASA repro (16 MB scanned doc, 2202 objects after one
+        // pass): byte-identical image streams that each reference their OWN
+        // copy of a duplicated ColorSpace object. The stream dedup pass alone
+        // cannot merge the images — their dicts differ until dedup_objects
+        // collapses the ColorSpace copies and remaps the references — so a
+        // single dedup generation per call left the stream merge to the NEXT
+        // optimize call, and optimize(optimize(x)) kept shrinking. The merge
+        // cascade must reach its fixpoint inside ONE call.
+        let mut img = image::RgbImage::new(16, 16);
+        for (x, y, pixel) in img.enumerate_pixels_mut() {
+            *pixel = image::Rgb([(x * 16) as u8, (y * 16) as u8, 0]);
+        }
+        let mut jpeg: Vec<u8> = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 92)
+            .encode_image(&img)
+            .unwrap();
+
+        let mut doc = Document::with_version("1.5");
+        // Two identical indirect ColorSpace objects — first-generation dupes.
+        let cs1 = doc.add_object(Object::Name(b"DeviceRGB".to_vec()));
+        let cs2 = doc.add_object(Object::Name(b"DeviceRGB".to_vec()));
+        // Two image streams with identical bytes whose dicts differ ONLY in
+        // which ColorSpace copy they reference — mergeable one generation
+        // AFTER the ColorSpaces collapse. Never painted, so the downsample
+        // planner ignores them; reachable via /Resources, so prune keeps them.
+        let image_dict = |cs: ObjectId| {
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Image",
+                "Width" => 16_i64,
+                "Height" => 16_i64,
+                "ColorSpace" => cs,
+                "BitsPerComponent" => 8_i64,
+                "Filter" => "DCTDecode",
+            }
+        };
+        let img1 = doc.add_object(Stream::new(image_dict(cs1), jpeg.clone()));
+        let img2 = doc.add_object(Stream::new(image_dict(cs2), jpeg));
+        // Two byte-identical content streams (a /Contents array is legal PDF):
+        // merged by the FIRST dedup_streams pass, which is what marks the
+        // document as having work to do at all (merged_streams == true).
+        let content = Content {
+            operations: vec![Operation::new("q", vec![]), Operation::new("Q", vec![])],
+        };
+        let c1 = doc.add_object(Stream::new(dictionary! {}, content.encode().unwrap()));
+        let c2 = doc.add_object(Stream::new(dictionary! {}, content.encode().unwrap()));
+
+        let pages_id = doc.new_object_id();
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "Contents" => vec![c1.into(), c2.into()],
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Resources" => dictionary! {
+                "XObject" => dictionary! { "Im0" => img1, "Im1" => img2 },
+            },
+        });
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => vec![page_id.into()],
+                "Count" => 1,
+            }),
+        );
+        let catalog_id = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+        doc.trailer.set("Root", catalog_id);
+        let mut pdf: Vec<u8> = Vec::new();
+        doc.save_to(&mut pdf).unwrap();
+
+        let once = optimize(&pdf);
+        assert!(once.len() < pdf.len(), "first pass must shrink");
+        assert_eq!(
+            count_image_streams(&once),
+            1,
+            "the second-generation image-stream merge must happen in pass one"
+        );
+        let twice = optimize(&once);
+        assert_eq!(twice, once, "second pass must be byte-stable");
+        assert_eq!(
+            twice.len(),
+            once.len(),
+            "single-pass output must already be the two-pass size"
+        );
+    }
+
+    #[test]
+    fn identical_blank_pages_are_never_merged() {
+        // NASA repro, part two: two blank pages with byte-identical content
+        // streams and shared resources. Once the content streams merge, the
+        // page dicts become byte-identical — and merging THEM corrupts the
+        // document: the same object id lands in /Kids twice, and lopdf's
+        // renumber page-reordering pass then collides page objects onto one
+        // id, silently overwriting other pages (a scanned page went blank and
+        // its 1.37 MB image subtree was orphaned). Page-tree nodes must
+        // survive dedup even when byte-identical.
+        let mut doc = Document::with_version("1.5");
+        let content = Content {
+            operations: vec![Operation::new("q", vec![]), Operation::new("Q", vec![])],
+        };
+        // Separate but byte-identical content streams: their merge is both the
+        // work trigger (merged_streams == true) and what makes the page dicts
+        // identical.
+        let c1 = doc.add_object(Stream::new(dictionary! {}, content.encode().unwrap()));
+        let c2 = doc.add_object(Stream::new(dictionary! {}, content.encode().unwrap()));
+
+        let pages_id = doc.new_object_id();
+        let blank_page = |contents: ObjectId| {
+            dictionary! {
+                "Type" => "Page",
+                "Parent" => pages_id,
+                "Contents" => contents,
+                "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            }
+        };
+        let p1 = doc.add_object(blank_page(c1));
+        let p2 = doc.add_object(blank_page(c2));
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => vec![p1.into(), p2.into()],
+                "Count" => 2,
+            }),
+        );
+        let catalog_id = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+        doc.trailer.set("Root", catalog_id);
+        let mut pdf: Vec<u8> = Vec::new();
+        doc.save_to(&mut pdf).unwrap();
+
+        let once = optimize(&pdf);
+        let out_doc = Document::load_mem(&once).expect("output must load");
+        let pages: Vec<ObjectId> = out_doc.get_pages().into_values().collect();
+        assert_eq!(pages.len(), 2, "both pages must survive");
+        assert_ne!(
+            pages[0], pages[1],
+            "identical pages must stay distinct objects, never merged"
+        );
+        let twice = optimize(&once);
+        assert_eq!(twice, once, "second pass must be byte-stable");
     }
 
     /// Real-file check. Defaults to the committed fixture

@@ -51,6 +51,30 @@ and this project adheres to
   composite-glyph closure, CIDToGIDMap-stream inputs, multi-page
   accumulation, and walker coverage of forms/appearances.
 
+### Fixed
+
+- **`optimize(optimize(x))` is now byte-stable on real-world files
+  (idempotence).** Duplicate-object merging ran exactly one generation per
+  call: merging duplicate leaf objects (e.g. repeated ColorSpace entries)
+  remaps references, which can make their *parents* — image streams, then
+  dicts referencing those — newly byte-identical, and that next generation of
+  merges was left to the next `optimize` call. Repro: a 16 MB NASA scan where
+  pass two removed 7 more objects (−3,725 bytes). The non-stream and stream
+  dedup passes now alternate to a fixpoint inside a single call (each
+  effective round strictly removes at least one object, so termination is
+  guaranteed).
+- **Page-tree nodes are never deduplicated, even when byte-identical.**
+  Surfaced by the fixpoint change on the same NASA file: two blank pages with
+  identical dicts (after their empty content streams and thumbnails merged)
+  were collapsed into one object, putting the same id in `/Kids` twice —
+  which changes what GoTo destinations resolve to, and breaks lopdf 0.42's
+  `renumber_objects_with` page-reordering pass (it assumes distinct page ids
+  and silently overwrote an unrelated scanned page, orphaning its 1.37 MB
+  image subtree). Page identity is load-bearing; `/Type /Page` and
+  `/Type /Pages` dicts are now excluded from dedup. The same hazard was
+  latent in earlier releases for documents whose pages are byte-identical at
+  load time.
+
 ### Notes
 
 - Fonts amatl does not subset are always left byte-for-byte untouched:
