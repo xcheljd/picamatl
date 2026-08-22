@@ -44,6 +44,15 @@ default 130 DPI / quality 78 — a measured visual-lossless sweet spot for
 business documents — the re-encoded image payload matches Ghostscript's within
 ~0.01%.
 
+Since 0.2.0, over-resolution **FlateDecode** raster images (screenshots,
+exported bitmaps, lossless scans — the PNG-like class) are downsampled by
+default too, *in the same format*: decoded (including PNG predictors), resized
+with Lanczos3, and re-deflated at maximum compression, with `/ColorSpace`
+untouched. Because the format never changes, no JPEG ringing is ever
+introduced on the flat-color/line-art content Flate typically holds. Callers
+who need the previous behavior can opt out with
+`with_downsample_flate_images(false)`.
+
 [mozjpeg]: https://github.com/mozilla/mozjpeg
 
 ## Fail-safe contract
@@ -89,9 +98,14 @@ file from tagged to untagged).
 
 ## Measured results
 
-On the committed synthetic fixture (`fixtures/sample.pdf`, reproducible via
-`scripts/bench-vs-gs.sh`; Ghostscript 10.07.1 at mirrored settings — 130 DPI,
-1.15 threshold, DCTEncode QFactor 0.4):
+On the committed synthetic fixture (`fixtures/sample.pdf`, four pages as of
+0.2.0 — two JPEG pages and two FlateDecode pages, reproducible via
+`scripts/bench-vs-gs.sh`): amatl (strip, no packing) takes 662,107 bytes to
+123,948 bytes (**18% of input**), downsampling the over-resolution JPEG *and*
+Flate images while leaving both under-resolution pages byte-for-byte alone.
+
+On the previous JPEG-only two-page fixture (Ghostscript 10.07.1 at mirrored
+settings — 130 DPI, 1.15 threshold, DCTEncode QFactor 0.4):
 
 | Pipeline | Bytes | % of input |
 | --- | ---: | ---: |
@@ -141,10 +155,14 @@ Amatl exists because shelling out to `gs` was evaluated and rejected:
 
 Amatl currently optimizes baseline-JPEG (`DCTDecode`) images without soft
 masks, in RGB or grayscale (CMYK/YCCK decode through a conservative fallback
-path). It does not (yet) recompress `FlateDecode`/`CCITT`/`JBIG2` images or
-subset fonts — on text-heavy PDFs with no large images it will honestly do
-very little, and by contract it returns the input unchanged rather than a
-worse file.
+path), and — since 0.2.0 — 8-bit `FlateDecode` raster images in
+DeviceRGB/DeviceGray/ICCBased(N=1,3), downsampled in place with the format and
+color space preserved. Flate images that are Indexed, 1/2/4/16-bit,
+soft-masked, `/Decode`-remapped, or TIFF-predicted are deliberately left
+untouched. It does not (yet) recompress `CCITT`/`JBIG2` images or subset
+fonts — on text-heavy PDFs with no large images it will honestly do very
+little, and by contract it returns the input unchanged rather than a worse
+file.
 
 ## Maintenance notes & constraints
 
