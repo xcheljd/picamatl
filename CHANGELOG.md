@@ -8,6 +8,12 @@ and this project adheres to
 
 ## [Unreleased]
 
+[Unreleased]: nothing yet.
+
+## [0.2.2] - 2026-08-22
+
+[0.2.2]: nothing yet.
+
 ### Added
 
 - **SMask-coupled Flate-base downsampling (Phase 5 D-M3).** Over-resolution
@@ -65,8 +71,6 @@ and this project adheres to
   Non-PDF input is rejected by `%PDF-` header sniffing; success reports
   input → output bytes, percent saved, and elapsed time; failures exit
   nonzero with a clean message (no panics on user-facing paths).
-
-[Unreleased]: nothing yet.
 
 ## [0.2.1] - 2026-08-22
 
