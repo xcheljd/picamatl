@@ -505,13 +505,29 @@ fn classify_filter(doc: &Document, filter: &Object) -> FilterClass {
     }
 }
 
+/// How the caller intends to transform a masked pair (Phase 6 P-M1). A
+/// dimension-preserving requantization never touches the mask, so a mask
+/// shared by several bases stays valid for every consumer; any RESIZE of a
+/// shared mask would break the other consumers' pixel alignment, so only the
+/// resize intent carries the shared-mask refcount guard.
+#[derive(Clone, Copy)]
+enum SmaskUse {
+    /// D-M1/P-M1 requantization: base re-encoded at its own geometry, mask
+    /// stream never modified.
+    Requant,
+    /// D-M2/D-M3 coupled downsample: base and mask change geometry together.
+    Resize,
+}
+
 /// Phase 5 D-M1: return the mask's object id when the `/SMask` value resolves
 /// to a plain 8-bit DeviceGray image stream — `/ImageMask` stencil unset, no
 /// `/Matte` (premultiplied color semantics are not understood), exactly 8 bits
 /// per component. Any doubt returns `None` (unresolvable reference, not an
 /// image object, other color space, other bpc, stencil flag set), leaving the
-/// masked pair untouched.
-fn eligible_smask(doc: &Document, smask: &Object) -> Option<ObjectId> {
+/// masked pair untouched. `SmaskUse::Resize` additionally applies the
+/// shared-mask refcount guard; `SmaskUse::Requant` deliberately does not
+/// (Phase 6 P-M1 — see `SmaskUse`).
+fn eligible_smask(doc: &Document, smask: &Object, usage: SmaskUse) -> Option<ObjectId> {
     // The `/SMask` value is normally a direct reference. Take the id from the
     // RAW value (not `resolve`, which would already have dereferenced it to
     // the mask stream itself) and only then look the stream up.
@@ -552,29 +568,35 @@ fn eligible_smask(doc: &Document, smask: &Object) -> Option<ObjectId> {
     {
         return None;
     }
-    // Shared-mask fail-safe (Phase 5 review finding): a `/SMask` object
-    // referenced by MORE than one image cannot be safely resized for one
-    // consumer's geometry without breaking the other's pixel alignment.
-    // This is reachable in practice: dedup merges byte-identical masks (e.g.
-    // three copies of the same 620-byte thumbnail mask on one NASA page)
-    // BEFORE planning runs, so several images legitimately share one mask id
-    // here. Count DIRECT references to this mask id; any second consumer
-    // disqualifies the pair entirely. (Indirect-reference chains are not
-    // counted, but `eligible_smask` only accepts direct references anyway.)
-    let refcount = doc
-        .objects
-        .values()
-        .filter(|obj| {
-            let raw = match obj {
-                Object::Stream(s) => s.dict.get(b"SMask"),
-                Object::Dictionary(d) => d.get(b"SMask"),
-                _ => return false,
-            };
-            matches!(raw, Ok(Object::Reference(id2)) if *id2 == mask_id)
-        })
-        .count();
-    if refcount > 1 {
-        return None;
+    // Shared-mask fail-safe (Phase 5 review finding), RESIZE intent only: a
+    // `/SMask` object referenced by MORE than one image cannot be safely
+    // resized for one consumer's geometry without breaking the other's pixel
+    // alignment. This is reachable in practice: dedup merges byte-identical
+    // masks (e.g. three copies of the same 620-byte thumbnail mask on one
+    // NASA page) BEFORE planning runs, so several images legitimately share
+    // one mask id here. Count DIRECT references to this mask id; any second
+    // consumer disqualifies the pair entirely. (Indirect-reference chains are
+    // not counted, but `eligible_smask` only accepts direct references
+    // anyway.) A REQUANT never modifies the mask stream, so sharing is
+    // harmless there — Phase 6 P-M1 measured 16 masked-JPEG payloads
+    // (1,163,221 B) on the reference corpus that the guard needlessly blocked
+    // from requantization.
+    if matches!(usage, SmaskUse::Resize) {
+        let refcount = doc
+            .objects
+            .values()
+            .filter(|obj| {
+                let raw = match obj {
+                    Object::Stream(s) => s.dict.get(b"SMask"),
+                    Object::Dictionary(d) => d.get(b"SMask"),
+                    _ => return false,
+                };
+                matches!(raw, Ok(Object::Reference(id2)) if *id2 == mask_id)
+            })
+            .count();
+        if refcount > 1 {
+            return None;
+        }
     }
     Some(mask_id)
 }
@@ -615,15 +637,16 @@ fn plan_replacement(
     // image stream, `/ImageMask` stencil unset, no `/Matte` anywhere in the
     // pair. An ineligible `/SMask` (unresolvable reference, non-image object,
     // `/ImageMask` stencil, non-DeviceGray color space, `BitsPerComponent`
-    // other than 8) leaves the whole pair untouched.
-    let smask_present = dict.get(b"SMask").is_ok();
+    // other than 8) leaves the whole pair untouched. Eligibility is checked
+    // here with the REQUANT intent (Phase 6 P-M1): a shared mask does not
+    // disqualify the pair outright anymore — the refcount guard is re-applied
+    // below only on the branches that would resize the mask.
+    let smask_raw = dict.get(b"SMask").ok();
+    let smask_present = smask_raw.is_some();
     if dict.get(b"Mask").is_ok() || (smask_present && dict.get(b"Matte").is_ok()) {
         return None;
     }
-    let smask_id = match dict.get(b"SMask") {
-        Ok(smask_value) => eligible_smask(doc, smask_value),
-        Err(_) => None,
-    };
+    let smask_id = smask_raw.and_then(|value| eligible_smask(doc, value, SmaskUse::Requant));
     if smask_present && smask_id.is_none() {
         return None;
     }
@@ -680,11 +703,18 @@ fn plan_replacement(
     // no-op in practice without blocking genuine wins.
     if smask_present {
         let mask_id = smask_id.expect("smask_id is set whenever smask_present");
+        // Resize eligibility (Phase 6 P-M1 split): the shared-mask refcount
+        // guard applies only to the branches that would change the mask's
+        // geometry. Evaluated lazily — the requant branch never needs it.
+        let resize_eligible = || {
+            smask_raw.is_some_and(|value| eligible_smask(doc, value, SmaskUse::Resize).is_some())
+        };
         if matches!(class, FilterClass::FlateOnly) {
             // D-M3: the masked-Flate pair. Only the over-resolution coupled
             // downsample exists on this branch, gated by the same consent
-            // flag as the unmasked Flate path.
-            if !over_resolution || !options.downsample_flate_images {
+            // flag as the unmasked Flate path. A shared mask is never
+            // resized, and a lossless base has no requant analogue — skip.
+            if !over_resolution || !options.downsample_flate_images || !resize_eligible() {
                 return None;
             }
             return plan_flate_smask_pair_downsample(
@@ -692,6 +722,19 @@ fn plan_replacement(
             );
         }
         if over_resolution {
+            // A shared mask is never RESIZED (P-M1 fail-safe, unchanged from
+            // Phase 5): an over-resolution pair whose mask has a second
+            // consumer cannot take the coupled downsample. It CAN still take
+            // the dimension-preserving requant below: the mask stream is not
+            // touched, so every other consumer keeps its alignment, and a
+            // future coupled downsample of this pair is blocked by the same
+            // shared mask either way — requantizing removes no option that
+            // existed before (an earlier draft skipped over-res shared-mask
+            // pairs entirely; that stranded ~1 MB of real savings on the NASA
+            // corpus while protecting against nothing).
+            if !resize_eligible() {
+                return plan_requant_replacement(stream, options, id, px_w, px_h);
+            }
             // The base is over-resolution, so the whole pair earns a
             // downsample. ATOMICITY (hard rule): plan both streams together
             // and apply both together — a failure on EITHER side (corrupt
@@ -707,26 +750,25 @@ fn plan_replacement(
             return None;
         }
 
-        // D-M1: dimension-preserving requantization (see the guard note above).
-        let out = plan_dct_requant(stream, options, px_w, px_h)?;
-        let original = stream.content.len();
-        if out.len() * 100 >= original * 95 {
-            return None;
-        }
-        return Some(Replacement {
-            id,
-            content: out,
-            width: px_w as i64,
-            height: px_h as i64,
-            dict_update: DictUpdate::Dct,
-            smask: None,
-        });
+        // D-M1: dimension-preserving requantization (see the guard note
+        // above). Reachable for SHARED masks too (P-M1): the mask stream is
+        // never modified, so every other consumer keeps its alignment.
+        return plan_requant_replacement(stream, options, id, px_w, px_h);
     }
 
-    // The unmasked path: anything not over-resolved (effective DPI inside the
-    // margin, or already at/below the target pixel geometry) is left untouched.
+    // The unmasked path. Anything not over-resolved (effective DPI inside the
+    // margin, or already at/below the target pixel geometry) is never
+    // RESIZED; under-threshold DCTDecode payloads instead take the same
+    // dimension-preserving requantization D-M1 applies to masked bases
+    // (Phase 6 P-M2) — quality normalization for scanner-quality JPEGs the
+    // resize pipeline never reaches. FlateDecode stays untouched (lossless
+    // contract — a JPEG re-encode would need the `allow_lossy_reencode`
+    // consent surface), and CCITT/bitonal never reaches this point.
     if !over_resolution {
-        return None;
+        if !matches!(class, FilterClass::DctOnly) {
+            return None;
+        }
+        return plan_requant_replacement(stream, options, id, px_w, px_h);
     }
 
     let (out, dict_update) = match class {
@@ -860,6 +902,33 @@ fn plan_dct_requant(
         return None;
     }
     Some(out)
+}
+
+/// The dimension-preserving requantization as a full `Replacement`, shared by
+/// D-M1 (masked bases, shared or not) and P-M2 (unmasked under-threshold
+/// JPEGs): re-encode at the configured quality via `plan_dct_requant`, then
+/// apply the 5% minimum-savings guard (the idempotence note in
+/// `plan_replacement` — generation-loss churn lands under 5% and is declined,
+/// genuine first-time requants of scanner-quality payloads save far more).
+fn plan_requant_replacement(
+    stream: &lopdf::Stream,
+    options: OptimizeOptions,
+    id: ObjectId,
+    px_w: u32,
+    px_h: u32,
+) -> Option<Replacement> {
+    let out = plan_dct_requant(stream, options, px_w, px_h)?;
+    if out.len() * 100 >= stream.content.len() * 95 {
+        return None;
+    }
+    Some(Replacement {
+        id,
+        content: out,
+        width: px_w as i64,
+        height: px_h as i64,
+        dict_update: DictUpdate::Dct,
+        smask: None,
+    })
 }
 
 /// True if re-decoding `out` reproduces the reference's geometry, channel
@@ -2642,10 +2711,78 @@ mod tests {
     #[test]
     fn uniformly_low_resolution_image_still_skipped() {
         // Guard the other direction: considering both axes must not cause
-        // already-adequate images to be churned.
+        // already-adequate images to be RESIZED. (The q92 payload itself may
+        // shrink via the P-M2 dimension-preserving requantization — geometry
+        // is what this test pins.)
         let pdf = build_pdf_placed(120, 100, 100);
         let out = optimize(&pdf);
-        assert_eq!(image_dims(&out), (120, 120), "must be left untouched");
+        assert_eq!(image_dims(&out), (120, 120), "must never be resized");
+    }
+
+    #[test]
+    fn under_threshold_unmasked_jpeg_is_requantized() {
+        // Phase 6 P-M2: 400px drawn into a 240pt box ≈ 120 DPI — under the
+        // 130 x 1.15 over-resolution threshold, so the resize pipeline never
+        // fires. The scanner-quality q92 payload must instead be requantized
+        // at jpeg_quality (78) in place: strictly smaller, exact same
+        // geometry.
+        let pdf = build_pdf(400, 240);
+        let before = image_stream_bytes(&pdf);
+        let out = optimize(&pdf);
+
+        assert!(out.len() < pdf.len(), "requantized output must be smaller");
+        assert_eq!(image_dims(&out), (400, 400), "dimensions must be identical");
+        let after = image_stream_bytes(&out);
+        assert!(
+            after.len() < before.len(),
+            "the payload must be strictly smaller"
+        );
+        assert!(Document::load_mem(&out).is_ok());
+    }
+
+    #[test]
+    fn under_threshold_requant_is_idempotent() {
+        // P-M2 idempotence: the second pass re-attempts the requant and the
+        // 5% minimum-savings guard declines the generation-loss churn.
+        let pdf = build_pdf(400, 240);
+        let once = optimize(&pdf);
+        assert!(once.len() < pdf.len(), "first pass must shrink");
+        let twice = optimize(&once);
+        assert_eq!(twice, once, "second pass must be byte-stable");
+    }
+
+    #[test]
+    fn under_threshold_requant_growth_is_discarded() {
+        // The unmasked analogue of the D-M1 never-larger guard: the first
+        // pass downsamples to ~130 DPI q78; a second pass at quality 100 hits
+        // the P-M2 requant path, must grow the stream, and the guard discards
+        // it — the exact baseline bytes come back.
+        let pdf = build_pdf(400, 100);
+        let baseline = optimize(&pdf);
+        assert!(baseline.len() < pdf.len(), "baseline must be smaller");
+        let opts = OptimizeOptions::default().with_jpeg_quality(100);
+        let out = optimize_with_options(&baseline, opts);
+        assert_eq!(out, baseline, "growing requantization must be discarded");
+    }
+
+    #[test]
+    fn corrupt_under_threshold_jpeg_returns_exact_original_bytes() {
+        // Structurally valid PDF, garbage JPEG bytes, UNDER the threshold: the
+        // P-M2 requant attempts a decode, fails, and the fail-safe returns
+        // the exact input bytes.
+        let mut doc = Document::load_mem(&build_pdf(400, 240)).unwrap();
+        for obj in doc.objects.values_mut() {
+            if let Object::Stream(s) = obj {
+                if matches!(s.dict.get(b"Subtype"), Ok(Object::Name(n)) if n == b"Image") {
+                    s.set_content(b"\xff\xd8\xff not a real jpeg payload".to_vec());
+                }
+            }
+        }
+        let mut input: Vec<u8> = Vec::new();
+        doc.save_to(&mut input).unwrap();
+
+        let out = optimize(&input);
+        assert_eq!(out, input, "corrupt under-threshold JPEG must be untouched");
     }
 
     #[test]
@@ -2848,7 +2985,9 @@ mod tests {
 
     #[test]
     fn leaves_low_resolution_image_untouched() {
-        // 120px drawn into 100pt box => ~86 DPI, below target: no change.
+        // 120px drawn into 100pt box => ~86 DPI, below target: never resized.
+        // (P-M2 may still requantize the q92 payload in place — the geometry
+        // is the contract here.)
         let pdf = build_pdf(120, 100);
         let out = optimize(&pdf);
 
@@ -3329,15 +3468,12 @@ mod tests {
         assert_eq!(twice, once, "second pass must be byte-stable");
     }
 
-    #[test]
-    fn shared_smask_is_never_resized() {
-        // NASA-derived corruption repro: two over-resolution masked images
-        // whose masks are byte-identical. dedup merges the masks into ONE
-        // object BEFORE planning, so both bases reference a single /SMask id.
-        // Resizing that shared mask for one base's geometry would break the
-        // other's alpha alignment (real page-33 corruption caught live). Both
-        // pairs must therefore stay untouched: shared mask ⇒ fail-safe skip.
-        let mut doc = Document::load_mem(&build_pdf_smask(400, 100, 92)).unwrap();
+    /// Two 400x400 q92 JPEG bases sharing ONE eligible `/SMask` object (the
+    /// NASA dedup shape: byte-identical masks merged into a single id before
+    /// planning), each drawn `draw_pts` square on one page. The bases carry
+    /// DIFFERENT pixels so dedup never merges them — only the mask is shared.
+    fn build_pdf_shared_smask(draw_pts: i64) -> Vec<u8> {
+        let mut doc = Document::load_mem(&build_pdf_smask(400, draw_pts, 92)).unwrap();
         // Locate the original image id + its mask id.
         let (img_a_id, mask_a) = doc
             .objects
@@ -3381,10 +3517,15 @@ mod tests {
             },
             jpeg_b,
         ));
-        // Draw both on one page at 100pt each (over-resolution at 400px).
+        // Draw both on one page at draw_pts each.
         let content_id = doc.add_object(Stream::new(
             dictionary! {},
-            b"q 100 0 0 100 0 0 cm /Im0 Do Q q 100 0 0 100 150 0 cm /Im1 Do Q".to_vec(),
+            format!(
+                "q {d} 0 0 {d} 0 0 cm /Im0 Do Q q {d} 0 0 {d} {off} 0 cm /Im1 Do Q",
+                d = draw_pts,
+                off = draw_pts + 50
+            )
+            .into_bytes(),
         ));
         let page_resources = dictionary! {
             "XObject" => dictionary! {
@@ -3406,11 +3547,136 @@ mod tests {
         }
         let mut input: Vec<u8> = Vec::new();
         doc.save_to(&mut input).unwrap();
+        input
+    }
+
+    /// Every image stream carrying an `/SMask` in `pdf`, as
+    /// `(content, width, height, mask_id)` sorted by object id.
+    fn shared_smask_bases(pdf: &[u8]) -> Vec<(Vec<u8>, i64, i64, ObjectId)> {
+        let doc = Document::load_mem(pdf).unwrap();
+        let mut ids: Vec<ObjectId> = doc.objects.keys().copied().collect();
+        ids.sort();
+        ids.iter()
+            .filter_map(|id| match doc.get_object(*id) {
+                Ok(Object::Stream(s))
+                    if matches!(
+                        s.dict.get(b"Subtype"),
+                        Ok(Object::Name(n)) if n == b"Image"
+                    ) && s.dict.get(b"SMask").is_ok() =>
+                {
+                    let mask = match s.dict.get(b"SMask").unwrap() {
+                        Object::Reference(r) => *r,
+                        _ => panic!("fixture uses direct refs"),
+                    };
+                    let w = s.dict.get(b"Width").unwrap().as_i64().unwrap();
+                    let h = s.dict.get(b"Height").unwrap().as_i64().unwrap();
+                    Some((s.content.clone(), w, h, mask))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn shared_smask_is_never_resized() {
+        // NASA-derived corruption repro: two over-resolution masked images
+        // whose masks are byte-identical. dedup merges the masks into ONE
+        // object BEFORE planning, so both bases reference a single /SMask id.
+        // Resizing that shared mask for one base's geometry would break the
+        // other's alpha alignment (real page-33 corruption caught live). At
+        // 100pt the pairs are OVER-resolution (400px ≈ 288 DPI), so the
+        // coupled downsample must be declined — but the P-M1 split allows the
+        // DIMENSION-PRESERVING requant (mask untouched): both q92 bases get
+        // re-encoded at jpeg_quality in place. Geometry stays 400x400, both
+        // /SMask refs still point at the same unmodified mask object, and the
+        // mask's bytes are byte-identical before/after.
+        let input = build_pdf_shared_smask(100);
+        let out = optimize(&input);
+        assert!(out.len() < input.len(), "requant must shrink the bases");
+        let pairs = shared_smask_bases(&out);
+        assert_eq!(pairs.len(), 2);
+        for (content, w, h, _mask) in &pairs {
+            assert_eq!((*w, *h), (400, 400), "dims must be unchanged");
+            let img = image::load_from_memory_with_format(content, image::ImageFormat::Jpeg)
+                .expect("base is still a decodable JPEG");
+            assert_eq!((img.width(), img.height()), (400, 400));
+        }
+        assert_eq!(pairs[0].3, pairs[1].3, "both refs point at one mask");
+        // The shared mask itself is byte-identical to its pre-optimization form.
+        let in_pairs = shared_smask_bases(&input);
+        let input_doc = Document::load_mem(&input).unwrap();
+        let mask_before = input_doc
+            .get_object(in_pairs[0].3)
+            .unwrap()
+            .as_stream()
+            .unwrap()
+            .content
+            .clone();
+        let mask_after = Document::load_mem(&out)
+            .unwrap()
+            .get_object(pairs[0].3)
+            .unwrap()
+            .as_stream()
+            .unwrap()
+            .content
+            .clone();
+        assert_eq!(mask_before, mask_after, "shared mask must be untouched");
+    }
+
+    #[test]
+    fn shared_smask_under_threshold_bases_are_requantized() {
+        // Phase 6 P-M1: the same shared-mask shape drawn at 240pt (~120 DPI,
+        // UNDER the over-resolution threshold). Requantization never touches
+        // the mask, so the shared mask no longer blocks it: BOTH q92 bases
+        // must be re-encoded at jpeg_quality (78) in place — smaller, exact
+        // same 400x400 geometry, both /SMask refs still pointing at the SAME
+        // untouched mask object.
+        let input = build_pdf_shared_smask(240);
+        let before = shared_smask_bases(&input);
+        assert_eq!(before.len(), 2, "fixture must hold two masked bases");
+        assert_eq!(
+            before[0].3, before[1].3,
+            "fixture masks must be merged into one object"
+        );
+        let mask_bytes_before = smask_stream_bytes(&input, before[0].3);
 
         let out = optimize(&input);
-        // Both masked pairs must be untouched: the shared mask blocks any
-        // coupled downsample AND any requantization of either base.
-        assert_eq!(out.len(), input.len(), "shared-mask pairs must not change");
+        assert!(
+            out.len() < input.len(),
+            "requantized output must be smaller"
+        );
+
+        let after = shared_smask_bases(&out);
+        assert_eq!(after.len(), 2, "both masked bases must survive");
+        assert_eq!(
+            after[0].3, after[1].3,
+            "both /SMask refs must still point at the same mask object"
+        );
+        for ((base_before, ..), (base_after, w, h, _)) in before.iter().zip(&after) {
+            assert_eq!((*w, *h), (400, 400), "base dimensions must be identical");
+            assert!(
+                base_after.len() < base_before.len(),
+                "each base must be strictly smaller"
+            );
+        }
+        assert_eq!(
+            smask_stream_bytes(&out, after[0].3),
+            mask_bytes_before,
+            "the shared mask stream must be byte-identical"
+        );
+        assert!(Document::load_mem(&out).is_ok());
+    }
+
+    #[test]
+    fn shared_smask_requant_is_idempotent() {
+        // P-M1 idempotence: the first pass requantizes both shared-mask bases;
+        // the second pass re-attempts the requant and the 5% minimum-savings
+        // guard declines the generation-loss churn. Byte-stable.
+        let input = build_pdf_shared_smask(240);
+        let once = optimize(&input);
+        assert!(once.len() < input.len(), "first pass must shrink");
+        let twice = optimize(&once);
+        assert_eq!(twice, once, "second pass must be byte-stable");
     }
 
     #[test]

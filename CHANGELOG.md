@@ -8,6 +8,25 @@ and this project adheres to
 
 ## [Unreleased]
 
+### Added
+
+- **Requantization reach extensions (Phase 6).** Two classes of
+  scanner-quality JPEG the Phase 5 pipeline never reached now take the
+  dimension-preserving requantization: masked images whose `/SMask` is shared
+  by several bases (the refcount fail-safe now blocks only resizing, which is
+  the only transform that can misalign other consumers — P-M1), and
+  unmasked/masked DCTDecode payloads at or below the DPI threshold, which are
+  quality-normalized in place instead of being left at scanner grade forever
+  (P-M2). Same guards as D-M1 throughout: strict-smaller + 5% minimum savings,
+  decode-back verification, untouched mask streams, byte-stable repeat passes.
+  Reference corpus: 5.55 MB → 4.96 MB (70.5% reduction from the original
+  16.8 MB).
+
+### Changed
+
+- **`SmaskUse` eligibility split.** `eligible_smask` now takes a usage intent;
+  the shared-mask refcount guard applies to resize-intent lookups only.
+
 [Unreleased]: nothing yet.
 
 ## [0.2.2] - 2026-08-22

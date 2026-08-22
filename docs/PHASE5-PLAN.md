@@ -159,6 +159,33 @@ its conversion of lossless image payloads to JPEG — exactly the consent-gated
   requires its own consent surface (`allow_lossy_reencode`) and vetting spike.
 - PDF/A, encrypted docs: skipped as today.
 
+## Phase 6 addendum — requantization reach extensions (2026-08-22)
+
+Byte-census probes on amatl's own NASA output found two classes of
+scanner-quality JPEG that the Phase 5 pipeline never reached. Both fixes are
+dimension-preserving requantizations — the same transform D-M1 established,
+with the same 5% minimum-savings guard, decode-back verification, and
+fail-safe skips:
+
+**P-M1 — Shared-mask requantization.** The shared-mask refcount guard is now
+scoped to RESIZE intent only (`SmaskUse::Resize` vs `SmaskUse::Requant`): a
+mask referenced by several images still blocks the coupled downsample, but no
+longer blocks requantization, which never touches the mask stream and cannot
+misalign any consumer. An earlier draft also skipped over-res shared-mask
+pairs entirely on a "cementing" rationale; that reasoning was wrong (the
+future downsample it protected is blocked by the same shared mask either way)
+and stranded ~1 MB of real savings on the reference corpus.
+
+**P-M2 — Under-threshold JPEG quality normalization.** DCTDecode payloads at
+or below the DPI threshold were previously left at scanner quality forever;
+they now take the same dimension-preserving requantization. FlateDecode bases
+remain excluded (lossless contract), bitonal remains owned by the G4 pass.
+
+Measured: amatl 5,547,684 B (D-M3) → 4,958,148 B on the reference corpus
+(70.5% of the 16,804,107 B original) vs Ghostscript's 3,722,562 B — gap now
+1.33×. Byte-stable on second pass; all 74 mask/base pairs dimensionally
+aligned; renders clean in Ghostscript.
+
 ## Gates (every milestone)
 
 cargo build && cargo test && cargo test --doc && cargo clippy --all-targets
