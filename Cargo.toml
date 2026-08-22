@@ -9,7 +9,9 @@ readme = "README.md"
 keywords = ["pdf", "compression", "optimizer", "jpeg", "mozjpeg"]
 categories = ["compression", "multimedia::images"]
 edition = "2021"
-rust-version = "1.77.2"
+# Floor comes from lopdf 0.42.0, whose manifest declares edition = "2024"
+# (requires Cargo/Rust >= 1.85) — not from this crate's own code.
+rust-version = "1.85.0"
 
 [package.metadata.docs.rs]
 targets = ["x86_64-unknown-linux-gnu"]
