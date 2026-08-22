@@ -128,9 +128,9 @@ settings — 130 DPI, 1.15 threshold, DCTEncode QFactor 0.4):
 
 On a public real-world document —
 [NASA TM-20210010291](https://ntrs.nasa.gov/citations/20210010291), a 16.8 MB
-58-page technical report — amatl 0.2.0 (strip, no packing) takes 16,804,107
-bytes to 11,353,517 bytes, a 32% reduction (0.1.x, JPEG-only, managed 24.5%
-on the same file). Ghostscript 10.07.1 (`/ebook` with
+58-page technical report — amatl 0.2.1 (strip, no packing) takes 16,804,107
+bytes to 11,350,430 bytes, a 32% reduction (0.1.x, JPEG-only, managed 24.5%
+on the same file), byte-stable under repeated optimization. Ghostscript 10.07.1 (`/ebook` with
 `-dDetectDuplicateImages=true`) takes the same file to 4,931,402 bytes —
 clearly ahead on raw ratio for this corpus. Most of that gap is Ghostscript's
 willingness to re-encode lossless images as JPEG (an artifact-class change
