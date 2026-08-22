@@ -315,7 +315,27 @@ has no such hazard and remains a legitimate B-M2 candidate.
 - **Out of scope, recommend permanently:** symbol/lossy JBIG2, bitonal
   downsampling, and MRC (below).
 
-### B.3 Risk register
+### B.3 Vetting spike results (2026-08-22) — PASS
+
+All checks against `fax 0.3.0` (probes live in `tests/fax_spike.rs`, kept as a
+permanent regression harness):
+
+| Check | Result | Detail |
+| --- | --- | --- |
+| License | PASS | MIT LICENSE file present in the crate |
+| Unsafe | PASS | `#![deny(unsafe_code)]` crate-wide |
+| MSRV | PASS | `rust-version = "1.88.0"` — exactly at our floor |
+| Transitive deps | PASS | none beyond std |
+| G4 round-trip | PASS | pixel equality on noise / flat-run / document-like / tiny-8×8 / single-row patterns (all five row filters of synthetic content) |
+| Panic safety | PASS | truncations at 5 offsets (incl. inside EOFB), every single-byte bit-flip across a valid stream, and 64 pure-garbage streams — zero panics, all fold to clean `None`/error |
+| Byte economy | PASS (with one honest caveat) | document-like: G4 **11,694 B vs flate9 12,346 B — G4 wins** (10.6% vs 11.2% of raw); flat-runs: G4 330 vs flate9 280 (deflate's best case, all-white rows); noise: both expand, G4 more |
+
+**Gate decision: PROCEED with B-M1.** The never-larger guard makes the
+flat-runs caveat harmless — a stream is only ever replaced when G4 is strictly
+smaller, and G4 wins on the realistic scanned-document pattern, which is the
+entire target corpus for this milestone.
+
+### B.4 Risk register
 
 | Risk | Assessment / recommendation |
 | --- | --- |

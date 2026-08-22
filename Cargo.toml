@@ -36,6 +36,7 @@ rayon = "1"
 subsetter = { version = "0.2.6", default-features = false }
 
 [dev-dependencies]
+fax = "0.3.0"
 # Test-only verification oracle for the font-subsetting path: per-glyph
 # outline + advance equality between the original and subset font programs.
 # Never a runtime dependency.
