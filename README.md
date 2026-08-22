@@ -156,9 +156,9 @@ worse file.
 - **Build-time requirements:** mozjpeg compiles libjpeg-turbo, which needs
   NASM and a C compiler at build time (CI uses `ilammy/setup-nasm`). There is
   no native *runtime* dependency.
-- **MSRV: 1.85.0**, enforced by a dedicated CI job. The floor is
-  dependency-driven: lopdf 0.42.0's manifest declares edition 2024, which
-  requires Cargo/Rust >= 1.85.
+- **MSRV: 1.88.0**, enforced by a dedicated CI job. The floor is
+  dependency-driven: lopdf 0.42.0's manifest declares edition 2024 (Cargo/Rust
+  >= 1.85), and current `image`/`time` releases require rustc 1.88.
 - mozjpeg's IJG license requires an attribution notice in documentation
   accompanying *binary* distributions; a `NOTICE` file will ship if and when
   prebuilt binaries do. Source distribution does not trigger it.
