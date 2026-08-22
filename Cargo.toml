@@ -1,0 +1,25 @@
+[package]
+name = "amatl"
+version = "0.1.0"
+description = "Pure-Rust PDF size optimizer: CTM-aware effective-DPI downsampling of embedded JPEGs via mozjpeg, with a hard fail-safe contract"
+authors = ["Xchel Dominguez <xjdom2@gmail.com>"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/xcheljd/amatl"
+readme = "README.md"
+keywords = ["pdf", "compression", "optimizer", "jpeg", "mozjpeg"]
+categories = ["compression", "multimedia::images"]
+edition = "2021"
+rust-version = "1.77.2"
+
+[package.metadata.docs.rs]
+targets = ["x86_64-unknown-linux-gnu"]
+
+[dependencies]
+# Hard ceiling: 0.43 and 0.44 do not compile against current `time` (their
+# datetime.rs calls FormatItem::StringLiteral, removed in time 0.3.47).
+# Re-test the bump when lopdf publishes a release that fixes this.
+lopdf = "0.42"
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
+mozjpeg = "0.10"
+# Parallel image work. Pure Rust, MIT OR Apache-2.0, no native deps.
+rayon = "1"
