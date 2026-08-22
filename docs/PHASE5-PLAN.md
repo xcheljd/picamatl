@@ -68,6 +68,18 @@ Since the transform never resizes, the effective-DPI margin of the resize
 pipeline is intentionally not applied to masked JPEGs — mask alignment is
 preserved by construction.
 
+**D-M2 SHIPPED** (0.2.1-dev, 2026-08-22): SMask-coupled downsampling
+(`plan_smask_pair_downsample`, `plan_mask_resample`,
+`plan_dct_resize_verified`). Over-resolution masked JPEG pairs are downsampled
+as an ATOMIC unit: base (Lanczos3 → JPEG q78) and mask (Triangle → plain
+FlateDecode gray) land at identical target geometry and are replaced together
+or not at all. Combined 5% minimum-savings guard; decode-back on both sides
+(exact for the lossless mask). Shared-mask fail-safe: a mask referenced by
+more than one image is never resized (dedup merges byte-identical masks before
+planning, making sharing reachable in practice — NASA page-33 repro). Measured
+on the reference corpus: amatl 11.51 MB (D-M1) → 6.03 MB vs Ghostscript's
+3.72 MB; idempotent across repeated passes.
+
 ## D-M2 — SMask-coupled downsampling (the big one)
 
 Scope: same eligibility as D-M1 plus over-resolution pairs (effective DPI >

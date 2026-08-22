@@ -10,6 +10,19 @@ and this project adheres to
 
 ### Added
 
+- **SMask-coupled downsampling (Phase 5 D-M2).** Over-resolution JPEG images
+  with an eligible `/SMask` are now downsampled as an atomic pair: base
+  (Lanczos3 → JPEG at `jpeg_quality`) and mask (Triangle → plain FlateDecode
+  8-bit DeviceGray) are resampled to the SAME target geometry and replaced
+  together — never one side alone. The combined candidate must beat the pair's
+  original size by the full 5% minimum, and both halves pass decode-back
+  verification (exact for the lossless mask). A mask referenced by more than
+  one image is never resized (fail-safe: dedup merges byte-identical masks
+  before planning, so sharing is reachable in practice), and all D-M1 skip
+  rules (`/Matte`, stencils, ineligible mask shapes, corrupt streams) carry
+  over. On the 16.8 MB NASA reference report this takes amatl from 11.51 MB
+  (D-M1) to 6.03 MB vs Ghostscript's 3.72 MB, byte-stable across passes.
+
 - **SMask-aware JPEG requantization (Phase 5 D-M1).** JPEG (`DCTDecode`)
   images carrying an `/SMask` soft mask are no longer unconditionally skipped:
   when the mask resolves to a plain 8-bit DeviceGray image stream with no

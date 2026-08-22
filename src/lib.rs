@@ -21,13 +21,16 @@
 //!      JPEG artifacts are ever introduced on that content class.
 //!   3. Replace the stream only when the result is actually smaller.
 //!
-//!   Soft-masked DCTDecode images (`/SMask`) follow a separate,
-//!   dimension-preserving rule (Phase 5 D-M1): when the mask is a plain 8-bit
-//!   DeviceGray image stream with no `/Matte`, the base is re-encoded at the
-//!   configured JPEG quality at its OWN dimensions — never resized, so mask
-//!   alignment is untouched by construction — and the `/SMask` stream is never
-//!   modified. `/Mask` (stencil/color-key) images and any ineligible `/SMask`
-//!   stay untouched.
+//!   Soft-masked DCTDecode images (`/SMask`) follow the Phase 5 D-milestone
+//!   rules: over-resolution pairs are **downsampled as a unit** (D-M2) — the
+//!   base JPEG and its `/SMask` stream are resampled to the SAME target
+//!   geometry and replaced together or not at all — while pairs at or below
+//!   the target resolution take the dimension-preserving D-M1 requantization
+//!   (the base is re-encoded at the configured JPEG quality at its OWN
+//!   dimensions, never resized, and the `/SMask` stream is never modified).
+//!   Both apply only when the mask is a plain 8-bit DeviceGray image stream
+//!   with no `/Matte`. `/Mask` (stencil/color-key) images and any ineligible
+//!   `/SMask` stay untouched.
 //!
 //! Optionally (opt-in via [`OptimizeOptions::subset_fonts`]), embedded
 //! Type0/CIDFontType2 (Identity-H/V) fonts are subset to the glyphs actually
@@ -455,6 +458,20 @@ struct Replacement {
     width: i64,
     height: i64,
     dict_update: DictUpdate,
+    /// Phase 5 D-M2: a paired `/SMask` stream replacement, applied atomically
+    /// with the base (the mask/image unit rule — never one side alone). `None`
+    /// for single-stream replacements (unmasked downsample, D-M1 requant).
+    smask: Option<MaskReplacement>,
+}
+
+/// Phase 5 D-M2: the `/SMask` stream's half of a coupled downsampling. The
+/// mask is re-encoded as plain FlateDecode 8-bit DeviceGray rows at the WIDTH
+/// AND HEIGHT of the base's target geometry.
+struct MaskReplacement {
+    mask_id: ObjectId,
+    content: Vec<u8>,
+    width: i64,
+    height: i64,
 }
 
 /// The single-filter classes the re-encode paths know how to handle.
@@ -535,6 +552,30 @@ fn eligible_smask(doc: &Document, smask: &Object) -> Option<ObjectId> {
     {
         return None;
     }
+    // Shared-mask fail-safe (Phase 5 review finding): a `/SMask` object
+    // referenced by MORE than one image cannot be safely resized for one
+    // consumer's geometry without breaking the other's pixel alignment.
+    // This is reachable in practice: dedup merges byte-identical masks (e.g.
+    // three copies of the same 620-byte thumbnail mask on one NASA page)
+    // BEFORE planning runs, so several images legitimately share one mask id
+    // here. Count DIRECT references to this mask id; any second consumer
+    // disqualifies the pair entirely. (Indirect-reference chains are not
+    // counted, but `eligible_smask` only accepts direct references anyway.)
+    let refcount = doc
+        .objects
+        .values()
+        .filter(|obj| {
+            let raw = match obj {
+                Object::Stream(s) => s.dict.get(b"SMask"),
+                Object::Dictionary(d) => d.get(b"SMask"),
+                _ => return false,
+            };
+            matches!(raw, Ok(Object::Reference(id2)) if *id2 == mask_id)
+        })
+        .count();
+    if refcount > 1 {
+        return None;
+    }
     Some(mask_id)
 }
 
@@ -568,22 +609,22 @@ fn plan_replacement(
         return None;
     }
 
-    // Transparency handling (Phase 5 D-M1). A `/Mask` (stencil / color-key) is
-    // always a hard skip; only `/SMask` soft masks open eligibility, and only
-    // for the dimension-preserving JPEG requantization branch below — the
-    // `/SMask` stream itself is never modified in D-M1. An ineligible `/SMask`
-    // (unresolvable reference, non-image object, `/ImageMask` stencil,
-    // non-DeviceGray color space, `BitsPerComponent` other than 8, or a
-    // `/Matte` anywhere in the pair) leaves the whole image untouched.
+    // Transparency handling (Phase 5 D-M1 / D-M2). A `/Mask` (stencil /
+    // color-key) is always a hard skip; `/SMask` soft masks open eligibility
+    // only for the pair shapes D-M1 already vetted — a plain 8-bit DeviceGray
+    // image stream, `/ImageMask` stencil unset, no `/Matte` anywhere in the
+    // pair. An ineligible `/SMask` (unresolvable reference, non-image object,
+    // `/ImageMask` stencil, non-DeviceGray color space, `BitsPerComponent`
+    // other than 8) leaves the whole pair untouched.
     let smask_present = dict.get(b"SMask").is_ok();
     if dict.get(b"Mask").is_ok() || (smask_present && dict.get(b"Matte").is_ok()) {
         return None;
     }
-    let smask_eligible = match dict.get(b"SMask") {
-        Ok(smask_value) => eligible_smask(doc, smask_value).is_some(),
-        Err(_) => false,
+    let smask_id = match dict.get(b"SMask") {
+        Ok(smask_value) => eligible_smask(doc, smask_value),
+        Err(_) => None,
     };
-    if smask_present && !smask_eligible {
+    if smask_present && smask_id.is_none() {
         return None;
     }
     let filter = dict.get(b"Filter").ok()?;
@@ -600,25 +641,60 @@ fn plan_replacement(
         return None;
     }
 
-    // D-M1: soft-mask-aware JPEG requantization. When the base carries an
-    // eligible `/SMask`, the only allowed transform is dimension-preserving:
-    // decode the base at its own size and re-encode at the configured quality.
-    // Never resized, so soft-mask alignment is untouched by construction.
-    // FlateDecode bases are deferred to D-M3; the `/SMask` stream itself is
-    // never modified here.
+    // Effective DPI = pixels / inches displayed, evaluated on BOTH axes. A
+    // non-uniformly scaled image (say 1000x1000 px drawn into 500x100 pt) can
+    // sit under the threshold horizontally while being ~6x over-resolved
+    // vertically; testing width alone skipped the whole image. Consider it if
+    // *either* axis is over-resolved — the `target_* < px_*` component here
+    // still prevents any upscaling. This is EXACTLY the gate the unmasked
+    // path applies below; D-M2's coupled downsampling shares it unchanged.
+    // `non_uniform_placement_is_downsampled` pins the both-axes rule.
+    let eff_dpi_w = px_w as f32 / (rendered_w_pts / 72.0);
+    let eff_dpi_h = px_h as f32 / (rendered_h_pts / 72.0);
+    let target_w = ((rendered_w_pts / 72.0) * target_dpi).round().max(1.0) as u32;
+    let target_h = ((rendered_h_pts / 72.0) * target_dpi).round().max(1.0) as u32;
+    let over_resolution =
+        eff_dpi_w.max(eff_dpi_h) > target_dpi * dpi_margin && target_w < px_w && target_h < px_h;
+
+    // D-M1 / D-M2 masked-JPEG handling. FlateDecode bases carrying `/SMask`
+    // are deferred to D-M3. For DCTDecode bases:
+    //   - OVER-RESOLUTION pairs are downsampled as a unit (D-M2): base and
+    //     `/SMask` are resampled to the SAME target geometry and replaced
+    //     together (atomic — never one side alone);
+    //   - pairs at/below the target take the dimension-preserving D-M1
+    //     requantization: the base is decoded at its own size, re-encoded at
+    //     the configured quality, and the `/SMask` stream is never modified.
     //
-    // Idempotence guard: requantization is lossy, so re-running it on an
-    // already-requantized payload keeps shrinking by a fraction of a percent
-    // each pass (generation loss). A stream is only requantized when the
-    // candidate saves at least 5% — a real first-time requant of an
-    // over-quality scan saves far more (the NASA corpus measured 40-55% per
-    // stream), while same-quality generation-loss churn is 1-4% and decays
-    // each pass. This makes optimize(optimize(x)) a no-op in practice without
-    // blocking genuine wins.
+    // Idempotence guard (D-M1, % ported to the D-M2 pair below): requantization
+    // is lossy, so re-running it on an already-requantized payload keeps
+    // shrinking by a fraction of a percent each pass (generation loss). A
+    // stream is only requantized when the candidate saves at least 5% — a real
+    // first-time requant of an over-quality scan saves far more (the NASA
+    // corpus measured 40-55% per stream), while same-quality generation-loss
+    // churn is 1-4% and decays each pass. This makes optimize(optimize(x)) a
+    // no-op in practice without blocking genuine wins.
     if smask_present {
         if !matches!(class, FilterClass::DctOnly) {
             return None;
         }
+        let mask_id = smask_id.expect("smask_id is set whenever smask_present");
+        if over_resolution {
+            // The base is over-resolution, so the whole pair earns a
+            // downsample. ATOMICITY (hard rule): plan both streams together
+            // and apply both together — a failure on EITHER side (corrupt
+            // base, corrupt mask, decode-back mismatch, or a COMBINED size
+            // that does not save the 5% minimum) skips the entire pair. There
+            // is deliberately no D-M1 fallback here: replacing only the base
+            // would violate the mask/image unit rule.
+            if let Some(replacement) = plan_smask_pair_downsample(
+                doc, id, mask_id, stream, px_w, px_h, target_w, target_h, options,
+            ) {
+                return Some(replacement);
+            }
+            return None;
+        }
+
+        // D-M1: dimension-preserving requantization (see the guard note above).
         let out = plan_dct_requant(stream, options, px_w, px_h)?;
         let original = stream.content.len();
         if out.len() * 100 >= original * 95 {
@@ -630,24 +706,13 @@ fn plan_replacement(
             width: px_w as i64,
             height: px_h as i64,
             dict_update: DictUpdate::Dct,
+            smask: None,
         });
     }
 
-    // Effective DPI = pixels / inches displayed, evaluated on BOTH axes. A
-    // non-uniformly scaled image (say 1000x1000 px drawn into 500x100 pt) can
-    // sit under the threshold horizontally while being ~6x over-resolved
-    // vertically; testing width alone skipped the whole image. Consider it if
-    // *either* axis is over-resolved — the `target_* >= px_*` guard below still
-    // prevents any upscaling. `non_uniform_placement_is_downsampled` pins this.
-    let eff_dpi_w = px_w as f32 / (rendered_w_pts / 72.0);
-    let eff_dpi_h = px_h as f32 / (rendered_h_pts / 72.0);
-    if eff_dpi_w.max(eff_dpi_h) <= target_dpi * dpi_margin {
-        return None;
-    }
-
-    let target_w = ((rendered_w_pts / 72.0) * target_dpi).round().max(1.0) as u32;
-    let target_h = ((rendered_h_pts / 72.0) * target_dpi).round().max(1.0) as u32;
-    if target_w >= px_w || target_h >= px_h {
+    // The unmasked path: anything not over-resolved (effective DPI inside the
+    // margin, or already at/below the target pixel geometry) is left untouched.
+    if !over_resolution {
         return None;
     }
 
@@ -676,6 +741,7 @@ fn plan_replacement(
         width: target_w as i64,
         height: target_h as i64,
         dict_update,
+        smask: None,
     })
 }
 
@@ -813,6 +879,180 @@ fn decode_back_matches(
         .map(|(a, b)| u64::from(a.abs_diff(*b)))
         .sum();
     sad as f64 / reference_pixels.len() as f64 <= max_mad
+}
+
+/// Phase 5 D-M2. Overhead allowance for the combined-size guard, covering the
+/// dict tokens the mask replacement writes beyond the stream bytes themselves
+/// (`/Width`, `/Height`, the scalar `/Filter /FlateDecode` line). The real
+/// delta is usually negative — a stale `/DecodeParms` (a multi-hundred-byte
+/// dict) is dropped — so this fixed positive allowance is deliberately
+/// conservative.
+const MASK_DICT_OVERHEAD: usize = 64;
+
+/// The D-M2 base half: decode (DCT-scaled when possible), resize to the EXACT
+/// target geometry with the same Lanczos3 kernel the unmasked path uses,
+/// re-encode as JPEG, and decode-back-verify the candidate against the exact
+/// resized pixels (geometry + channel count + MAD ceiling) — the same MAD-based
+/// check D-M1 applies to its requantized payloads.
+fn plan_dct_resize_verified(
+    stream: &lopdf::Stream,
+    options: OptimizeOptions,
+    target_w: u32,
+    target_h: u32,
+) -> Option<Vec<u8>> {
+    let quality = options.jpeg_quality.clamp(1, 100);
+    let (decoded, is_gray) = decode_jpeg(&stream.content, target_w, target_h)?;
+    let resized = decoded.resize_exact(target_w, target_h, image::imageops::FilterType::Lanczos3);
+    // Reference pixels are the exact buffer handed to the encoder; the
+    // decode-back below must reproduce its geometry, channel count and nearby
+    // pixels from the re-encoded JPEG.
+    let reference = if is_gray {
+        resized.to_luma8().into_raw()
+    } else {
+        resized.to_rgb8().into_raw()
+    };
+    let out = encode_jpeg(resized, is_gray, quality)?;
+    if !decode_back_matches(
+        &out,
+        &reference,
+        is_gray,
+        target_w,
+        target_h,
+        DECODE_BACK_MAX_MAD,
+    ) {
+        return None;
+    }
+    Some(out)
+}
+
+/// The D-M2 mask half: decode the `/SMask` stream — the payload may be JPEG OR
+/// FlateDecode — resample gray samples to the BASE's exact target geometry
+/// (the core invariant: base and mask must end at identical width/height), and
+/// re-encode as plain FlateDecode 8-bit DeviceGray rows (zlib of packed rows,
+/// no predictor). Returns `None` on any doubt: a mask that refuses to decode
+/// as single-channel gray, a non-identity `/Decode`, lying geometry, or a
+/// candidate that fails its own decode-back.
+fn plan_mask_resample(
+    doc: &Document,
+    mask_stream: &lopdf::Stream,
+    px_w: u32,
+    px_h: u32,
+    target_w: u32,
+    target_h: u32,
+) -> Option<Vec<u8>> {
+    let dict = &mask_stream.dict;
+    // A non-identity `/Decode` would remap samples after decoding; the
+    // exact-byte verification below assumes identity.
+    if dict.get(b"Decode").is_ok() {
+        return None;
+    }
+    let filter = dict.get(b"Filter").ok()?;
+    let class = classify_filter(doc, filter);
+    let mask_img = match class {
+        FilterClass::DctOnly => {
+            let (decoded, is_gray) = decode_jpeg(&mask_stream.content, target_w, target_h)?;
+            // A soft mask is a one-component image; a non-gray payload behind
+            // the DeviceGray declaration is a mismatch — skip the whole pair.
+            if !is_gray {
+                return None;
+            }
+            decoded
+        }
+        FilterClass::FlateOnly => {
+            if flate_channels(doc, dict)? != 1 {
+                return None;
+            }
+            let encoding = flate_encoding(dict, 1, px_w)?;
+            let expected = u64::from(px_w) * u64::from(px_h);
+            if expected > MAX_FLATE_PIXEL_BYTES {
+                return None;
+            }
+            let decoded = match encoding {
+                FlateEncoding::Plain => inflate_capped(&mask_stream.content, expected as usize)?,
+                FlateEncoding::PngPredictor => {
+                    let filtered_len = (px_w as usize + 1) * px_h as usize;
+                    let inflated = inflate_capped(&mask_stream.content, filtered_len)?;
+                    if inflated.len() != filtered_len {
+                        return None;
+                    }
+                    png_defilter(&inflated, 1, px_w as usize)?
+                }
+            };
+            if decoded.len() as u64 != expected {
+                return None;
+            }
+            DynamicImage::ImageLuma8(image::GrayImage::from_raw(px_w, px_h, decoded)?)
+        }
+        FilterClass::CcittOnly | FilterClass::Other => return None,
+    };
+
+    // Bilinear on gray (plan §D-M2), to the base's exact target geometry.
+    let resized = mask_img.resize_exact(target_w, target_h, image::imageops::FilterType::Triangle);
+    let raw = resized.into_luma8().into_raw();
+    let out = deflate_level9(&raw)?;
+
+    // Mask decode-back verification (hard rule): the candidate must inflate
+    // back to EXACTLY target_w*target_h gray samples, byte-identical to the
+    // planned raster. Flate is lossless, so equality must be exact.
+    let back = inflate_capped(&out, raw.len())?;
+    if back != raw {
+        return None;
+    }
+    Some(out)
+}
+
+/// Phase 5 D-M2: coupled downsampling of an over-resolution JPEG base and its
+/// eligible `/SMask`. Both streams are planned together — and carried by the
+/// single returned `Replacement` so the apply pass replaces them together.
+/// Any doubt on either side, or a COMBINED size that fails the never-larger /
+/// 5% idempotence guard, returns `None` and the whole pair stays untouched.
+#[allow(clippy::too_many_arguments)] // mirrors plan_replacement's flat signature
+fn plan_smask_pair_downsample(
+    doc: &Document,
+    id: ObjectId,
+    mask_id: ObjectId,
+    base_stream: &lopdf::Stream,
+    px_w: u32,
+    px_h: u32,
+    target_w: u32,
+    target_h: u32,
+    options: OptimizeOptions,
+) -> Option<Replacement> {
+    // Base: JPEG at the target geometry with the existing MAD decode-back.
+    let base_out = plan_dct_resize_verified(base_stream, options, target_w, target_h)?;
+
+    // Mask: decode (JPEG or Flate) + resample to the SAME geometry + Flate
+    // re-encode, verified by its own decode-back.
+    let mask_stream = doc.get_object(mask_id).ok()?.as_stream().ok()?;
+    let mask_out = plan_mask_resample(doc, mask_stream, px_w, px_h, target_w, target_h)?;
+
+    // ATOMICITY + idempotence, evaluated over the COMBINED pair. The 5%
+    // minimum-savings guard is the D-M1 philosophy ported to the pair: both
+    // lossy re-encodes save far more on a genuine first pass, while a second
+    // pass over an already-optimized pair lands under 5% and is declined
+    // (downsampling to a fixed DPI is naturally idempotent anyway — the
+    // `target_* >= px_*` half of `over_resolution` declines before we get
+    // here). It also enforces strict-shrink atomicity: the candidate must
+    // beat the pair's original size by the full 5% to replace both streams.
+    let combined_original = base_stream.content.len() + mask_stream.content.len();
+    let combined_candidate = base_out.len() + mask_out.len() + MASK_DICT_OVERHEAD;
+    if combined_candidate * 100 >= combined_original * 95 {
+        return None;
+    }
+
+    Some(Replacement {
+        id,
+        content: base_out,
+        width: target_w as i64,
+        height: target_h as i64,
+        dict_update: DictUpdate::Dct, // base keeps its existing form (/Filter, /ColorSpace, ...)
+        smask: Some(MaskReplacement {
+            mask_id,
+            content: mask_out,
+            width: target_w as i64,
+            height: target_h as i64,
+        }),
+    })
 }
 
 /// Raw pixel budget above which a Flate image is never decoded: 256 MiB
@@ -1451,6 +1691,24 @@ fn try_optimize(input: &[u8], options: OptimizeOptions) -> Result<Option<Vec<u8>
                     None => {
                         stream.dict.remove(b"DecodeParms");
                     }
+                }
+            }
+            // D-M2: the paired /SMask is applied atomically with the base —
+            // never one side alone. The mask stream keeps /ColorSpace
+            // /DeviceGray and /BitsPerComponent 8; it gains the new
+            // /Width//Height, the scalar /Filter /FlateDecode, and drops any
+            // stale /DecodeParms its old encoding carried.
+            if let Some(smask) = r.smask {
+                if let Ok(Object::Stream(mask_stream)) = doc.get_object_mut(smask.mask_id) {
+                    mask_stream.set_content(smask.content);
+                    mask_stream.dict.set("Width", Object::Integer(smask.width));
+                    mask_stream
+                        .dict
+                        .set("Height", Object::Integer(smask.height));
+                    mask_stream
+                        .dict
+                        .set("Filter", Object::Name(b"FlateDecode".to_vec()));
+                    mask_stream.dict.remove(b"DecodeParms");
                 }
             }
         }
@@ -2969,10 +3227,13 @@ mod tests {
     #[test]
     fn smask_masked_jpeg_requantizes_smaller_dimensions_identical() {
         // Positive D-M1 case: a q92 RGB JPEG with a plain 8-bit DeviceGray
-        // /SMask. The base must be re-encoded at jpeg_quality (78) WITHOUT
-        // resizing, replaced only because it is strictly smaller, and the
-        // /SMask must survive byte-for-byte pointing at the same mask stream.
-        let pdf = build_pdf_smask(400, 100, 92);
+        // /SMask placed at 240 pt (~120 DPI — UNDER the D-M2 over-resolution
+        // threshold, so the pair is not eligible for the coupled downsample
+        // and D-M1 remains the transform that applies). The base must be
+        // re-encoded at jpeg_quality (78) WITHOUT resizing, replaced only
+        // because it is strictly smaller, and the /SMask must survive
+        // byte-for-byte pointing at the same mask stream.
+        let pdf = build_pdf_smask(400, 240, 92);
         let (base_before, iw, ih, smask_before) = smask_base_info(&pdf);
         let mask_before = smask_stream_bytes(&pdf, smask_before);
         assert_eq!((iw, ih), (400, 400), "fixture base must be 400x400");
@@ -3004,11 +3265,100 @@ mod tests {
 
     #[test]
     fn smask_masked_optimize_is_idempotent() {
+        // Over-resolution masked pair: the first pass is a D-M2 coupled
+        // downsample (base + mask to 181 px). The second pass sees the pair at
+        // ~130 DPI, under the margin, so the coupled downsample is declined by
+        // the `target_* >= px_*` gate; the D-M1 requant that then applies is
+        // a byte-identical no-op (5% guard). Byte-stable.
         let pdf = build_pdf_smask(400, 100, 92);
         let once = optimize(&pdf);
         assert!(once.len() < pdf.len(), "first pass must shrink");
         let twice = optimize(&once);
         assert_eq!(twice, once, "second pass must be byte-stable");
+    }
+
+    #[test]
+    fn shared_smask_is_never_resized() {
+        // NASA-derived corruption repro: two over-resolution masked images
+        // whose masks are byte-identical. dedup merges the masks into ONE
+        // object BEFORE planning, so both bases reference a single /SMask id.
+        // Resizing that shared mask for one base's geometry would break the
+        // other's alpha alignment (real page-33 corruption caught live). Both
+        // pairs must therefore stay untouched: shared mask ⇒ fail-safe skip.
+        let mut doc = Document::load_mem(&build_pdf_smask(400, 100, 92)).unwrap();
+        // Locate the original image id + its mask id.
+        let (img_a_id, mask_a) = doc
+            .objects
+            .iter()
+            .find_map(|(id, obj)| match obj {
+                Object::Stream(s)
+                    if matches!(
+                        s.dict.get(b"Subtype"),
+                        Ok(Object::Name(n)) if n == b"Image"
+                    ) && s.dict.get(b"SMask").is_ok() =>
+                {
+                    let mask = match s.dict.get(b"SMask").unwrap() {
+                        Object::Reference(r) => *r,
+                        _ => panic!("fixture uses direct refs"),
+                    };
+                    Some((*id, mask))
+                }
+                _ => None,
+            })
+            .expect("fixture has one masked image");
+        // Second image: same geometry class (over-res when drawn), DIFFERENT
+        // pixels so dedup does not merge the BASES — only the masks merge.
+        let mut img_b = image::RgbImage::new(400, 400);
+        for (x, y, pixel) in img_b.enumerate_pixels_mut() {
+            *pixel = image::Rgb([255 - (x % 256) as u8, (y % 256) as u8, 128]);
+        }
+        let mut jpeg_b: Vec<u8> = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg_b, 92)
+            .encode_image(&img_b)
+            .unwrap();
+        let img_b_id = doc.add_object(Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Image",
+                "Width" => 400_i64,
+                "Height" => 400_i64,
+                "ColorSpace" => "DeviceRGB",
+                "BitsPerComponent" => 8_i64,
+                "Filter" => "DCTDecode",
+                "SMask" => mask_a,
+            },
+            jpeg_b,
+        ));
+        // Draw both on one page at 100pt each (over-resolution at 400px).
+        let content_id = doc.add_object(Stream::new(
+            dictionary! {},
+            b"q 100 0 0 100 0 0 cm /Im0 Do Q q 100 0 0 100 150 0 cm /Im1 Do Q".to_vec(),
+        ));
+        let page_resources = dictionary! {
+            "XObject" => dictionary! {
+                "Im0" => Object::Reference(img_a_id),
+                "Im1" => Object::Reference(img_b_id),
+            },
+        };
+        // Point the fixture's single-image page at our two-image content.
+        for obj in doc.objects.values_mut() {
+            if let Object::Dictionary(d) = obj {
+                if matches!(
+                    d.get(b"Type").map(|t| t.as_name()),
+                    Ok(Ok(name)) if name == b"Page"
+                ) {
+                    d.set("Resources", page_resources.clone());
+                    d.set("Contents", Object::Reference(content_id));
+                }
+            }
+        }
+        let mut input: Vec<u8> = Vec::new();
+        doc.save_to(&mut input).unwrap();
+
+        let out = optimize(&input);
+        // Both masked pairs must be untouched: the shared mask blocks any
+        // coupled downsample AND any requantization of either base.
+        assert_eq!(out.len(), input.len(), "shared-mask pairs must not change");
     }
 
     #[test]
@@ -3035,11 +3385,14 @@ mod tests {
 
     #[test]
     fn smask_requantization_never_larger_guard_holds() {
-        // Re-encoding a masked base UP to quality 100 from its already-optimized
-        // q78 payload must grow the stream; the per-stream never-larger guard
-        // must discard the replacement and return the exact original bytes.
+        // First pass D-M2-downsamples the over-resolution pair to 181 px. The
+        // second pass (quality 100) then sees an under-resolution pair, so the
+        // D-M1 dimension-preserving path applies: re-encoding the base UP to
+        // quality 100 from its q78 payload must grow the stream, and the
+        // per-stream never-larger guard must discard it — the exact baseline
+        // bytes (and untouched mask) come back.
         let pdf = build_pdf_smask(400, 100, 92);
-        let baseline = optimize(&pdf); // sits at the configured q78 after D-M1
+        let baseline = optimize(&pdf); // D-M2'd: pair sits at ~130 DPI after this
         assert!(baseline.len() < pdf.len(), "baseline must be smaller");
         let opts = OptimizeOptions::default().with_jpeg_quality(100);
         let out = optimize_with_options(&baseline, opts);
