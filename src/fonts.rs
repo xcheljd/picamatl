@@ -1,0 +1,1825 @@
+//! Font subsetting (Phase 3, C-M1): Type0 / CIDFontType2 / Identity-H|V
+//! fonts only, integrated via `subsetter` 0.2.6 (`default-features = false`).
+//!
+//! The design exploits the `/CIDToGIDMap` **stream** form so that
+//! content-stream text bytes are **never rewritten**: the subset font gets new
+//! (remapped) glyph IDs, and a freshly written old-CID -> new-GID map stream
+//! absorbs the remapping. `/W`, `/DW`, and `/ToUnicode` are keyed by CID,
+//! which never changes, so they stay untouched and text extraction is
+//! bit-identical pre/post. The entire "rewrote the text wrong" bug class is
+//! structurally impossible here.
+//!
+//! Fail-safe posture (eligibility, not effort — see docs/PHASE3-PLAN.md §C):
+//!
+//! - **Global rule:** if ANY content-bearing stream (page, form XObject,
+//!   annotation appearance, tiling pattern, Type3 char proc) fails strict
+//!   decompression or strict content parsing — or text is shown in a state we
+//!   cannot attribute to a font — **no font in the document is touched**.
+//! - **Per-font rule:** any doubt about one font (non-Identity encoding, no
+//!   `/FontFile2`, unresolvable `/CIDToGIDMap`, shared descendant/descriptor/
+//!   font file, out-of-range glyph IDs, `subsetter` error, not net-smaller)
+//!   leaves *that* font untouched.
+//! - PDF/A-declared documents (`pdfaid` in the XMP metadata) and encrypted
+//!   documents are skipped entirely (C-M2 revisits PDF/A with `/CIDSet`
+//!   regeneration).
+//!
+//! Discovery walks every stream class with its own resource context, with
+//! bounded recursion and a path-based cycle guard. Fonts reachable from
+//! contexts we cannot fully verify (AcroForm `/DR` — viewers may regenerate
+//! appearance streams from `/DA` strings we do not parse; ExtGState `/Font`
+//! entries) are disqualified rather than guessed at.
+
+use std::collections::{BTreeSet, HashMap, HashSet};
+
+use lopdf::content::Content;
+use lopdf::{dictionary, Dictionary, Document, Object, ObjectId, Stream};
+use subsetter::GlyphRemapper;
+
+use crate::{deflate_level9, inflate_capped, resolve, FilterClass};
+
+/// Recursion bound for the form/pattern/Type3 walk (depth of nested streams).
+const MAX_WALK_DEPTH: usize = 16;
+/// Inflation cap for content/font/map streams walked by the subsetter path.
+const MAX_STREAM_BYTES: usize = 64 * 1024 * 1024;
+
+/// A planned, fully validated font subset, computed read-only against the
+/// document. Applying it replaces the `/FontFile2` stream in place, points
+/// `/CIDToGIDMap` at a new map stream, and re-tags the font names — nothing
+/// else changes.
+pub(crate) struct FontPlan {
+    type0_id: ObjectId,
+    descendant_id: ObjectId,
+    descriptor_id: ObjectId,
+    font_file_id: ObjectId,
+    /// Flate-compressed subset font program.
+    deflated_font: Vec<u8>,
+    /// Uncompressed length of the subset font (`/Length1`).
+    font_len: i64,
+    /// Flate-compressed old-CID -> new-GID map stream payload.
+    deflated_map: Vec<u8>,
+    /// `TAG+BaseFont` name applied to `/BaseFont` (both dicts) and `/FontName`.
+    tagged_name: Vec<u8>,
+}
+
+/// Plan every eligible font subset. Read-only; returns an empty vector (and
+/// therefore changes nothing) on any global disqualifier.
+pub(crate) fn plan_font_subsets(doc: &Document) -> Vec<FontPlan> {
+    if doc.is_encrypted() || pdfa_blocked(doc) {
+        return Vec::new();
+    }
+
+    let mut walker = Walker {
+        doc,
+        dr: None,
+        used: HashMap::new(),
+        ineligible: HashSet::new(),
+        visited: HashSet::new(),
+        aborted: false,
+    };
+    walker.walk_document();
+    if walker.aborted || walker.used.is_empty() {
+        return Vec::new();
+    }
+
+    // Reference counts over the whole live object graph: a descendant,
+    // descriptor, or font file referenced from more than one place could be
+    // shared with a font whose usage we did not attribute to it — mutating it
+    // would be unsound, so such fonts are ineligible.
+    let mut refcounts: HashMap<ObjectId, usize> = HashMap::new();
+    for obj in doc.objects.values() {
+        count_refs(obj, &mut refcounts);
+    }
+    for (_, val) in doc.trailer.iter() {
+        count_refs(val, &mut refcounts);
+    }
+
+    let mut plans: Vec<FontPlan> = walker
+        .used
+        .iter()
+        .filter(|(id, cids)| !walker.ineligible.contains(id) && !cids.is_empty())
+        .filter_map(|(&id, cids)| plan_one_font(doc, id, cids, &refcounts))
+        .collect();
+    // HashMap iteration order is arbitrary; sort so output is reproducible.
+    plans.sort_by_key(|p| p.type0_id);
+    plans
+}
+
+/// Apply planned subsets. Each plan is independent; the set may be empty.
+pub(crate) fn apply_font_subsets(doc: &mut Document, plans: Vec<FontPlan>) {
+    for plan in plans {
+        let map_stream = Stream::new(
+            dictionary! { "Filter" => "FlateDecode" },
+            plan.deflated_map,
+        )
+        .with_compression(false);
+        let map_id = doc.add_object(map_stream);
+
+        let font_stream = Stream::new(
+            dictionary! {
+                "Filter" => "FlateDecode",
+                "Length1" => plan.font_len,
+            },
+            plan.deflated_font,
+        )
+        .with_compression(false);
+        doc.objects.insert(plan.font_file_id, Object::Stream(font_stream));
+
+        if let Ok(Object::Dictionary(d)) = doc.get_object_mut(plan.descendant_id) {
+            d.set("CIDToGIDMap", Object::Reference(map_id));
+            d.set("BaseFont", Object::Name(plan.tagged_name.clone()));
+        }
+        if let Ok(Object::Dictionary(d)) = doc.get_object_mut(plan.type0_id) {
+            d.set("BaseFont", Object::Name(plan.tagged_name.clone()));
+        }
+        if let Ok(Object::Dictionary(d)) = doc.get_object_mut(plan.descriptor_id) {
+            d.set("FontName", Object::Name(plan.tagged_name));
+            // A stale /CIDSet would over-claim glyph coverage after the
+            // subset; it is optional metadata outside PDF/A (and PDF/A
+            // documents were skipped above), so drop it. C-M2 regenerates it.
+            d.remove(b"CIDSet");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Strict stream access
+// ---------------------------------------------------------------------------
+
+/// Strictly decode a stream's bytes: uncompressed or single-filter
+/// FlateDecode without `/DecodeParms` only. Unlike lopdf's
+/// `decompressed_content` (which returns *partial* data on corrupt zlib —
+/// a silent under-read that would hide text-show operators from the walker),
+/// corrupt input yields `None`.
+fn strict_stream_bytes(doc: &Document, stream: &Stream) -> Option<Vec<u8>> {
+    match stream.dict.get(b"Filter") {
+        Err(_) => Some(stream.content.clone()),
+        Ok(Object::Null) => Some(stream.content.clone()),
+        Ok(filter) => match crate::classify_filter(doc, filter) {
+            FilterClass::FlateOnly => {
+                if !matches!(stream.dict.get(b"DecodeParms"), Err(_) | Ok(Object::Null)) {
+                    return None;
+                }
+                inflate_capped(&stream.content, MAX_STREAM_BYTES)
+            }
+            _ => None,
+        },
+    }
+}
+
+/// Follow a reference chain, returning the id of the **final** reference (the
+/// object that would be mutated) alongside the resolved object. `None` id
+/// means the object was inline (not an indirect object).
+fn resolve_ref<'a>(doc: &'a Document, mut obj: &'a Object) -> (Option<ObjectId>, &'a Object) {
+    let mut last = None;
+    for _ in 0..8 {
+        match obj {
+            Object::Reference(id) => match doc.get_object(*id) {
+                Ok(next) => {
+                    last = Some(*id);
+                    obj = next;
+                }
+                Err(_) => break,
+            },
+            _ => break,
+        }
+    }
+    (last, obj)
+}
+
+/// True when the document declares PDF/A conformance in its XMP metadata (or
+/// when the metadata exists but cannot be read strictly — treated as "cannot
+/// rule PDF/A out"). Subsetting would invalidate `/CIDSet`-style conformance
+/// artifacts, so such documents are skipped wholesale in C-M1.
+fn pdfa_blocked(doc: &Document) -> bool {
+    let Ok(catalog) = doc.catalog() else {
+        return true;
+    };
+    match catalog.get(b"Metadata") {
+        Err(_) => false,
+        Ok(meta) => {
+            let (_, meta) = resolve_ref(doc, meta);
+            let Object::Stream(stream) = meta else {
+                return true;
+            };
+            let Some(bytes) = strict_stream_bytes(doc, stream) else {
+                return true;
+            };
+            // Match both the conventional prefix and the namespace URI tail,
+            // since XMP prefixes are renameable.
+            contains(&bytes, b"pdfaid:part") || contains(&bytes, b"pdfa/ns/id")
+        }
+    }
+}
+
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+fn count_refs(obj: &Object, counts: &mut HashMap<ObjectId, usize>) {
+    match obj {
+        Object::Reference(id) => *counts.entry(*id).or_insert(0) += 1,
+        Object::Array(items) => {
+            for item in items {
+                count_refs(item, counts);
+            }
+        }
+        Object::Dictionary(dict) => {
+            for (_, val) in dict.iter() {
+                count_refs(val, counts);
+            }
+        }
+        Object::Stream(stream) => {
+            for (_, val) in stream.dict.iter() {
+                count_refs(val, counts);
+            }
+        }
+        _ => {}
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Glyph discovery walker
+// ---------------------------------------------------------------------------
+
+/// The font selected by the most recent `Tf` in the current stream.
+enum CurrentFont {
+    /// No `Tf` seen yet: a show operator here means text we cannot attribute,
+    /// e.g. a form inheriting the invoker's text state — global abort.
+    Unset,
+    /// A font we will never subset (simple fonts, non-Identity Type0):
+    /// show strings are ignored.
+    Other,
+    /// A Type0 / Identity-H|V font: show strings are big-endian 2-byte CIDs.
+    Candidate(ObjectId),
+}
+
+struct Walker<'a> {
+    doc: &'a Document,
+    /// AcroForm `/DR` resources: fallback context for appearance streams.
+    dr: Option<&'a Dictionary>,
+    /// Used CIDs per candidate Type0 font object.
+    used: HashMap<ObjectId, BTreeSet<u16>>,
+    /// Fonts disqualified during the walk (odd show strings, `/DR` exposure).
+    ineligible: HashSet<ObjectId>,
+    /// Self-contained streams already walked (safe to skip on re-encounter).
+    visited: HashSet<ObjectId>,
+    aborted: bool,
+}
+
+impl<'a> Walker<'a> {
+    fn abort(&mut self) {
+        self.aborted = true;
+    }
+
+    fn walk_document(&mut self) {
+        self.collect_acroform();
+        if self.aborted {
+            return;
+        }
+        for (_, page_id) in self.doc.get_pages() {
+            self.walk_page(page_id);
+            if self.aborted {
+                return;
+            }
+        }
+    }
+
+    /// Fonts reachable from AcroForm `/DR` are disqualified: viewers may
+    /// regenerate field appearances from `/DA` strings (which we do not
+    /// parse), using glyphs we never saw.
+    fn collect_acroform(&mut self) {
+        let Ok(catalog) = self.doc.catalog() else {
+            self.abort();
+            return;
+        };
+        let Ok(acroform) = catalog.get(b"AcroForm") else {
+            return;
+        };
+        let Ok(acroform) = resolve(self.doc, acroform).as_dict() else {
+            self.abort();
+            return;
+        };
+        let Ok(dr) = acroform.get(b"DR") else {
+            return;
+        };
+        let Ok(dr) = resolve(self.doc, dr).as_dict() else {
+            self.abort();
+            return;
+        };
+        self.dr = Some(dr);
+        let Ok(fonts) = dr.get(b"Font") else {
+            return;
+        };
+        let Ok(fonts) = resolve(self.doc, fonts).as_dict() else {
+            self.abort();
+            return;
+        };
+        for (_, val) in fonts.iter() {
+            if let (Some(id), _) = resolve_ref(self.doc, val) {
+                self.ineligible.insert(id);
+            }
+        }
+    }
+
+    fn walk_page(&mut self, page_id: ObjectId) {
+        let mut path: Vec<ObjectId> = Vec::new();
+        let resources = crate::page_resources(self.doc, page_id);
+
+        // Concatenate the page's content streams (operators may span stream
+        // boundaries, so they are parsed as one unit, per spec).
+        let mut content = Vec::new();
+        for stream_id in self.doc.get_page_contents(page_id) {
+            let Ok(stream) = self
+                .doc
+                .get_object(stream_id)
+                .and_then(Object::as_stream)
+            else {
+                self.abort();
+                return;
+            };
+            let Some(bytes) = strict_stream_bytes(self.doc, stream) else {
+                self.abort();
+                return;
+            };
+            content.extend_from_slice(&bytes);
+            content.push(b'\n');
+        }
+        self.walk_context(&content, resources, &[], &mut path);
+        if self.aborted {
+            return;
+        }
+        self.walk_annotations(page_id, &mut path);
+    }
+
+    fn walk_annotations(&mut self, page_id: ObjectId, path: &mut Vec<ObjectId>) {
+        let Ok(page) = self
+            .doc
+            .get_object(page_id)
+            .and_then(Object::as_dict)
+        else {
+            self.abort();
+            return;
+        };
+        let Ok(annots) = page.get(b"Annots") else {
+            return;
+        };
+        let Ok(annots) = resolve(self.doc, annots).as_array() else {
+            self.abort();
+            return;
+        };
+        for entry in annots {
+            // A dangling annotation reference renders nothing; skip it.
+            if let Object::Reference(id) = entry {
+                if self.doc.get_object(*id).is_err() {
+                    continue;
+                }
+            }
+            let Ok(annot) = resolve(self.doc, entry).as_dict() else {
+                self.abort();
+                return;
+            };
+            let Ok(ap) = annot.get(b"AP") else {
+                continue;
+            };
+            let Ok(ap) = resolve(self.doc, ap).as_dict() else {
+                self.abort();
+                return;
+            };
+            for (_, appearance) in ap.iter() {
+                match resolve_ref(self.doc, appearance) {
+                    (Some(id), Object::Stream(_)) => self.walk_appearance(id, path),
+                    // Appearance sub-dictionary: one stream per state.
+                    (_, Object::Dictionary(states)) => {
+                        for (_, state) in states.iter() {
+                            match resolve_ref(self.doc, state) {
+                                (Some(id), Object::Stream(_)) => {
+                                    self.walk_appearance(id, path)
+                                }
+                                (_, Object::Reference(_)) => continue, // dangling
+                                _ => self.abort(),
+                            }
+                            if self.aborted {
+                                return;
+                            }
+                        }
+                    }
+                    (_, Object::Reference(_)) => continue, // dangling
+                    _ => self.abort(),
+                }
+                if self.aborted {
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Walk one annotation appearance stream. Its resource fallback is the
+    /// AcroForm `/DR` (the context viewers evaluate `/DA` against), never the
+    /// page resources.
+    fn walk_appearance(&mut self, id: ObjectId, path: &mut Vec<ObjectId>) {
+        let parent: Vec<&Dictionary> = self.dr.into_iter().collect();
+        self.walk_stream_object(id, OwnResources::OfStream, &parent, path, true);
+    }
+
+    /// Walk a content-bearing stream object (form XObject, tiling pattern,
+    /// appearance stream, or Type3 char proc) with cycle guard and depth
+    /// bound. Returns true when any font lookup fell back past the stream's
+    /// own resources (context-dependent: must be re-walked per context).
+    fn walk_stream_object(
+        &mut self,
+        id: ObjectId,
+        own: OwnResources<'a>,
+        parent_chain: &[&'a Dictionary],
+        path: &mut Vec<ObjectId>,
+        cacheable: bool,
+    ) -> bool {
+        if path.contains(&id) {
+            // A stream reachable from itself is malformed; walking it could
+            // loop, so give up on the whole document.
+            self.abort();
+            return false;
+        }
+        if cacheable && self.visited.contains(&id) {
+            return false;
+        }
+        if path.len() >= MAX_WALK_DEPTH {
+            self.abort();
+            return false;
+        }
+        let Ok(stream) = self.doc.get_object(id).and_then(Object::as_stream) else {
+            self.abort();
+            return false;
+        };
+        let own_res = match own {
+            OwnResources::OfStream => match stream.dict.get(b"Resources") {
+                Err(_) => None,
+                Ok(res) => match resolve(self.doc, res).as_dict() {
+                    Ok(dict) => Some(dict),
+                    Err(_) => {
+                        self.abort();
+                        return false;
+                    }
+                },
+            },
+            OwnResources::Given(res) => res,
+        };
+        let Some(bytes) = strict_stream_bytes(self.doc, stream) else {
+            self.abort();
+            return false;
+        };
+        path.push(id);
+        let fallback = self.walk_context(&bytes, own_res, parent_chain, path);
+        path.pop();
+        if cacheable && !fallback && !self.aborted {
+            self.visited.insert(id);
+        }
+        fallback
+    }
+
+    /// Walk one content stream in its resource context: recurse into the
+    /// resources' nested content (forms, patterns, Type3 char procs), then
+    /// parse the operators tracking `Tf` and the four show operators.
+    fn walk_context(
+        &mut self,
+        content: &[u8],
+        own_res: Option<&'a Dictionary>,
+        parent_chain: &[&'a Dictionary],
+        path: &mut Vec<ObjectId>,
+    ) -> bool {
+        let mut chain: Vec<&'a Dictionary> = Vec::with_capacity(parent_chain.len() + 1);
+        if let Some(res) = own_res {
+            chain.push(res);
+        }
+        chain.extend_from_slice(parent_chain);
+        let own_count = usize::from(own_res.is_some());
+
+        let mut fallback = false;
+        if let Some(res) = own_res {
+            fallback |= self.walk_resources(res, &chain, path);
+            if self.aborted {
+                return fallback;
+            }
+        }
+
+        // Strict parsing: the lenient `Content::decode` silently drops a
+        // trailing unparseable region, which could hide show operators.
+        let Ok(parsed) = Content::decode_strict(content) else {
+            self.abort();
+            return fallback;
+        };
+
+        let mut current = CurrentFont::Unset;
+        for op in &parsed.operations {
+            match op.operator.as_str() {
+                "Tf" => {
+                    let Some(Object::Name(name)) = op.operands.first() else {
+                        self.abort();
+                        return fallback;
+                    };
+                    let Some((font, from_fallback)) =
+                        self.lookup_font(&chain, own_count, name)
+                    else {
+                        self.abort();
+                        return fallback;
+                    };
+                    fallback |= from_fallback;
+                    current = self.classify_font(font);
+                }
+                "Tj" | "'" => match op.operands.first() {
+                    Some(Object::String(s, _)) => self.record_show(&current, s),
+                    _ => self.abort(),
+                },
+                "\"" => match op.operands.get(2) {
+                    Some(Object::String(s, _)) => self.record_show(&current, s),
+                    _ => self.abort(),
+                },
+                "TJ" => match op.operands.first() {
+                    Some(Object::Array(items)) => {
+                        for item in items {
+                            match item {
+                                Object::String(s, _) => self.record_show(&current, s),
+                                Object::Integer(_) | Object::Real(_) => {}
+                                _ => self.abort(),
+                            }
+                            if self.aborted {
+                                return fallback;
+                            }
+                        }
+                    }
+                    _ => self.abort(),
+                },
+                // lopdf parses inline images into a "BI" operation carrying
+                // the image as a stream operand; EMPTY operands mean it could
+                // not parse the image and skipped bytes — parsing after that
+                // point is untrustworthy.
+                "BI" if op.operands.is_empty() => self.abort(),
+                _ => {}
+            }
+            if self.aborted {
+                return fallback;
+            }
+        }
+        fallback
+    }
+
+    /// Look up a font name through the resource chain (innermost first).
+    /// Returns the font object and whether the hit came from a fallback
+    /// (inherited) context.
+    fn lookup_font(
+        &self,
+        chain: &[&'a Dictionary],
+        own_count: usize,
+        name: &[u8],
+    ) -> Option<(&'a Object, bool)> {
+        for (idx, res) in chain.iter().enumerate() {
+            let Ok(fonts) = res.get(b"Font") else {
+                continue;
+            };
+            let Ok(fonts) = resolve(self.doc, fonts).as_dict() else {
+                return None;
+            };
+            if let Ok(font) = fonts.get(name) {
+                return Some((font, idx >= own_count));
+            }
+        }
+        None
+    }
+
+    /// Classify the font selected by a `Tf`. Aborts (via the returned state
+    /// being irrelevant after `self.aborted`) when the font cannot be
+    /// understood well enough to be safe.
+    fn classify_font(&mut self, font: &'a Object) -> CurrentFont {
+        let (id, resolved) = resolve_ref(self.doc, font);
+        let Ok(dict) = resolved.as_dict() else {
+            self.abort();
+            return CurrentFont::Other;
+        };
+        let is_type0 = matches!(
+            dict.get(b"Subtype").map(|s| resolve(self.doc, s)),
+            Ok(Object::Name(n)) if n == b"Type0"
+        );
+        if !is_type0 {
+            return CurrentFont::Other;
+        }
+        let identity = matches!(
+            dict.get(b"Encoding").map(|e| resolve(self.doc, e)),
+            Ok(Object::Name(n)) if n == b"Identity-H" || n == b"Identity-V"
+        );
+        if !identity {
+            // Predefined CJK CMaps, embedded CMap streams: never subset,
+            // shows are safely ignored (the font stays untouched).
+            return CurrentFont::Other;
+        }
+        match id {
+            Some(id) => CurrentFont::Candidate(id),
+            None => {
+                // An inline Identity Type0 dict could share descendants with
+                // a referenced font without us being able to attribute usage.
+                self.abort();
+                CurrentFont::Other
+            }
+        }
+    }
+
+    fn record_show(&mut self, current: &CurrentFont, bytes: &[u8]) {
+        match current {
+            CurrentFont::Unset => self.abort(),
+            CurrentFont::Other => {}
+            CurrentFont::Candidate(id) => {
+                if !bytes.len().is_multiple_of(2) {
+                    // Malformed for Identity-H/V; cannot trust this font's
+                    // collected set.
+                    self.ineligible.insert(*id);
+                    return;
+                }
+                let set = self.used.entry(*id).or_default();
+                for pair in bytes.chunks_exact(2) {
+                    set.insert(u16::from_be_bytes([pair[0], pair[1]]));
+                }
+            }
+        }
+    }
+
+    /// Recurse into the content-bearing streams reachable from one resource
+    /// dictionary: form XObjects, tiling patterns, Type3 char procs. Also
+    /// vets ExtGState entries (a `/Font` there selects a font without `Tf`,
+    /// which the walker cannot attribute — global abort).
+    fn walk_resources(
+        &mut self,
+        res: &'a Dictionary,
+        chain: &[&'a Dictionary],
+        path: &mut Vec<ObjectId>,
+    ) -> bool {
+        let mut fallback = false;
+
+        if let Ok(states) = res.get(b"ExtGState") {
+            let Ok(states) = resolve(self.doc, states).as_dict() else {
+                self.abort();
+                return fallback;
+            };
+            for (_, state) in states.iter() {
+                let Ok(state) = resolve(self.doc, state).as_dict() else {
+                    self.abort();
+                    return fallback;
+                };
+                if state.get(b"Font").is_ok() {
+                    self.abort();
+                    return fallback;
+                }
+            }
+        }
+
+        if let Ok(xobjects) = res.get(b"XObject") {
+            let Ok(xobjects) = resolve(self.doc, xobjects).as_dict() else {
+                self.abort();
+                return fallback;
+            };
+            for (_, val) in xobjects.iter() {
+                let Object::Reference(id) = val else {
+                    self.abort();
+                    return fallback;
+                };
+                let Ok(obj) = self.doc.get_object(*id) else {
+                    continue; // dangling: renders nothing
+                };
+                let Ok(stream) = obj.as_stream() else {
+                    self.abort();
+                    return fallback;
+                };
+                match stream.dict.get(b"Subtype").map(|s| resolve(self.doc, s)) {
+                    Ok(Object::Name(n)) if n == b"Form" => {
+                        fallback |= self.walk_stream_object(
+                            *id,
+                            OwnResources::OfStream,
+                            chain,
+                            path,
+                            true,
+                        );
+                    }
+                    Ok(Object::Name(n)) if n == b"Image" || n == b"PS" => {}
+                    _ => {
+                        self.abort();
+                        return fallback;
+                    }
+                }
+                if self.aborted {
+                    return fallback;
+                }
+            }
+        }
+
+        if let Ok(patterns) = res.get(b"Pattern") {
+            let Ok(patterns) = resolve(self.doc, patterns).as_dict() else {
+                self.abort();
+                return fallback;
+            };
+            for (_, val) in patterns.iter() {
+                match resolve_ref(self.doc, val) {
+                    (Some(id), Object::Stream(stream)) => {
+                        match stream
+                            .dict
+                            .get(b"PatternType")
+                            .map(|p| resolve(self.doc, p))
+                            .and_then(Object::as_i64)
+                        {
+                            Ok(1) => {
+                                fallback |= self.walk_stream_object(
+                                    id,
+                                    OwnResources::OfStream,
+                                    chain,
+                                    path,
+                                    true,
+                                );
+                            }
+                            Ok(2) => {}
+                            _ => {
+                                self.abort();
+                                return fallback;
+                            }
+                        }
+                    }
+                    // Shading patterns may be plain dictionaries; no content.
+                    (_, Object::Dictionary(dict))
+                        if matches!(
+                            dict.get(b"PatternType")
+                                .map(|p| resolve(self.doc, p))
+                                .and_then(Object::as_i64),
+                            Ok(2)
+                        ) => {}
+                    (_, Object::Reference(_)) => continue, // dangling
+                    _ => {
+                        self.abort();
+                        return fallback;
+                    }
+                }
+                if self.aborted {
+                    return fallback;
+                }
+            }
+        }
+
+        if let Ok(fonts) = res.get(b"Font") {
+            let Ok(fonts) = resolve(self.doc, fonts).as_dict() else {
+                self.abort();
+                return fallback;
+            };
+            for (_, val) in fonts.iter() {
+                let (_, resolved) = resolve_ref(self.doc, val);
+                if let Object::Reference(id) = resolved {
+                    if self.doc.get_object(*id).is_err() {
+                        continue; // dangling
+                    }
+                }
+                let Ok(dict) = resolved.as_dict() else {
+                    self.abort();
+                    return fallback;
+                };
+                let is_type3 = matches!(
+                    dict.get(b"Subtype").map(|s| resolve(self.doc, s)),
+                    Ok(Object::Name(n)) if n == b"Type3"
+                );
+                if is_type3 {
+                    fallback |= self.walk_type3(dict, chain, path);
+                    if self.aborted {
+                        return fallback;
+                    }
+                }
+            }
+        }
+
+        fallback
+    }
+
+    /// Walk a Type3 font's char-proc streams. Their names resolve in the
+    /// font's own `/Resources` first, falling back to the invoking context
+    /// (the deprecated-but-real inheritance path).
+    fn walk_type3(
+        &mut self,
+        font: &'a Dictionary,
+        chain: &[&'a Dictionary],
+        path: &mut Vec<ObjectId>,
+    ) -> bool {
+        let mut fallback = false;
+        let own_res = match font.get(b"Resources") {
+            Err(_) => None,
+            Ok(res) => match resolve(self.doc, res).as_dict() {
+                Ok(dict) => Some(dict),
+                Err(_) => {
+                    self.abort();
+                    return fallback;
+                }
+            },
+        };
+        let Ok(procs) = font.get(b"CharProcs") else {
+            self.abort();
+            return fallback;
+        };
+        let Ok(procs) = resolve(self.doc, procs).as_dict() else {
+            self.abort();
+            return fallback;
+        };
+        for (_, proc_ref) in procs.iter() {
+            let Object::Reference(id) = proc_ref else {
+                self.abort();
+                return fallback;
+            };
+            if self.doc.get_object(*id).is_err() {
+                continue; // dangling: glyph renders nothing
+            }
+            // Not cacheable: the same char-proc stream under a different
+            // Type3 font would have a different own-resources context.
+            fallback |=
+                self.walk_stream_object(*id, OwnResources::Given(own_res), chain, path, false);
+            if self.aborted {
+                return fallback;
+            }
+        }
+        fallback
+    }
+}
+
+/// Where a walked stream's own resource dictionary comes from.
+enum OwnResources<'a> {
+    /// The stream's own `/Resources` entry (forms, patterns, appearances).
+    OfStream,
+    /// Supplied by the surrounding structure (Type3 `/Resources` for its
+    /// char procs, which have no `/Resources` of their own).
+    Given(Option<&'a Dictionary>),
+}
+
+// ---------------------------------------------------------------------------
+// Per-font planning
+// ---------------------------------------------------------------------------
+
+/// The descendant's CID -> GID mapping on input.
+enum CidToGid {
+    Identity,
+    Table(Vec<u8>),
+}
+
+struct CidMap {
+    map: CidToGid,
+    /// Stored (compressed) size of the old map stream, for the net-smaller
+    /// comparison. Zero for `/Identity`.
+    stored_len: usize,
+}
+
+impl CidMap {
+    fn lookup(&self, cid: u16) -> u16 {
+        match &self.map {
+            CidToGid::Identity => cid,
+            CidToGid::Table(table) => {
+                let idx = usize::from(cid) * 2;
+                match (table.get(idx), table.get(idx + 1)) {
+                    (Some(&hi), Some(&lo)) => u16::from_be_bytes([hi, lo]),
+                    // Beyond the table: .notdef, per spec.
+                    _ => 0,
+                }
+            }
+        }
+    }
+}
+
+fn load_cid_map(doc: &Document, descendant: &Dictionary) -> Option<CidMap> {
+    match descendant.get(b"CIDToGIDMap") {
+        // Absent defaults to /Identity per spec.
+        Err(_) => Some(CidMap { map: CidToGid::Identity, stored_len: 0 }),
+        Ok(obj) => match resolve_ref(doc, obj).1 {
+            Object::Name(n) if n == b"Identity" => {
+                Some(CidMap { map: CidToGid::Identity, stored_len: 0 })
+            }
+            Object::Stream(stream) => {
+                let table = strict_stream_bytes(doc, stream)?;
+                Some(CidMap { map: CidToGid::Table(table), stored_len: stream.content.len() })
+            }
+            _ => None,
+        },
+    }
+}
+
+fn be16(data: &[u8], offset: usize) -> Option<u16> {
+    Some(u16::from_be_bytes([
+        *data.get(offset)?,
+        *data.get(offset.checked_add(1)?)?,
+    ]))
+}
+
+/// `numGlyphs` from the font's `maxp` table (single fonts only; collections
+/// return `None`, which disqualifies them — FontFile2 must not be a TTC).
+fn num_glyphs(font: &[u8]) -> Option<u16> {
+    let table_count = usize::from(be16(font, 4)?);
+    for i in 0..table_count {
+        let record = 12 + i * 16;
+        if font.get(record..record + 4)? == b"maxp" {
+            let offset = u32::from_be_bytes(
+                font.get(record + 8..record + 12)?.try_into().ok()?,
+            ) as usize;
+            return be16(font, offset.checked_add(4)?);
+        }
+    }
+    None
+}
+
+/// Deterministic 6-letter subset tag derived from the subset bytes (FNV-1a;
+/// no randomness, so outputs are reproducible).
+fn subset_tag(data: &[u8]) -> [u8; 6] {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for &byte in data {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    let mut tag = [0u8; 6];
+    for slot in &mut tag {
+        *slot = b'A' + (hash % 26) as u8;
+        hash /= 26;
+    }
+    tag
+}
+
+/// Strip an existing `ABCDEF+` subset tag so re-subsetting replaces it
+/// instead of stacking a second one.
+fn strip_subset_tag(name: &[u8]) -> &[u8] {
+    if name.len() > 7 && name[6] == b'+' && name[..6].iter().all(u8::is_ascii_uppercase) {
+        &name[7..]
+    } else {
+        name
+    }
+}
+
+/// Validate one candidate font end to end and build its plan. Any failure —
+/// wrong shapes, shared structure, subsetter error, not net-smaller —
+/// returns `None` and the font ships untouched.
+fn plan_one_font(
+    doc: &Document,
+    type0_id: ObjectId,
+    cids: &BTreeSet<u16>,
+    refcounts: &HashMap<ObjectId, usize>,
+) -> Option<FontPlan> {
+    let type0 = doc.get_object(type0_id).ok()?.as_dict().ok()?;
+
+    let descendants = type0.get(b"DescendantFonts").ok()?;
+    // If the array itself is indirect, it must not be shared between fonts.
+    let (array_id, descendants) = resolve_ref(doc, descendants);
+    if let Some(array_id) = array_id {
+        if refcounts.get(&array_id) != Some(&1) {
+            return None;
+        }
+    }
+    let descendants = descendants.as_array().ok()?;
+    if descendants.len() != 1 {
+        return None;
+    }
+    let (descendant_id, descendant) = resolve_ref(doc, &descendants[0]);
+    let descendant_id = descendant_id?;
+    let descendant = descendant.as_dict().ok()?;
+    if !matches!(
+        descendant.get(b"Subtype").map(|s| resolve(doc, s)),
+        Ok(Object::Name(n)) if n == b"CIDFontType2"
+    ) {
+        // CIDFontType0 (CFF) requires show-string rewriting — C-M2/M3.
+        return None;
+    }
+
+    let (descriptor_id, descriptor) =
+        resolve_ref(doc, descendant.get(b"FontDescriptor").ok()?);
+    let descriptor_id = descriptor_id?;
+    let descriptor = descriptor.as_dict().ok()?;
+    // A descriptor carrying additional font programs is a shape we do not
+    // understand well enough to mutate.
+    if descriptor.get(b"FontFile").is_ok() || descriptor.get(b"FontFile3").is_ok() {
+        return None;
+    }
+    let (font_file_id, font_file) = resolve_ref(doc, descriptor.get(b"FontFile2").ok()?);
+    let font_file_id = font_file_id?;
+    let font_file = font_file.as_stream().ok()?;
+
+    // Shared descendant/descriptor/font-program structure could serve fonts
+    // whose usage was not attributed here; mutating it would be unsound.
+    if refcounts.get(&descendant_id) != Some(&1)
+        || refcounts.get(&descriptor_id) != Some(&1)
+        || refcounts.get(&font_file_id) != Some(&1)
+    {
+        return None;
+    }
+
+    let font_bytes = strict_stream_bytes(doc, font_file)?;
+    let glyph_count = num_glyphs(&font_bytes)?;
+    let cid_map = load_cid_map(doc, descendant)?;
+
+    let mut gids: BTreeSet<u16> = BTreeSet::new();
+    for &cid in cids {
+        let gid = cid_map.lookup(cid);
+        if gid != 0 && gid >= glyph_count {
+            // The document references a glyph the font does not have; the
+            // font is not in a state we can confidently transform.
+            return None;
+        }
+        gids.insert(gid);
+    }
+    let gid_list: Vec<u16> = gids.iter().copied().collect();
+    let remapper = GlyphRemapper::new_from_glyphs_sorted(&gid_list);
+    let subset = subsetter::subset(&font_bytes, 0, &remapper).ok()?;
+    // Cheap structural sanity on the output before trusting it: it must have
+    // at least as many glyphs as we remapped (composite closure adds more).
+    if num_glyphs(&subset)? < remapper.num_gids() {
+        return None;
+    }
+
+    // Old CID -> new GID, 2 bytes big-endian per CID up to the max used CID;
+    // unused CIDs map to 0 (.notdef). Mostly zeros, so it deflates to nearly
+    // nothing.
+    let max_cid = *cids.iter().next_back()?;
+    let mut map = vec![0u8; (usize::from(max_cid) + 1) * 2];
+    for &cid in cids {
+        let new_gid = remapper.get(cid_map.lookup(cid)).unwrap_or(0);
+        let idx = usize::from(cid) * 2;
+        map[idx..idx + 2].copy_from_slice(&new_gid.to_be_bytes());
+    }
+
+    let deflated_font = deflate_level9(&subset)?;
+    let deflated_map = deflate_level9(&map)?;
+    // Net-smaller guard on stored bytes: the new font program plus the new
+    // map stream must undercut the old font program plus the old map stream.
+    if deflated_font.len() + deflated_map.len()
+        >= font_file.content.len() + cid_map.stored_len
+    {
+        return None;
+    }
+
+    let base_name = base_font_name(doc, type0, descendant, descriptor)?;
+    let tag = subset_tag(&subset);
+    let mut tagged_name = Vec::with_capacity(base_name.len() + 7);
+    tagged_name.extend_from_slice(&tag);
+    tagged_name.push(b'+');
+    tagged_name.extend_from_slice(strip_subset_tag(&base_name));
+
+    Some(FontPlan {
+        type0_id,
+        descendant_id,
+        descriptor_id,
+        font_file_id,
+        deflated_font,
+        font_len: subset.len() as i64,
+        deflated_map,
+        tagged_name,
+    })
+}
+
+fn base_font_name(
+    doc: &Document,
+    type0: &Dictionary,
+    descendant: &Dictionary,
+    descriptor: &Dictionary,
+) -> Option<Vec<u8>> {
+    for (dict, key) in [
+        (descendant, b"BaseFont".as_slice()),
+        (type0, b"BaseFont".as_slice()),
+        (descriptor, b"FontName".as_slice()),
+    ] {
+        if let Ok(obj) = dict.get(key) {
+            if let Object::Name(name) = resolve(doc, obj) {
+                return Some(name.clone());
+            }
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{optimize, optimize_with_options, OptimizeOptions};
+    use lopdf::content::Operation;
+    use lopdf::StringFormat;
+
+    fn subset_opts() -> OptimizeOptions {
+        OptimizeOptions::default().with_subset_fonts(true)
+    }
+
+    fn noto_bytes() -> Vec<u8> {
+        std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/fixtures/fonts/NotoSans-Regular.ttf"
+        ))
+        .expect("fixtures/fonts/NotoSans-Regular.ttf missing")
+    }
+
+    /// GID of each char in the fixture font. Under `/CIDToGIDMap /Identity`,
+    /// these double as the CIDs used in show strings.
+    fn gids_for(text: &str) -> Vec<u16> {
+        let data = noto_bytes();
+        let face = ttf_parser::Face::parse(&data, 0).unwrap();
+        text.chars()
+            .map(|c| face.glyph_index(c).expect("fixture glyph missing").0)
+            .collect()
+    }
+
+    /// A minimal ToUnicode CMap so text extraction has a CID -> Unicode
+    /// oracle that must survive subsetting untouched.
+    fn to_unicode_bytes(pairs: &[(u16, char)]) -> Vec<u8> {
+        let mut body = String::new();
+        for (cid, ch) in pairs {
+            let mut units = [0u16; 2];
+            let encoded = ch.encode_utf16(&mut units);
+            let target: String = encoded.iter().map(|u| format!("{u:04X}")).collect();
+            body.push_str(&format!("<{cid:04X}> <{target}>\u{a}"));
+        }
+        let mut cmap = String::new();
+        for line in [
+            "/CIDInit /ProcSet findresource begin",
+            "12 dict begin",
+            "begincmap",
+            "/CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def",
+            "/CMapName /Adobe-Identity-UCS def",
+            "/CMapType 2 def",
+            "1 begincodespacerange",
+            "<0000> <FFFF>",
+            "endcodespacerange",
+        ] {
+            cmap.push_str(line);
+            cmap.push('\u{a}');
+        }
+        cmap.push_str(&format!("{} beginbfchar\u{a}{body}endbfchar\u{a}", pairs.len()));
+        for line in [
+            "endcmap",
+            "CMapName currentdict /CMap defineresource pop",
+            "end",
+            "end",
+        ] {
+            cmap.push_str(line);
+            cmap.push('\u{a}');
+        }
+        cmap.into_bytes()
+    }
+
+    struct FontSpec {
+        /// `None` => `/CIDToGIDMap /Identity`; `Some(table)` => a stream
+        /// mapping CID i -> table[i].
+        cid_table: Option<Vec<u16>>,
+        base_font: &'static str,
+        corrupt_font_file: bool,
+        to_unicode: Vec<(u16, char)>,
+    }
+
+    impl FontSpec {
+        fn identity(to_unicode: Vec<(u16, char)>) -> Self {
+            FontSpec {
+                cid_table: None,
+                base_font: "NotoSans-Regular",
+                corrupt_font_file: false,
+                to_unicode,
+            }
+        }
+    }
+
+    /// Add a complete Type0/CIDFontType2/Identity-H font to `doc`, returning
+    /// the Type0 font object id.
+    fn add_type0_font(doc: &mut Document, spec: &FontSpec) -> ObjectId {
+        let font_data = if spec.corrupt_font_file {
+            b"this is not a truetype font at all".to_vec()
+        } else {
+            noto_bytes()
+        };
+        let font_len = font_data.len() as i64;
+        let ff_id = doc.add_object(
+            Stream::new(
+                dictionary! { "Filter" => "FlateDecode", "Length1" => font_len },
+                deflate_level9(&font_data).unwrap(),
+            )
+            .with_compression(false),
+        );
+        let descr_id = doc.add_object(dictionary! {
+            "Type" => "FontDescriptor",
+            "FontName" => Object::Name(spec.base_font.as_bytes().to_vec()),
+            "Flags" => 32,
+            "FontBBox" => vec![(-619).into(), (-293).into(), 1536.into(), 1069.into()],
+            "ItalicAngle" => 0,
+            "Ascent" => 1069,
+            "Descent" => (-293),
+            "CapHeight" => 714,
+            "StemV" => 80,
+            "FontFile2" => ff_id,
+        });
+        let cid_map_obj: Object = match &spec.cid_table {
+            None => Object::Name(b"Identity".to_vec()),
+            Some(table) => {
+                let mut bytes = Vec::with_capacity(table.len() * 2);
+                for gid in table {
+                    bytes.extend_from_slice(&gid.to_be_bytes());
+                }
+                doc.add_object(Stream::new(dictionary! {}, bytes)).into()
+            }
+        };
+        let desc_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "CIDFontType2",
+            "BaseFont" => Object::Name(spec.base_font.as_bytes().to_vec()),
+            "CIDSystemInfo" => dictionary! {
+                "Registry" => Object::String(b"Adobe".to_vec(), StringFormat::Literal),
+                "Ordering" => Object::String(b"Identity".to_vec(), StringFormat::Literal),
+                "Supplement" => 0,
+            },
+            "FontDescriptor" => descr_id,
+            "DW" => 600,
+            "CIDToGIDMap" => cid_map_obj,
+        });
+        let tou_id = doc.add_object(Stream::new(
+            dictionary! {},
+            to_unicode_bytes(&spec.to_unicode),
+        ));
+        doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type0",
+            "BaseFont" => Object::Name(spec.base_font.as_bytes().to_vec()),
+            "Encoding" => "Identity-H",
+            "DescendantFonts" => vec![desc_id.into()],
+            "ToUnicode" => tou_id,
+        })
+    }
+
+    fn show_text_ops(font: &str, cids: &[u16]) -> Vec<Operation> {
+        let mut bytes = Vec::with_capacity(cids.len() * 2);
+        for cid in cids {
+            bytes.extend_from_slice(&cid.to_be_bytes());
+        }
+        vec![
+            Operation::new("BT", vec![]),
+            // 10pt: even the longest test string stays inside the MediaBox
+            // (off-page text would be dropped by the pdftotext oracle).
+            Operation::new(
+                "Tf",
+                vec![Object::Name(font.as_bytes().to_vec()), 10.into()],
+            ),
+            Operation::new("Td", vec![72.into(), 700.into()]),
+            Operation::new(
+                "Tj",
+                vec![Object::String(bytes, StringFormat::Hexadecimal)],
+            ),
+            Operation::new("ET", vec![]),
+        ]
+    }
+
+    fn finish_pdf(doc: &mut Document, pages_id: ObjectId, page_ids: Vec<ObjectId>) -> Vec<u8> {
+        let kids: Vec<Object> = page_ids.iter().map(|&id| id.into()).collect();
+        let count = page_ids.len() as i64;
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => kids,
+                "Count" => count,
+            }),
+        );
+        let catalog_id = doc.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => pages_id,
+        });
+        doc.trailer.set("Root", catalog_id);
+        let mut out = Vec::new();
+        doc.save_to(&mut out).unwrap();
+        out
+    }
+
+    fn add_text_page(
+        doc: &mut Document,
+        pages_id: ObjectId,
+        font_id: ObjectId,
+        content: Vec<Operation>,
+    ) -> ObjectId {
+        let content_id = doc.add_object(Stream::new(
+            dictionary! {},
+            Content { operations: content }.encode().unwrap(),
+        ));
+        doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "Contents" => content_id,
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Resources" => dictionary! {
+                "Font" => dictionary! { "F1" => font_id },
+            },
+        })
+    }
+
+    /// One-page-per-entry text PDF over a single shared font.
+    fn build_text_pdf(spec: &FontSpec, pages: &[Vec<u16>]) -> Vec<u8> {
+        let mut doc = Document::with_version("1.7");
+        let pages_id = doc.new_object_id();
+        let font_id = add_type0_font(&mut doc, spec);
+        let page_ids: Vec<ObjectId> = pages
+            .iter()
+            .map(|cids| add_text_page(&mut doc, pages_id, font_id, show_text_ops("F1", cids)))
+            .collect();
+        finish_pdf(&mut doc, pages_id, page_ids)
+    }
+
+    // -- output inspection ---------------------------------------------------
+
+    struct SubsetView {
+        type0: Dictionary,
+        descendant: Dictionary,
+        descriptor: Dictionary,
+        /// Decompressed subset font program.
+        font: Vec<u8>,
+        /// Decompressed CID -> GID map stream, when the map is a stream.
+        cid_map: Option<Vec<u8>>,
+        /// The re-loaded output document (for follow-up stream lookups).
+        doc: Document,
+    }
+
+    fn subset_view(pdf: &[u8]) -> SubsetView {
+        let doc = Document::load_mem(pdf).unwrap();
+        let mut found = None;
+        for obj in doc.objects.values() {
+            let Object::Dictionary(type0) = obj else { continue };
+            if !matches!(type0.get(b"Subtype"), Ok(Object::Name(n)) if n == b"Type0") {
+                continue;
+            }
+            let descendants = resolve(&doc, type0.get(b"DescendantFonts").unwrap())
+                .as_array()
+                .unwrap()
+                .clone();
+            let descendant = resolve(&doc, &descendants[0]).as_dict().unwrap().clone();
+            let descriptor = resolve(&doc, descendant.get(b"FontDescriptor").unwrap())
+                .as_dict()
+                .unwrap()
+                .clone();
+            let ff = resolve(&doc, descriptor.get(b"FontFile2").unwrap())
+                .as_stream()
+                .unwrap();
+            let font = strict_stream_bytes(&doc, ff).expect("font stream must inflate");
+            let cid_map = match descendant.get(b"CIDToGIDMap") {
+                Ok(obj) => match resolve(&doc, obj) {
+                    Object::Stream(s) => {
+                        Some(strict_stream_bytes(&doc, s).expect("map must inflate"))
+                    }
+                    _ => None,
+                },
+                Err(_) => None,
+            };
+            found = Some((type0.clone(), descendant, descriptor, font, cid_map));
+            break;
+        }
+        let (type0, descendant, descriptor, font, cid_map) =
+            found.expect("no Type0 font in output");
+        SubsetView { type0, descendant, descriptor, font, cid_map, doc }
+    }
+
+    impl SubsetView {
+        /// New GID for an old CID, through the rewritten map stream.
+        fn new_gid(&self, cid: u16) -> u16 {
+            let map = self.cid_map.as_ref().expect("CIDToGIDMap must be a stream");
+            be16(map, usize::from(cid) * 2).unwrap_or(0)
+        }
+    }
+
+    /// Record a glyph outline as a comparable op list.
+    #[derive(Default)]
+    struct Outline(Vec<String>);
+
+    impl ttf_parser::OutlineBuilder for Outline {
+        fn move_to(&mut self, x: f32, y: f32) {
+            self.0.push(format!("M {x} {y}"));
+        }
+        fn line_to(&mut self, x: f32, y: f32) {
+            self.0.push(format!("L {x} {y}"));
+        }
+        fn quad_to(&mut self, x1: f32, y1: f32, x: f32, y: f32) {
+            self.0.push(format!("Q {x1} {y1} {x} {y}"));
+        }
+        fn curve_to(&mut self, x1: f32, y1: f32, x2: f32, y2: f32, x: f32, y: f32) {
+            self.0.push(format!("C {x1} {y1} {x2} {y2} {x} {y}"));
+        }
+        fn close(&mut self) {
+            self.0.push("Z".to_string());
+        }
+    }
+
+    fn outline_and_advance(font: &[u8], gid: u16) -> (Vec<String>, Option<u16>) {
+        let face = ttf_parser::Face::parse(font, 0).expect("font must parse");
+        let mut rec = Outline::default();
+        let id = ttf_parser::GlyphId(gid);
+        face.outline_glyph(id, &mut rec);
+        (rec.0, face.glyph_hor_advance(id))
+    }
+
+    /// Assert that the old GID (in the original font) and the subset's mapped
+    /// GID draw the identical outline with the identical advance.
+    fn assert_glyph_preserved(view: &SubsetView, old_font: &[u8], cid: u16, old_gid: u16) {
+        let (old_outline, old_adv) = outline_and_advance(old_font, old_gid);
+        let (new_outline, new_adv) = outline_and_advance(&view.font, view.new_gid(cid));
+        // Both may legitimately be empty (e.g. the space glyph); what matters
+        // is equality of outline and advance.
+        assert_eq!(old_outline, new_outline, "outline mismatch for CID {cid}");
+        assert_eq!(old_adv, new_adv, "advance mismatch for CID {cid}");
+    }
+
+    fn base_name_of(dict: &Dictionary, key: &[u8]) -> Vec<u8> {
+        match dict.get(key) {
+            Ok(Object::Name(n)) => n.clone(),
+            other => panic!(
+                "expected name at {}: {other:?}",
+                String::from_utf8_lossy(key)
+            ),
+        }
+    }
+
+    // -- the battery ---------------------------------------------------------
+
+    #[test]
+    fn subset_shrinks_and_never_touches_text_or_cid_keyed_tables() {
+        let cids = gids_for("Hello, World!");
+        let pairs: Vec<(u16, char)> =
+            cids.iter().copied().zip("Hello, World!".chars()).collect();
+        let pdf =
+            build_text_pdf(&FontSpec::identity(pairs.clone()), std::slice::from_ref(&cids));
+        let out = optimize_with_options(&pdf, subset_opts());
+
+        assert!(out.len() < pdf.len(), "subsetting must shrink the file");
+
+        // Content-stream bytes are the M1 superpower: byte-identical.
+        let pre = Document::load_mem(&pdf).unwrap();
+        let post = Document::load_mem(&out).unwrap();
+        let pre_page = *pre.get_pages().get(&1).unwrap();
+        let post_page = *post.get_pages().get(&1).unwrap();
+        assert_eq!(
+            pre.get_page_content(pre_page).unwrap(),
+            post.get_page_content(post_page).unwrap(),
+            "content stream must be byte-identical"
+        );
+
+        let view = subset_view(&out);
+        // CID-keyed tables untouched.
+        assert_eq!(
+            view.descendant.get(b"DW").unwrap().as_i64().unwrap(),
+            600,
+            "/DW must be untouched"
+        );
+        // ToUnicode untouched (compare decompressed bytes: the save path may
+        // Flate-wrap the previously raw stream).
+        let tou = resolve(&view.doc, view.type0.get(b"ToUnicode").unwrap())
+            .as_stream()
+            .unwrap();
+        let tou_bytes = tou
+            .decompressed_content()
+            .unwrap_or_else(|_| tou.content.clone());
+        assert_eq!(tou_bytes, to_unicode_bytes(&pairs), "/ToUnicode must be untouched");
+
+        // Names re-tagged consistently, map now a stream, font smaller.
+        let tagged = base_name_of(&view.type0, b"BaseFont");
+        assert_eq!(tagged.len(), "NotoSans-Regular".len() + 7);
+        assert_eq!(tagged[6], b'+');
+        assert!(tagged[..6].iter().all(u8::is_ascii_uppercase));
+        assert_eq!(&tagged[7..], b"NotoSans-Regular");
+        assert_eq!(base_name_of(&view.descendant, b"BaseFont"), tagged);
+        assert_eq!(base_name_of(&view.descriptor, b"FontName"), tagged);
+        assert!(view.cid_map.is_some(), "CIDToGIDMap must now be a stream");
+        let original = noto_bytes();
+        assert!(
+            view.font.len() < original.len() / 4,
+            "subset must be much smaller than the full font"
+        );
+
+        // Every used glyph: outline + advance equality.
+        for &cid in &cids {
+            assert_glyph_preserved(&view, &original, cid, cid);
+        }
+    }
+
+    #[test]
+    fn text_extraction_is_identical_pre_and_post() {
+        let text = "The quick brown fox";
+        let cids = gids_for(text);
+        let pairs: Vec<(u16, char)> = cids.iter().copied().zip(text.chars()).collect();
+        let pdf = build_text_pdf(&FontSpec::identity(pairs), &[cids]);
+        let out = optimize_with_options(&pdf, subset_opts());
+        assert!(out.len() < pdf.len());
+
+        let pre = Document::load_mem(&pdf).unwrap().extract_text(&[1]);
+        let post = Document::load_mem(&out).unwrap().extract_text(&[1]);
+        let pre = pre.expect("fixture text must extract");
+        let post = post.expect("subset text must extract");
+        assert_eq!(pre, post, "extracted text must be identical");
+        assert!(pre.contains("The quick brown fox"), "oracle must see the text");
+    }
+
+    #[test]
+    fn composite_glyph_closure_is_preserved() {
+        // "é" and "ü" are composite glyphs (base + accent) in Noto Sans; the
+        // subsetter must pull their component glyphs into the subset or the
+        // outline comparison fails.
+        let text = "éü";
+        let cids = gids_for(text);
+        let pairs: Vec<(u16, char)> = cids.iter().copied().zip(text.chars()).collect();
+        let pdf = build_text_pdf(&FontSpec::identity(pairs), std::slice::from_ref(&cids));
+        let out = optimize_with_options(&pdf, subset_opts());
+        assert!(out.len() < pdf.len());
+
+        let view = subset_view(&out);
+        let original = noto_bytes();
+        for &cid in &cids {
+            assert_glyph_preserved(&view, &original, cid, cid);
+        }
+        // Closure must have added component glyphs beyond .notdef + the two
+        // composites we asked for.
+        let face = ttf_parser::Face::parse(&view.font, 0).unwrap();
+        assert!(
+            face.number_of_glyphs() > 3,
+            "composite components missing: only {} glyphs",
+            face.number_of_glyphs()
+        );
+    }
+
+    #[test]
+    fn cid_to_gid_map_stream_input_is_composed() {
+        // Non-identity input mapping: CID 1 -> 'a', CID 2 -> 'b', CID 3 -> 'c'.
+        let abc = gids_for("abc");
+        let spec = FontSpec {
+            cid_table: Some(vec![0, abc[0], abc[1], abc[2]]),
+            base_font: "NotoSans-Regular",
+            corrupt_font_file: false,
+            to_unicode: vec![(1, 'a'), (2, 'b'), (3, 'c')],
+        };
+        let pdf = build_text_pdf(&spec, &[vec![1, 2, 3]]);
+        let out = optimize_with_options(&pdf, subset_opts());
+        assert!(out.len() < pdf.len());
+
+        let view = subset_view(&out);
+        let original = noto_bytes();
+        for (cid, &old_gid) in (1u16..=3).zip(abc.iter()) {
+            assert_glyph_preserved(&view, &original, cid, old_gid);
+        }
+    }
+
+    #[test]
+    fn shared_font_accumulates_across_pages() {
+        let page1 = gids_for("abc");
+        let page2 = gids_for("xyz");
+        let pairs: Vec<(u16, char)> = page1
+            .iter()
+            .chain(page2.iter())
+            .copied()
+            .zip("abcxyz".chars())
+            .collect();
+        let pdf = build_text_pdf(&FontSpec::identity(pairs), &[page1.clone(), page2.clone()]);
+        let out = optimize_with_options(&pdf, subset_opts());
+        assert!(out.len() < pdf.len());
+
+        let view = subset_view(&out);
+        let original = noto_bytes();
+        for &cid in page1.iter().chain(page2.iter()) {
+            assert_glyph_preserved(&view, &original, cid, cid);
+        }
+    }
+
+    #[test]
+    fn glyphs_in_forms_and_annotation_appearances_are_found() {
+        let page_cids = gids_for("ab");
+        let form_cids = gids_for("cd");
+        let ap_cids = gids_for("ef");
+        let pairs: Vec<(u16, char)> = page_cids
+            .iter()
+            .chain(form_cids.iter())
+            .chain(ap_cids.iter())
+            .copied()
+            .zip("abcdef".chars())
+            .collect();
+
+        let mut doc = Document::with_version("1.7");
+        let pages_id = doc.new_object_id();
+        let font_id = add_type0_font(&mut doc, &FontSpec::identity(pairs));
+
+        let form_id = doc.add_object(Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Form",
+                "BBox" => vec![0.into(), 0.into(), 200.into(), 200.into()],
+                "Resources" => dictionary! { "Font" => dictionary! { "F1" => font_id } },
+            },
+            Content { operations: show_text_ops("F1", &form_cids) }
+                .encode()
+                .unwrap(),
+        ));
+        let ap_id = doc.add_object(Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Form",
+                "BBox" => vec![0.into(), 0.into(), 200.into(), 50.into()],
+                "Resources" => dictionary! { "Font" => dictionary! { "F1" => font_id } },
+            },
+            Content { operations: show_text_ops("F1", &ap_cids) }
+                .encode()
+                .unwrap(),
+        ));
+        let annot_id = doc.add_object(dictionary! {
+            "Type" => "Annot",
+            "Subtype" => "Square",
+            "Rect" => vec![0.into(), 0.into(), 200.into(), 50.into()],
+            "AP" => dictionary! { "N" => ap_id },
+        });
+
+        let mut ops = show_text_ops("F1", &page_cids);
+        ops.push(Operation::new("Do", vec![Object::Name(b"Fm1".to_vec())]));
+        let content_id = doc.add_object(Stream::new(
+            dictionary! {},
+            Content { operations: ops }.encode().unwrap(),
+        ));
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "Contents" => content_id,
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Resources" => dictionary! {
+                "Font" => dictionary! { "F1" => font_id },
+                "XObject" => dictionary! { "Fm1" => form_id },
+            },
+            "Annots" => vec![annot_id.into()],
+        });
+        let pdf = finish_pdf(&mut doc, pages_id, vec![page_id]);
+
+        let out = optimize_with_options(&pdf, subset_opts());
+        assert!(out.len() < pdf.len(), "subsetting must still shrink");
+
+        let view = subset_view(&out);
+        let original = noto_bytes();
+        for &cid in page_cids.iter().chain(form_cids.iter()).chain(ap_cids.iter()) {
+            assert_glyph_preserved(&view, &original, cid, cid);
+        }
+    }
+
+    #[test]
+    fn unparseable_content_stream_disables_all_subsetting() {
+        let cids = gids_for("Hello");
+        let pairs: Vec<(u16, char)> = cids.iter().copied().zip("Hello".chars()).collect();
+        let mut doc = Document::with_version("1.7");
+        let pages_id = doc.new_object_id();
+        let font_id = add_type0_font(&mut doc, &FontSpec::identity(pairs));
+        let text_page = add_text_page(&mut doc, pages_id, font_id, show_text_ops("F1", &cids));
+        // Page 2: an unterminated string literal that content parsing rejects.
+        let bad_content = doc.add_object(Stream::new(
+            dictionary! {},
+            b"(this string never terminates".to_vec(),
+        ));
+        let bad_page = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "Contents" => bad_content,
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Resources" => dictionary! {},
+        });
+        let pdf = finish_pdf(&mut doc, pages_id, vec![text_page, bad_page]);
+
+        let out = optimize_with_options(&pdf, subset_opts());
+        assert_eq!(out, pdf, "one unparseable stream must disable subsetting entirely");
+    }
+
+    #[test]
+    fn extgstate_font_entry_disables_all_subsetting() {
+        // An ExtGState /Font selects a font without Tf; the walker cannot
+        // attribute subsequent shows, so the document must be left alone.
+        let cids = gids_for("Hello");
+        let pairs: Vec<(u16, char)> = cids.iter().copied().zip("Hello".chars()).collect();
+        let mut doc = Document::with_version("1.7");
+        let pages_id = doc.new_object_id();
+        let font_id = add_type0_font(&mut doc, &FontSpec::identity(pairs));
+        let content_id = doc.add_object(Stream::new(
+            dictionary! {},
+            Content { operations: show_text_ops("F1", &cids) }
+                .encode()
+                .unwrap(),
+        ));
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "Contents" => content_id,
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Resources" => dictionary! {
+                "Font" => dictionary! { "F1" => font_id },
+                "ExtGState" => dictionary! {
+                    "GS0" => dictionary! { "Font" => vec![font_id.into(), 12.into()] },
+                },
+            },
+        });
+        let pdf = finish_pdf(&mut doc, pages_id, vec![page_id]);
+
+        let out = optimize_with_options(&pdf, subset_opts());
+        assert_eq!(out, pdf, "ExtGState /Font must disable subsetting");
+    }
+
+    #[test]
+    fn corrupt_font_file_leaves_font_untouched() {
+        let cids = gids_for("Hi");
+        let spec = FontSpec {
+            corrupt_font_file: true,
+            ..FontSpec::identity(cids.iter().copied().zip("Hi".chars()).collect())
+        };
+        let pdf = build_text_pdf(&spec, &[cids]);
+        let out = optimize_with_options(&pdf, subset_opts());
+        assert_eq!(out, pdf, "corrupt FontFile2 must return original bytes");
+    }
+
+    #[test]
+    fn referenced_but_unused_font_is_untouched() {
+        // A font in the resources that never shows text: no usage evidence,
+        // so it ships untouched ("any uncertainty => leave it alone").
+        let mut doc = Document::with_version("1.7");
+        let pages_id = doc.new_object_id();
+        let font_id = add_type0_font(&mut doc, &FontSpec::identity(vec![]));
+        let page = add_text_page(&mut doc, pages_id, font_id, vec![]);
+        let pdf = finish_pdf(&mut doc, pages_id, vec![page]);
+
+        let out = optimize_with_options(&pdf, subset_opts());
+        assert_eq!(out, pdf, "unused font must be untouched");
+    }
+
+    #[test]
+    fn pdfa_declared_documents_are_skipped() {
+        let cids = gids_for("Hello");
+        let pairs: Vec<(u16, char)> = cids.iter().copied().zip("Hello".chars()).collect();
+        let pdf = build_text_pdf(&FontSpec::identity(pairs), &[cids]);
+
+        // Re-open and attach a PDF/A XMP metadata stream to the catalog.
+        let mut doc = Document::load_mem(&pdf).unwrap();
+        let xmp = concat!(
+            r#"<x:xmpmeta xmlns:x="adobe:ns:meta/">"#,
+            r#"<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">"#,
+            r#"<rdf:Description rdf:about="" xmlns:pdfaid="http://www.aiim.org/pdfa/ns/id/">"#,
+            r#"<pdfaid:part>2</pdfaid:part><pdfaid:conformance>B</pdfaid:conformance>"#,
+            r#"</rdf:Description></rdf:RDF></x:xmpmeta>"#,
+        );
+        let meta_id = doc.add_object(Stream::new(
+            dictionary! { "Type" => "Metadata", "Subtype" => "XML" },
+            xmp.as_bytes().to_vec(),
+        ));
+        if let Ok(catalog) = doc.catalog_mut() {
+            catalog.set("Metadata", Object::Reference(meta_id));
+        }
+        let mut pdfa: Vec<u8> = Vec::new();
+        doc.save_to(&mut pdfa).unwrap();
+
+        let out = optimize_with_options(&pdfa, subset_opts());
+        assert_eq!(out, pdfa, "PDF/A-declared document must be skipped");
+    }
+
+    #[test]
+    fn subset_fonts_is_off_by_default() {
+        let cids = gids_for("Hello");
+        let pairs: Vec<(u16, char)> = cids.iter().copied().zip("Hello".chars()).collect();
+        let pdf = build_text_pdf(&FontSpec::identity(pairs), &[cids]);
+        let out = optimize(&pdf);
+        assert_eq!(out, pdf, "default options must not touch fonts");
+    }
+
+    #[test]
+    fn existing_subset_tag_is_replaced_not_stacked() {
+        let cids = gids_for("Hello");
+        let spec = FontSpec {
+            base_font: "ABCDEF+NotoSans-Regular",
+            ..FontSpec::identity(cids.iter().copied().zip("Hello".chars()).collect())
+        };
+        let pdf = build_text_pdf(&spec, &[cids]);
+        let out = optimize_with_options(&pdf, subset_opts());
+        assert!(out.len() < pdf.len());
+
+        let view = subset_view(&out);
+        let tagged = base_name_of(&view.type0, b"BaseFont");
+        assert_eq!(&tagged[7..], b"NotoSans-Regular", "old tag must be stripped");
+        assert_eq!(tagged.iter().filter(|&&b| b == b'+').count(), 1);
+    }
+
+    #[test]
+    fn subsetting_is_idempotent() {
+        let cids = gids_for("Hello, World!");
+        let pairs: Vec<(u16, char)> =
+            cids.iter().copied().zip("Hello, World!".chars()).collect();
+        let pdf = build_text_pdf(&FontSpec::identity(pairs), &[cids]);
+        let once = optimize_with_options(&pdf, subset_opts());
+        assert!(once.len() < pdf.len(), "first pass must shrink");
+        let twice = optimize_with_options(&once, subset_opts());
+        assert_eq!(twice, once, "second pass must be byte-stable");
+    }
+
+    /// Emit pre/post PDFs for the dev-only external verification harness
+    /// (`scripts/verify-fonts.sh`: Ghostscript nullpage render + pdftotext
+    /// diff). Not a CI gate; same posture as `bench-vs-gs.sh`.
+    #[test]
+    #[ignore = "writes target/font-verify/{pre,post}.pdf for scripts/verify-fonts.sh"]
+    fn emit_font_verification_pdfs() {
+        let text = "The quick brown fox jumps over the lazy dog: été, naïve, Zürich!";
+        let cids = gids_for(text);
+        let pairs: Vec<(u16, char)> = cids.iter().copied().zip(text.chars()).collect();
+        let pdf = build_text_pdf(&FontSpec::identity(pairs), &[cids]);
+        let out = optimize_with_options(&pdf, subset_opts());
+        assert!(out.len() < pdf.len());
+
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/target/font-verify");
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(format!("{dir}/pre.pdf"), &pdf).unwrap();
+        std::fs::write(format!("{dir}/post.pdf"), &out).unwrap();
+        println!(
+            "wrote {dir}/pre.pdf ({} bytes) and post.pdf ({} bytes)",
+            pdf.len(),
+            out.len()
+        );
+    }
+}

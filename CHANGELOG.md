@@ -6,6 +6,42 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Opt-in font subsetting (Phase 3 C-M1).**
+  `OptimizeOptions::subset_fonts` (default `false`) and the
+  `with_subset_fonts` builder subset embedded Type0/CIDFontType2
+  (Identity-H/V) fonts to the glyphs the document actually shows, via
+  `subsetter` 0.2.6 (`default-features = false`; one transitive dependency).
+  The `/CIDToGIDMap`-stream technique replaces only `/FontFile2` and
+  `/CIDToGIDMap` (plus a deterministic `TAG+` name): content-stream text
+  bytes are **never rewritten**, and `/W`, `/DW`, and `/ToUnicode` stay
+  untouched, so text extraction is bit-identical pre/post (pinned by tests
+  and a Ghostscript/pdftotext harness in `scripts/verify-fonts.sh`).
+- Resource-aware glyph discovery over all content-bearing stream classes:
+  pages, form XObjects (recursive, cycle-guarded), annotation appearance
+  streams, tiling patterns, and Type3 char procs. Any parse failure anywhere
+  disables subsetting for the whole document; any per-font doubt (shared
+  descendant/descriptor/font program, non-Identity encoding, CFF/CFF2,
+  unresolvable map, glyphs out of range, not net-smaller) leaves that font
+  untouched. PDF/A-declared (`pdfaid` XMP) and encrypted documents are
+  skipped entirely.
+- OFL-licensed fixture font (`fixtures/fonts/NotoSans-Regular.ttf` +
+  `fixtures/fonts/OFL.txt`) powering the verification battery: per-glyph
+  outline and advance equality via `ttf-parser` (dev-dependency only),
+  composite-glyph closure, CIDToGIDMap-stream inputs, multi-page
+  accumulation, and walker coverage of forms/appearances.
+
+### Notes
+
+- Fonts amatl does not subset are always left byte-for-byte untouched:
+  simple (non-Type0) fonts and predefined CJK CMaps are permanently out of
+  scope; embedded CMap streams and CIDFontType0 (CFF) are future milestones.
+- The default-ON flip for `subset_fonts` is planned only after a clean
+  corpus soak (see docs/PHASE3-PLAN.md, decision #3).
+
 ## [0.2.0] - 2026-08-21
 
 ### Added

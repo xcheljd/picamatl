@@ -21,11 +21,18 @@
 //!      JPEG artifacts are ever introduced on that content class.
 //!   3. Replace the stream only when the result is actually smaller.
 //!
+//! Optionally (opt-in via [`OptimizeOptions::subset_fonts`]), embedded
+//! Type0/CIDFontType2 (Identity-H/V) fonts are subset to the glyphs actually
+//! shown, using a `/CIDToGIDMap`-stream technique that never rewrites
+//! content-stream text bytes (see `src/fonts.rs`).
+//!
 //! Hard safety guarantees:
 //!   - Images we can't measure a placement for are left untouched.
 //!   - Images already at/below the target DPI are left untouched (no upscaling).
 //!   - A re-encode that isn't smaller is discarded.
 //!   - Any failure (parse, decode, save) falls back to the original bytes.
+
+mod fonts;
 
 use std::collections::HashMap;
 
@@ -107,6 +114,16 @@ pub struct OptimizeOptions {
     /// so no JPEG artifacts are introduced). Applies the same effective-DPI
     /// threshold as the JPEG path. Default: `true`.
     pub downsample_flate_images: bool,
+
+    /// Subset embedded Type0/CIDFontType2 (Identity-H/V) fonts to the glyphs
+    /// the document actually shows. Only `/FontFile2` and `/CIDToGIDMap` are
+    /// replaced (plus the subset name tag): content-stream text bytes are
+    /// never rewritten, and `/W`, `/DW`, and `/ToUnicode` stay untouched, so
+    /// text extraction is bit-identical. Any parse uncertainty disables
+    /// subsetting for the affected font or the whole document — output is
+    /// always valid. PDF/A-declared and encrypted documents are skipped.
+    /// Default: `false` (opt-in for at least one release cycle).
+    pub subset_fonts: bool,
 }
 
 /// Written by hand, NOT derived: a derived `Default` would zero the numeric
@@ -122,6 +139,7 @@ impl Default for OptimizeOptions {
             strip_accessibility: false,
             pack_object_streams: false,
             downsample_flate_images: true,
+            subset_fonts: false,
         }
     }
 }
@@ -171,6 +189,14 @@ impl OptimizeOptions {
     #[must_use]
     pub fn with_downsample_flate_images(mut self, downsample: bool) -> Self {
         self.downsample_flate_images = downsample;
+        self
+    }
+
+    /// Enable/disable subsetting of embedded Type0/CIDFontType2 fonts
+    /// (off by default). See [`OptimizeOptions::subset_fonts`].
+    #[must_use]
+    pub fn with_subset_fonts(mut self, subset: bool) -> Self {
+        self.subset_fonts = subset;
         self
     }
 }
@@ -1105,6 +1131,16 @@ fn try_optimize(
         .filter_map(|(&id, &rendered)| plan_replacement(&doc, id, rendered, options))
         .collect();
 
+    // Plan font subsets on the still-immutable document (read-only; empty
+    // when the option is off or anything at all disqualified the document —
+    // see src/fonts.rs for the eligibility posture). Applied further down,
+    // after the image replacements.
+    let font_plans = if options.subset_fonts {
+        fonts::plan_font_subsets(&doc)
+    } else {
+        Vec::new()
+    };
+
     // If we have no work to do at all, hand back the original bytes.
     // Note: pack_object_streams alone is not sufficient reason to write a new
     // file — packing only helps when there are objects to pack, and the
@@ -1112,7 +1148,11 @@ fn try_optimize(
     // `merged_streams` counts as work: dedup_streams may have collapsed repeated
     // images even when nothing needed downsampling, and discarding that would
     // throw away a real size win.
-    if replacements.is_empty() && !options.strip_accessibility && !merged_streams {
+    if replacements.is_empty()
+        && font_plans.is_empty()
+        && !options.strip_accessibility
+        && !merged_streams
+    {
         return Ok(None);
     }
 
@@ -1136,6 +1176,8 @@ fn try_optimize(
             }
         }
     }
+
+    fonts::apply_font_subsets(&mut doc, font_plans);
 
     // Optionally strip the PDF's structure tree (accessibility metadata). This
     // is what Ghostscript's /ebook and /screen presets do silently: removes
@@ -2085,6 +2127,7 @@ mod tests {
         assert!(!d.strip_accessibility);
         assert!(!d.pack_object_streams);
         assert!(d.downsample_flate_images, "Flate downsampling is default-ON (0.2.0)");
+        assert!(!d.subset_fonts, "font subsetting is opt-in (decision #3)");
     }
 
     #[test]
@@ -2095,13 +2138,15 @@ mod tests {
             .with_dpi_margin(1.5)
             .with_strip_accessibility(true)
             .with_pack_object_streams(true)
-            .with_downsample_flate_images(false);
+            .with_downsample_flate_images(false)
+            .with_subset_fonts(true);
         assert_eq!(o.target_dpi, 96.0);
         assert_eq!(o.jpeg_quality, 60);
         assert_eq!(o.dpi_margin, 1.5);
         assert!(o.strip_accessibility);
         assert!(o.pack_object_streams);
         assert!(!o.downsample_flate_images);
+        assert!(o.subset_fonts);
     }
 
     #[test]
