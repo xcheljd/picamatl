@@ -22,10 +22,19 @@
 # match). gs also rewrites fonts/structure, so totals are not apples-to-apples
 # beyond the image payload; the point is a size sanity check.
 #
-# Measured baseline (2026-08-21, fixtures/sample.pdf, gs 10.07.1):
-#   input:  193668 bytes
-#   amatl:   27087 bytes (13% of input)
-#   gs:      43722 bytes (22% of input)
+# The fixture is Flate-heavy as of 0.2.0: pages 3-4 embed FlateDecode images
+# (PNG Up-predictor rows), so this same run also benchmarks the Flate
+# downsampling path — no separate input needed. gs's mirrored settings already
+# downsample all raster classes, keeping the comparison apples-to-apples.
+#
+# Measured baseline (2026-08-21, 4-page fixtures/sample.pdf with Flate pages):
+#   input:  662107 bytes
+#   amatl:  123948 bytes (18% of input)
+#   gs:     re-measure with `scripts/bench-vs-gs.sh` (not runnable in the
+#           sandboxed session that regenerated the fixture)
+#
+# Previous 2-page JPEG-only fixture (gs 10.07.1): 193668 -> amatl 27087 (13%),
+# gs 43722 (22%).
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"

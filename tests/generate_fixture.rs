@@ -13,10 +13,18 @@
 //!   downsamples and re-encodes it.
 //! - Page 2 embeds a 200x200 JPEG drawn into a 150pt box → effective ~96 DPI,
 //!   under the target, so amatl must leave it untouched.
+//! - Page 3 embeds a 400x400 FlateDecode RGB image (PNG Up-predictor rows,
+//!   `/DecodeParms /Predictor 15`) drawn into a 72pt box → effective ~400
+//!   DPI, so amatl's Flate path downsamples it in place.
+//! - Page 4 embeds a 150x150 FlateDecode image drawn into a 150pt box →
+//!   effective ~72 DPI, under the target, so it must stay untouched.
+
+use std::io::Write;
 
 use image::codecs::jpeg::JpegEncoder;
 use image::RgbImage;
 use lopdf::content::{Content, Operation};
+use lopdf::filters::png;
 use lopdf::{dictionary, Document, Object, Stream};
 
 /// Encode a deterministic sinusoidal RGB pattern as a baseline JPEG. The
@@ -35,6 +43,50 @@ fn pattern_jpeg(width: u32, height: u32, quality: u8) -> Vec<u8> {
     img.write_with_encoder(JpegEncoder::new_with_quality(&mut buf, quality))
         .expect("JPEG encoding of the synthetic pattern failed");
     buf
+}
+
+/// Deterministic pixels for the Flate pages: a smooth gradient plus
+/// low-amplitude xorshift noise. The noise keeps the stream from deflating to
+/// almost nothing (which would make the downsampling win unrepresentative and
+/// could even trip the never-larger guard), while staying reproducible.
+fn noisy_pixels(width: u32, height: u32) -> Vec<u8> {
+    let mut state = 0x2545_F491_u32;
+    let mut noise = move || {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        (state >> 24) as u8
+    };
+    let mut raw = Vec::with_capacity((width * height * 3) as usize);
+    for y in 0..height {
+        for x in 0..width {
+            let base = ((x * 2 + y) % 200) as u8;
+            raw.push(base.wrapping_add(noise() & 0x3F));
+            raw.push(base.wrapping_add(noise() & 0x3F).wrapping_add(30));
+            raw.push(200u8.wrapping_sub(base).wrapping_add(noise() & 0x3F));
+        }
+    }
+    raw
+}
+
+/// Deflate `raw` (level 9) as PNG Up-predictor-filtered rows via lopdf's
+/// `filters::png::encode_row`, returning the stream payload for a
+/// `/DecodeParms << /Predictor 15 /Colors 3 /BitsPerComponent 8 /Columns w >>`
+/// image — this exercises amatl's predictor decode path end to end.
+fn flate_up_payload(raw: &[u8], width: u32) -> Vec<u8> {
+    let bpr = width as usize * 3;
+    let mut filtered = Vec::with_capacity(raw.len() + raw.len() / bpr);
+    let mut previous = vec![0u8; bpr];
+    for row in raw.chunks_exact(bpr) {
+        let mut current = row.to_vec();
+        png::encode_row(png::FilterType::Up, 3, &previous, &mut current);
+        filtered.push(2); // PNG row-filter tag: Up
+        filtered.extend_from_slice(&current);
+        previous.copy_from_slice(row);
+    }
+    let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::new(9));
+    enc.write_all(&filtered).unwrap();
+    enc.finish().unwrap()
 }
 
 /// Build one Letter-sized page drawing `img_name` into a `box_pt`-wide square
@@ -110,17 +162,60 @@ fn generate_fixture() {
         jpeg_under,
     ));
 
+    let flate_over_raw = noisy_pixels(400, 400);
+    let img_flate_over = doc.add_object(Stream::new(
+        dictionary! {
+            "Type" => "XObject",
+            "Subtype" => "Image",
+            "Width" => 400_i64,
+            "Height" => 400_i64,
+            "ColorSpace" => "DeviceRGB",
+            "BitsPerComponent" => 8_i64,
+            "Filter" => "FlateDecode",
+            "DecodeParms" => dictionary! {
+                "Predictor" => 15_i64,
+                "Colors" => 3_i64,
+                "BitsPerComponent" => 8_i64,
+                "Columns" => 400_i64,
+            },
+        },
+        flate_up_payload(&flate_over_raw, 400),
+    ));
+
+    let flate_under_raw = noisy_pixels(150, 150);
+    let img_flate_under = doc.add_object(Stream::new(
+        dictionary! {
+            "Type" => "XObject",
+            "Subtype" => "Image",
+            "Width" => 150_i64,
+            "Height" => 150_i64,
+            "ColorSpace" => "DeviceRGB",
+            "BitsPerComponent" => 8_i64,
+            "Filter" => "FlateDecode",
+            "DecodeParms" => dictionary! {
+                "Predictor" => 15_i64,
+                "Colors" => 3_i64,
+                "BitsPerComponent" => 8_i64,
+                "Columns" => 150_i64,
+            },
+        },
+        flate_up_payload(&flate_under_raw, 150),
+    ));
+
     // 800px into 144pt → ~400 DPI (downsampled); 200px into 150pt → ~96 DPI
-    // (kept as-is).
+    // (kept as-is); 400px Flate into 72pt → ~400 DPI (downsampled in place);
+    // 150px Flate into 150pt → ~72 DPI (kept as-is).
     let page1 = add_page(&mut doc, pages_id, img_over, "Im1", 144);
     let page2 = add_page(&mut doc, pages_id, img_under, "Im2", 150);
+    let page3 = add_page(&mut doc, pages_id, img_flate_over, "Im3", 72);
+    let page4 = add_page(&mut doc, pages_id, img_flate_under, "Im4", 150);
 
     doc.objects.insert(
         pages_id,
         Object::Dictionary(dictionary! {
             "Type" => "Pages",
-            "Kids" => vec![page1.into(), page2.into()],
-            "Count" => 2,
+            "Kids" => vec![page1.into(), page2.into(), page3.into(), page4.into()],
+            "Count" => 4,
         }),
     );
     let catalog_id = doc.add_object(dictionary! {
