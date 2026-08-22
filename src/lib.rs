@@ -16,6 +16,9 @@
 //!      on-page rendered size (in points) of every painted image XObject.
 //!   2. For DCTDecode (JPEG) images whose *effective* DPI exceeds the target,
 //!      decode, resize to the target pixel dimensions, and re-encode as JPEG.
+//!      For FlateDecode raster images (screenshots, exported bitmaps), decode,
+//!      resize, and re-deflate — same format, `/ColorSpace` untouched, so no
+//!      JPEG artifacts are ever introduced on that content class.
 //!   3. Replace the stream only when the result is actually smaller.
 //!
 //! Hard safety guarantees:
@@ -29,7 +32,7 @@ use std::collections::HashMap;
 use image::{DynamicImage, ImageFormat};
 use rayon::prelude::*;
 use lopdf::content::Content;
-use lopdf::{Document, Object, ObjectId};
+use lopdf::{dictionary, Document, Object, ObjectId};
 
 /// Target resolution for downsampled images, in dots per inch.
 const TARGET_DPI: f32 = 130.0;
@@ -98,6 +101,12 @@ pub struct OptimizeOptions {
     /// compression). Default: `false`. See struct doc for the cost/benefit
     /// trade-off on different input shapes.
     pub pack_object_streams: bool,
+
+    /// Downsample over-resolution FlateDecode raster images in place (format
+    /// preserved: the result is still FlateDecode with the same `/ColorSpace`,
+    /// so no JPEG artifacts are introduced). Applies the same effective-DPI
+    /// threshold as the JPEG path. Default: `true`.
+    pub downsample_flate_images: bool,
 }
 
 /// Written by hand, NOT derived: a derived `Default` would zero the numeric
@@ -112,6 +121,7 @@ impl Default for OptimizeOptions {
             dpi_margin: DPI_MARGIN,
             strip_accessibility: false,
             pack_object_streams: false,
+            downsample_flate_images: true,
         }
     }
 }
@@ -153,6 +163,14 @@ impl OptimizeOptions {
     #[must_use]
     pub fn with_pack_object_streams(mut self, pack: bool) -> Self {
         self.pack_object_streams = pack;
+        self
+    }
+
+    /// Enable/disable in-place downsampling of over-resolution FlateDecode
+    /// raster images (on by default).
+    #[must_use]
+    pub fn with_downsample_flate_images(mut self, downsample: bool) -> Self {
+        self.downsample_flate_images = downsample;
         self
     }
 }
@@ -355,28 +373,53 @@ fn collect_placements(doc: &Document) -> HashMap<ObjectId, (f32, f32)> {
     sizes
 }
 
+/// Dictionary edits that accompany a replacement's new stream bytes, beyond
+/// the always-updated `/Width`/`/Height`.
+enum DictUpdate {
+    /// JPEG path: the payload is still raw DCTDecode, nothing else changes.
+    Dct,
+    /// Flate path: normalize `/Filter` to the scalar name and set the new
+    /// `/DecodeParms` (Up-predictor variant) or remove it (plain deflate).
+    Flate { decode_parms: Option<lopdf::Dictionary> },
+}
+
 /// A planned image replacement, computed read-only before mutating the doc.
 struct Replacement {
     id: ObjectId,
     content: Vec<u8>,
     width: i64,
     height: i64,
+    dict_update: DictUpdate,
 }
 
-/// Whether a stream's `/Filter` is exactly DCTDecode (raw JPEG payload).
-fn is_dct_only(doc: &Document, filter: &Object) -> bool {
-    match resolve(doc, filter) {
-        Object::Name(n) => n == b"DCTDecode",
-        Object::Array(items) => {
-            items.len() == 1
-                && matches!(resolve(doc, &items[0]), Object::Name(n) if n == b"DCTDecode")
-        }
-        _ => false,
+/// The single-filter classes `plan_replacement` knows how to re-encode.
+enum FilterClass {
+    DctOnly,
+    FlateOnly,
+    Other,
+}
+
+/// Classify a stream's `/Filter`: exactly DCTDecode (raw JPEG payload),
+/// exactly FlateDecode (deflated raster data), or anything else (untouched).
+/// Both the scalar-name and one-element-array forms are recognized.
+fn classify_filter(doc: &Document, filter: &Object) -> FilterClass {
+    let name = match resolve(doc, filter) {
+        Object::Name(n) => n.as_slice(),
+        Object::Array(items) if items.len() == 1 => match resolve(doc, &items[0]) {
+            Object::Name(n) => n.as_slice(),
+            _ => return FilterClass::Other,
+        },
+        _ => return FilterClass::Other,
+    };
+    match name {
+        b"DCTDecode" => FilterClass::DctOnly,
+        b"FlateDecode" => FilterClass::FlateOnly,
+        _ => FilterClass::Other,
     }
 }
 
-/// Decode, resize, and re-encode one image if it's an over-resolution JPEG.
-/// Returns `None` to leave the image untouched.
+/// Decode, resize, and re-encode one image if it's an over-resolution JPEG or
+/// Flate raster. Returns `None` to leave the image untouched.
 fn plan_replacement(
     doc: &Document,
     id: ObjectId,
@@ -395,12 +438,11 @@ fn plan_replacement(
         return None;
     }
     let dpi_margin = options.dpi_margin.max(1.0);
-    let quality = options.jpeg_quality.clamp(1, 100);
 
     let stream = doc.get_object(id).ok()?.as_stream().ok()?;
     let dict = &stream.dict;
 
-    // Must be a JPEG image with no soft mask (we don't touch transparency).
+    // Must be an image with no soft mask (we don't touch transparency).
     if !matches!(dict.get(b"Subtype").map(|s| resolve(doc, s)), Ok(Object::Name(n)) if n == b"Image")
     {
         return None;
@@ -409,7 +451,8 @@ fn plan_replacement(
         return None;
     }
     let filter = dict.get(b"Filter").ok()?;
-    if !is_dct_only(doc, filter) {
+    let class = classify_filter(doc, filter);
+    if matches!(class, FilterClass::Other) {
         return None;
     }
 
@@ -437,6 +480,45 @@ fn plan_replacement(
         return None;
     }
 
+    let (out, dict_update) = match class {
+        FilterClass::DctOnly => {
+            let out = plan_dct(stream, options, target_w, target_h)?;
+            (out, DictUpdate::Dct)
+        }
+        FilterClass::FlateOnly => {
+            if !options.downsample_flate_images {
+                return None;
+            }
+            let (out, decode_parms) =
+                plan_flate(doc, stream, px_w, px_h, target_w, target_h)?;
+            (out, DictUpdate::Flate { decode_parms })
+        }
+        FilterClass::Other => return None,
+    };
+
+    if out.len() >= stream.content.len() {
+        return None;
+    }
+
+    Some(Replacement {
+        id,
+        content: out,
+        width: target_w as i64,
+        height: target_h as i64,
+        dict_update,
+    })
+}
+
+/// The JPEG re-encode path: decode (scaled when possible), resize, re-encode
+/// via mozjpeg. Channel count is preserved to match the unchanged /ColorSpace.
+fn plan_dct(
+    stream: &lopdf::Stream,
+    options: OptimizeOptions,
+    target_w: u32,
+    target_h: u32,
+) -> Option<Vec<u8>> {
+    let quality = options.jpeg_quality.clamp(1, 100);
+
     // Prefer scaled decoding; fall back to a full decode for color spaces the
     // scaled path declines (CMYK/YCCK) or if libjpeg refuses the stream.
     let (decoded, is_gray) = decode_jpeg_scaled(&stream.content, target_w, target_h)
@@ -453,18 +535,292 @@ fn plan_replacement(
 
     // Preserve the original component count so the PDF /ColorSpace (which we
     // leave unchanged) still matches: gray -> 1 channel, else RGB -> 3.
-    let out = encode_jpeg(resized, is_gray, quality)?;
+    encode_jpeg(resized, is_gray, quality)
+}
 
-    if out.len() >= stream.content.len() {
+/// Raw pixel budget above which a Flate image is never decoded: 256 MiB
+/// (~9.5k x 9.5k RGB), far above anything legitimately placed on a page.
+/// Guards against decompression bombs before any allocation happens.
+const MAX_FLATE_PIXEL_BYTES: u64 = 256 * 1024 * 1024;
+
+/// The Flate same-format path: inflate (hard-capped), un-apply any PNG
+/// predictor, resize, and re-deflate at level 9 — trying both a PNG
+/// Up-predictor variant and a plain no-predictor variant, keeping the smaller.
+/// `/ColorSpace` is never touched, so no artifact-class change is possible.
+///
+/// Every eligibility gate returns `None` (image untouched) on doubt. Decoding
+/// is done with our own capped inflate + spec-correct predictor inversion
+/// instead of lopdf's `Stream::decompressed_content`, for three verified
+/// lopdf 0.42 reasons: its `decode_row` mis-computes the PNG Avg filter
+/// (`left + up/2` instead of `(left + up)/2` — silently wrong pixels with the
+/// right length), it swallows corrupt-zlib errors and returns partial data as
+/// `Ok`, and it has no decompressed-size cap. The predictor-VALUE gates still
+/// exist because lopdf also ignores TIFF Predictor 2 and the array form of
+/// `/DecodeParms`; we keep both out of M1 scope entirely.
+fn plan_flate(
+    doc: &Document,
+    stream: &lopdf::Stream,
+    px_w: u32,
+    px_h: u32,
+    target_w: u32,
+    target_h: u32,
+) -> Option<(Vec<u8>, Option<lopdf::Dictionary>)> {
+    let dict = &stream.dict;
+
+    // M1 scope: 8-bit only (Indexed/1/2/4/16-bit are skipped, never touched).
+    let bpc = dict
+        .get(b"BitsPerComponent")
+        .ok()
+        .map(|o| resolve(doc, o))
+        .and_then(|o| o.as_i64().ok())?;
+    if bpc != 8 {
         return None;
     }
 
-    Some(Replacement {
-        id,
-        content: out,
-        width: target_w as i64,
-        height: target_h as i64,
-    })
+    // A /Decode array remaps sample values; resizing under a remap is not
+    // sample-preserving, so skip.
+    if dict.get(b"Decode").is_ok() {
+        return None;
+    }
+
+    let channels = flate_channels(doc, dict)?;
+    let encoding = flate_encoding(dict, channels, px_w)?;
+
+    // Decompression-bomb guard before decoding, then an EXACT length check
+    // after: any mismatch (truncated stream, lying dimensions) means we cannot
+    // trust the pixel data — skip.
+    let expected = u64::from(px_w) * u64::from(px_h) * channels as u64;
+    if expected > MAX_FLATE_PIXEL_BYTES {
+        return None;
+    }
+    let bytes_per_row = px_w as usize * channels;
+    let decoded = match encoding {
+        FlateEncoding::Plain => inflate_capped(&stream.content, expected as usize)?,
+        FlateEncoding::PngPredictor => {
+            // Filtered layout: one leading tag byte per row.
+            let filtered_len = (bytes_per_row + 1) * px_h as usize;
+            let inflated = inflate_capped(&stream.content, filtered_len)?;
+            if inflated.len() != filtered_len {
+                return None;
+            }
+            png_defilter(&inflated, channels, bytes_per_row)?
+        }
+    };
+    if decoded.len() as u64 != expected {
+        return None;
+    }
+
+    let img = if channels == 3 {
+        DynamicImage::ImageRgb8(image::RgbImage::from_raw(px_w, px_h, decoded)?)
+    } else {
+        DynamicImage::ImageLuma8(image::GrayImage::from_raw(px_w, px_h, decoded)?)
+    };
+    let resized = img.resize_exact(target_w, target_h, image::imageops::FilterType::Lanczos3);
+    let raw = if channels == 3 {
+        resized.into_rgb8().into_raw()
+    } else {
+        resized.into_luma8().into_raw()
+    };
+
+    // Re-encode both variants and keep the smaller. The Up-predictor variant
+    // must also pay for the /DecodeParms dict it forces into the image
+    // dictionary (~70 serialized bytes), so the comparison includes that.
+    let plain = deflate_level9(&raw)?;
+    let up = deflate_level9(&png_up_filter(&raw, target_w, channels))?;
+    const PARMS_OVERHEAD: usize = 70;
+    if up.len() + PARMS_OVERHEAD < plain.len() {
+        let parms = dictionary! {
+            "Predictor" => 15_i64,
+            "Colors" => channels as i64,
+            "BitsPerComponent" => 8_i64,
+            "Columns" => target_w as i64,
+        };
+        Some((up, Some(parms)))
+    } else {
+        Some((plain, None))
+    }
+}
+
+/// Resolve `/ColorSpace` to a component count the M1 Flate path handles:
+/// DeviceRGB / ICCBased N=3 -> 3, DeviceGray / ICCBased N=1 -> 1. Anything
+/// else (Indexed, Separation, Lab, CalRGB, ...) -> `None` (image untouched).
+fn flate_channels(doc: &Document, dict: &lopdf::Dictionary) -> Option<usize> {
+    match resolve(doc, dict.get(b"ColorSpace").ok()?) {
+        Object::Name(n) if n == b"DeviceRGB" => Some(3),
+        Object::Name(n) if n == b"DeviceGray" => Some(1),
+        Object::Array(items) if items.len() == 2 => {
+            if !matches!(resolve(doc, &items[0]), Object::Name(n) if n == b"ICCBased") {
+                return None;
+            }
+            let icc = resolve(doc, &items[1]).as_stream().ok()?;
+            match resolve(doc, icc.dict.get(b"N").ok()?).as_i64().ok()? {
+                1 => Some(1),
+                3 => Some(3),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// How a Flate image's pixel data is laid out inside the deflate stream.
+enum FlateEncoding {
+    /// Raw pixel rows, no predictor.
+    Plain,
+    /// PNG-filtered rows (Predictor 10-15): a leading filter-type byte per row.
+    PngPredictor,
+}
+
+/// Classify the stream's `/DecodeParms` (if any) into a layout the M1 path
+/// decodes, or `None` (skip). Only the direct-dictionary form is accepted
+/// (arrays and indirect references are out of scope — lopdf ignores them too,
+/// so such streams have never been reliably decodable here), the predictor
+/// must be 1 (none) or PNG 10-15 (TIFF Predictor 2 is out of scope), and for
+/// PNG predictors the declared Colors/Columns/BitsPerComponent must match the
+/// image dictionary or the row stride would be wrong. Defaults mirror the PDF
+/// spec (Predictor 1, Colors 1, Columns 1, BitsPerComponent 8).
+fn flate_encoding(
+    dict: &lopdf::Dictionary,
+    channels: usize,
+    px_w: u32,
+) -> Option<FlateEncoding> {
+    let parms = match dict.get(b"DecodeParms") {
+        Err(_) => return Some(FlateEncoding::Plain), // no parms: plain deflate
+        Ok(Object::Dictionary(d)) => d,
+        Ok(_) => return None, // array / reference form: out of M1 scope
+    };
+    let predictor = parms.get(b"Predictor").and_then(Object::as_i64).unwrap_or(1);
+    match predictor {
+        1 => Some(FlateEncoding::Plain),
+        10..=15 => {
+            let colors = parms.get(b"Colors").and_then(Object::as_i64).unwrap_or(1);
+            let columns = parms.get(b"Columns").and_then(Object::as_i64).unwrap_or(1);
+            let parms_bpc = parms
+                .get(b"BitsPerComponent")
+                .and_then(Object::as_i64)
+                .unwrap_or(8);
+            let matches_image = colors == channels as i64
+                && columns == i64::from(px_w)
+                && parms_bpc == 8;
+            matches_image.then_some(FlateEncoding::PngPredictor)
+        }
+        _ => None,
+    }
+}
+
+/// Inflate a zlib stream with a hard output cap. Returns `None` for corrupt
+/// or truncated input (unlike lopdf, which logs and returns partial data as
+/// `Ok`) and for streams that would produce more than `limit` bytes — the
+/// actual decompression-bomb guard, enforced *during* inflation.
+fn inflate_capped(data: &[u8], limit: usize) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let mut out = Vec::new();
+    // Read one byte past the cap so an over-limit stream is distinguishable
+    // from one that is exactly at it.
+    let mut dec = flate2::read::ZlibDecoder::new(data).take(limit as u64 + 1);
+    dec.read_to_end(&mut out).ok()?;
+    if out.len() > limit {
+        return None;
+    }
+    Some(out)
+}
+
+/// PNG Paeth predictor (PNG spec §9.4).
+fn paeth_predict(left: u8, up: u8, upper_left: u8) -> u8 {
+    let (a, b, c) = (i16::from(left), i16::from(up), i16::from(upper_left));
+    let p = a + b - c;
+    let (pa, pb, pc) = ((p - a).abs(), (p - b).abs(), (p - c).abs());
+    if pa <= pb && pa <= pc {
+        left
+    } else if pb <= pc {
+        up
+    } else {
+        upper_left
+    }
+}
+
+/// Spec-correct inversion of PNG row filters over a whole frame of
+/// `[tag][filtered row]` records. Hand-rolled rather than lopdf's
+/// `filters::png::decode_frame` because lopdf 0.42 mis-computes the Avg
+/// filter (`left + up/2` instead of `(left + up)/2`, verified by round-trip
+/// test) — silently wrong pixels with the correct length, which the outer
+/// length check cannot catch. Returns `None` on any malformed shape.
+fn png_defilter(data: &[u8], bytes_per_pixel: usize, bytes_per_row: usize) -> Option<Vec<u8>> {
+    let stride = bytes_per_row.checked_add(1)?;
+    if bytes_per_row == 0 || !data.len().is_multiple_of(stride) {
+        return None;
+    }
+    let rows = data.len() / stride;
+    let mut out = vec![0u8; rows * bytes_per_row];
+    for r in 0..rows {
+        let src = &data[r * stride..(r + 1) * stride];
+        let tag = src[0];
+        let (done, rest) = out.split_at_mut(r * bytes_per_row);
+        let prev = &done[done.len().saturating_sub(bytes_per_row)..];
+        let cur = &mut rest[..bytes_per_row];
+        cur.copy_from_slice(&src[1..]);
+        let bpp = bytes_per_pixel;
+        let up_at = |i: usize| if r == 0 { 0 } else { prev[i] };
+        match tag {
+            0 => {}
+            1 => {
+                for i in bpp..bytes_per_row {
+                    cur[i] = cur[i].wrapping_add(cur[i - bpp]);
+                }
+            }
+            2 => {
+                for (i, c) in cur.iter_mut().enumerate() {
+                    *c = c.wrapping_add(up_at(i));
+                }
+            }
+            3 => {
+                for i in 0..bytes_per_row {
+                    let left = if i >= bpp { u16::from(cur[i - bpp]) } else { 0 };
+                    let up = u16::from(up_at(i));
+                    cur[i] = cur[i].wrapping_add(((left + up) / 2) as u8);
+                }
+            }
+            4 => {
+                for i in 0..bytes_per_row {
+                    let left = if i >= bpp { cur[i - bpp] } else { 0 };
+                    let up = up_at(i);
+                    let upper_left = if i >= bpp { up_at(i - bpp) } else { 0 };
+                    cur[i] = cur[i].wrapping_add(paeth_predict(left, up, upper_left));
+                }
+            }
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
+/// Apply the PNG Up filter to every row, producing the predictor-encoded byte
+/// stream FlateDecode + `/Predictor >= 10` expects: each row is a leading
+/// filter-type byte (2 = Up) followed by the filtered row bytes.
+fn png_up_filter(raw: &[u8], width: u32, channels: usize) -> Vec<u8> {
+    use lopdf::filters::png;
+
+    let bytes_per_row = width as usize * channels;
+    let rows = raw.len() / bytes_per_row.max(1);
+    let mut out = Vec::with_capacity(raw.len() + rows);
+    let mut previous = vec![0u8; bytes_per_row];
+    for row in raw.chunks_exact(bytes_per_row) {
+        let mut current = row.to_vec();
+        // `previous` must be the UNFILTERED prior row (encode_row subtracts it).
+        png::encode_row(png::FilterType::Up, channels, &previous, &mut current);
+        out.push(2); // PNG filter-type tag: Up
+        out.extend_from_slice(&current);
+        previous.copy_from_slice(row);
+    }
+    out
+}
+
+/// Deflate (zlib container, as FlateDecode requires) at maximum compression.
+fn deflate_level9(data: &[u8]) -> Option<Vec<u8>> {
+    use std::io::Write;
+    let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::new(9));
+    enc.write_all(data).ok()?;
+    enc.finish().ok()
 }
 
 /// Encode an image as JPEG using mozjpeg (optimized Huffman + trellis), which
@@ -765,6 +1121,19 @@ fn try_optimize(
             stream.set_content(r.content);
             stream.dict.set("Width", Object::Integer(r.width));
             stream.dict.set("Height", Object::Integer(r.height));
+            if let DictUpdate::Flate { decode_parms } = r.dict_update {
+                // Normalize /Filter to the scalar name (the array form was
+                // accepted on input) and write parms matching the new payload.
+                stream
+                    .dict
+                    .set("Filter", Object::Name(b"FlateDecode".to_vec()));
+                match decode_parms {
+                    Some(parms) => stream.dict.set("DecodeParms", Object::Dictionary(parms)),
+                    None => {
+                        stream.dict.remove(b"DecodeParms");
+                    }
+                }
+            }
         }
     }
 
@@ -1021,6 +1390,497 @@ mod tests {
         panic!("no image found");
     }
 
+    // ---- Flate-path fixtures ----------------------------------------------
+
+    /// Deterministic xorshift noise. Noise is essentially incompressible, so a
+    /// downsampled re-encode is reliably smaller than the original — unlike a
+    /// regular gradient, whose predictor-filtered rows deflate to almost
+    /// nothing and (correctly) trip the never-larger guard.
+    fn flate_pixels(px_w: u32, px_h: u32, channels: usize) -> Vec<u8> {
+        let mut state = 0x2545_F491_u32;
+        (0..px_w as usize * px_h as usize * channels)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                (state >> 24) as u8
+            })
+            .collect()
+    }
+
+    /// Apply one PNG row filter to every row, producing the tagged row stream
+    /// (`[tag][filtered row]...`) that FlateDecode + PNG predictors expect.
+    /// Spec-correct forward filtering (PNG spec §9), hand-rolled: lopdf 0.42's
+    /// `encode_row` mis-computes Avg (`(left wrapping+ up)/2` overflows), so
+    /// fixtures built with it would not exercise the real-world byte shape.
+    fn png_filter_rows(raw: &[u8], px_w: u32, channels: usize, tag: u8) -> Vec<u8> {
+        let bpr = px_w as usize * channels;
+        let bpp = channels;
+        let mut out = Vec::with_capacity(raw.len() + raw.len() / bpr);
+        let mut previous = vec![0u8; bpr];
+        for row in raw.chunks_exact(bpr) {
+            out.push(tag);
+            for i in 0..bpr {
+                let x = row[i];
+                let left = if i >= bpp { row[i - bpp] } else { 0 };
+                let up = previous[i];
+                let upper_left = if i >= bpp { previous[i - bpp] } else { 0 };
+                let filtered = match tag {
+                    0 => x,
+                    1 => x.wrapping_sub(left),
+                    2 => x.wrapping_sub(up),
+                    3 => x.wrapping_sub(((u16::from(left) + u16::from(up)) / 2) as u8),
+                    4 => x.wrapping_sub(paeth_predict(left, up, upper_left)),
+                    _ => unreachable!("bad filter tag"),
+                };
+                out.push(filtered);
+            }
+            previous.copy_from_slice(row);
+        }
+        out
+    }
+
+    /// Wrap a prepared image XObject stream in a one-page document drawing it
+    /// into a `draw_pts` square box.
+    fn wrap_image_pdf(doc: &mut Document, img_id: ObjectId, draw_pts: i64) -> Vec<u8> {
+        let content = Content {
+            operations: vec![
+                Operation::new("q", vec![]),
+                Operation::new(
+                    "cm",
+                    vec![
+                        draw_pts.into(),
+                        0.into(),
+                        0.into(),
+                        draw_pts.into(),
+                        0.into(),
+                        0.into(),
+                    ],
+                ),
+                Operation::new("Do", vec![Object::Name(b"Im0".to_vec())]),
+                Operation::new("Q", vec![]),
+            ],
+        };
+        let content_id = doc.add_object(Stream::new(dictionary! {}, content.encode().unwrap()));
+        let pages_id = doc.new_object_id();
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "Contents" => content_id,
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Resources" => dictionary! { "XObject" => dictionary! { "Im0" => img_id } },
+        });
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => vec![page_id.into()],
+                "Count" => 1,
+            }),
+        );
+        let catalog_id = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+        doc.trailer.set("Root", catalog_id);
+        let mut out: Vec<u8> = Vec::new();
+        doc.save_to(&mut out).unwrap();
+        out
+    }
+
+    /// Build a one-page PDF embedding a `px`x`px` FlateDecode image drawn into
+    /// a `draw_pts` square. `predictor: Some(f)` stores PNG-filtered rows with
+    /// a `/DecodeParms << /Predictor 15 ... >>`; `None` stores plain deflate
+    /// with no DecodeParms. `filter_as_array`/`parms_as_array` exercise the
+    /// array dictionary forms.
+    fn build_pdf_flate_ext(
+        px: u32,
+        draw_pts: i64,
+        channels: usize,
+        predictor: Option<u8>,
+        filter_as_array: bool,
+        parms_as_array: bool,
+    ) -> Vec<u8> {
+        let raw = flate_pixels(px, px, channels);
+        let (payload, parms) = match predictor {
+            Some(tag) => {
+                let filtered = png_filter_rows(&raw, px, channels, tag);
+                let parms = dictionary! {
+                    "Predictor" => 15_i64,
+                    "Colors" => channels as i64,
+                    "BitsPerComponent" => 8_i64,
+                    "Columns" => px as i64,
+                };
+                (deflate_level9(&filtered).unwrap(), Some(parms))
+            }
+            None => (deflate_level9(&raw).unwrap(), None),
+        };
+
+        let mut dict = dictionary! {
+            "Type" => "XObject",
+            "Subtype" => "Image",
+            "Width" => px as i64,
+            "Height" => px as i64,
+            "ColorSpace" => if channels == 1 { "DeviceGray" } else { "DeviceRGB" },
+            "BitsPerComponent" => 8_i64,
+        };
+        if filter_as_array {
+            dict.set("Filter", vec![Object::Name(b"FlateDecode".to_vec())]);
+        } else {
+            dict.set("Filter", Object::Name(b"FlateDecode".to_vec()));
+        }
+        if let Some(parms) = parms {
+            if parms_as_array {
+                dict.set("DecodeParms", vec![Object::Dictionary(parms)]);
+            } else {
+                dict.set("DecodeParms", Object::Dictionary(parms));
+            }
+        }
+
+        let mut doc = Document::with_version("1.5");
+        let img_id = doc.add_object(Stream::new(dict, payload));
+        wrap_image_pdf(&mut doc, img_id, draw_pts)
+    }
+
+    fn build_pdf_flate(px: u32, draw_pts: i64, predictor: Option<u8>) -> Vec<u8> {
+        build_pdf_flate_ext(px, draw_pts, 3, predictor, false, false)
+    }
+
+    /// The single image stream's decompressed pixel bytes.
+    fn flate_image_pixels(pdf: &[u8]) -> Vec<u8> {
+        let doc = Document::load_mem(pdf).unwrap();
+        for obj in doc.objects.values() {
+            if let Object::Stream(s) = obj {
+                if matches!(s.dict.get(b"Subtype"), Ok(Object::Name(n)) if n == b"Image") {
+                    return s.decompressed_content().unwrap();
+                }
+            }
+        }
+        panic!("no image stream");
+    }
+
+    // ---- Flate-path tests --------------------------------------------------
+
+    #[test]
+    fn flate_predictor_variants_are_downsampled() {
+        // 400px drawn into 100pt => ~288 DPI, over target. Every PNG row
+        // filter plus the no-DecodeParms form must decode, downsample to
+        // ~181px, and still yield consistent pixel data.
+        let variants: [(Option<u8>, &str); 6] = [
+            (None, "no DecodeParms"),
+            (Some(0), "Predictor 15 / rows None"),
+            (Some(1), "Predictor 15 / rows Sub"),
+            (Some(2), "Predictor 15 / rows Up"),
+            (Some(3), "Predictor 15 / rows Avg"),
+            (Some(4), "Predictor 15 / rows Paeth"),
+        ];
+        for (predictor, label) in variants {
+            let pdf = build_pdf_flate(400, 100, predictor);
+            let out = optimize(&pdf);
+            let (w, h) = image_dims(&out);
+            assert!(
+                (150..=210).contains(&w) && w == h,
+                "{label}: unexpected dims {w}x{h}"
+            );
+            assert!(out.len() < pdf.len(), "{label}: output must be smaller");
+            // The rewritten stream, decoded through lopdf's own filter path,
+            // must equal a direct Lanczos3 resize of the source pixels EXACTLY
+            // (both sides run the same deterministic resize) — this pins the
+            // whole predictor decode chain, not just the byte count.
+            let pixels = flate_image_pixels(&out);
+            let reference = DynamicImage::ImageRgb8(
+                image::RgbImage::from_raw(400, 400, flate_pixels(400, 400, 3)).unwrap(),
+            )
+            .resize_exact(w as u32, h as u32, image::imageops::FilterType::Lanczos3)
+            .into_rgb8()
+            .into_raw();
+            assert_eq!(
+                pixels, reference,
+                "{label}: decoded pixels must match a direct resize of the source"
+            );
+        }
+    }
+
+    #[test]
+    fn flate_filter_array_form_is_downsampled() {
+        // Day-1 probe, kept as a regression test: /Filter [/FlateDecode] with
+        // a SCALAR /DecodeParms dict decodes fine and must be handled like
+        // the scalar-name form.
+        let pdf = build_pdf_flate_ext(400, 100, 3, Some(2), true, false);
+        let out = optimize(&pdf);
+        let (w, h) = image_dims(&out);
+        assert!((150..=210).contains(&w) && w == h, "unexpected dims {w}x{h}");
+        assert!(out.len() < pdf.len());
+        assert!(Document::load_mem(&out).is_ok());
+    }
+
+    #[test]
+    fn flate_decode_parms_array_form_is_skipped() {
+        // Day-1 probe result: lopdf 0.42 only reads the direct-dict form of
+        // /DecodeParms — the array form is silently NOT applied, which would
+        // hand us predictor-filtered rows as if they were pixels. The gate
+        // must skip such images entirely (original bytes returned).
+        let pdf = build_pdf_flate_ext(400, 100, 3, Some(2), false, true);
+        let out = optimize(&pdf);
+        assert_eq!(out, pdf, "array-form DecodeParms must leave the file untouched");
+    }
+
+    #[test]
+    fn flate_tiff_predictor_2_is_skipped() {
+        // Day-1 probe result: lopdf silently IGNORES TIFF Predictor 2 — the
+        // decoded bytes are wrong but the length is right, so the length check
+        // alone cannot catch it. The explicit predictor-value gate must skip.
+        let px = 400u32;
+        let mut raw = flate_pixels(px, px, 3);
+        let bpr = px as usize * 3;
+        for row in raw.chunks_exact_mut(bpr) {
+            for i in (3..bpr).rev() {
+                row[i] = row[i].wrapping_sub(row[i - 3]);
+            }
+        }
+        let payload = deflate_level9(&raw).unwrap();
+        let mut doc = Document::with_version("1.5");
+        let img_id = doc.add_object(Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Image",
+                "Width" => px as i64,
+                "Height" => px as i64,
+                "ColorSpace" => "DeviceRGB",
+                "BitsPerComponent" => 8_i64,
+                "Filter" => "FlateDecode",
+                "DecodeParms" => dictionary! {
+                    "Predictor" => 2_i64,
+                    "Colors" => 3_i64,
+                    "BitsPerComponent" => 8_i64,
+                    "Columns" => px as i64,
+                },
+            },
+            payload,
+        ));
+        let pdf = wrap_image_pdf(&mut doc, img_id, 100);
+
+        let out = optimize(&pdf);
+        assert_eq!(out, pdf, "TIFF Predictor 2 must leave the file untouched");
+    }
+
+    #[test]
+    fn flate_grayscale_stays_single_channel() {
+        let pdf = build_pdf_flate_ext(400, 100, 1, Some(2), false, false);
+        let out = optimize(&pdf);
+        let (w, h) = image_dims(&out);
+        assert!((150..=210).contains(&w) && w == h, "unexpected dims {w}x{h}");
+        assert!(out.len() < pdf.len());
+        // 1 channel in, 1 channel out — the DeviceGray /ColorSpace is unchanged
+        // so 3-channel data here would be a corrupt image.
+        let pixels = flate_image_pixels(&out);
+        assert_eq!(pixels.len(), (w * h) as usize, "grayscale must stay 1-channel");
+    }
+
+    #[test]
+    fn flate_iccbased_n3_is_accepted() {
+        // ICCBased with /N 3 is component-count-equivalent to DeviceRGB, which
+        // is all the same-format path needs (the color space is never touched).
+        let px = 400u32;
+        let raw = flate_pixels(px, px, 3);
+        let payload = deflate_level9(&raw).unwrap();
+        let mut doc = Document::with_version("1.5");
+        // A stand-in ICC profile stream: /N is what matters to the gate.
+        let icc_id = doc.add_object(Stream::new(
+            dictionary! { "N" => 3_i64 },
+            vec![0u8; 128],
+        ));
+        let img_id = doc.add_object(Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Image",
+                "Width" => px as i64,
+                "Height" => px as i64,
+                "ColorSpace" => vec![Object::Name(b"ICCBased".to_vec()), icc_id.into()],
+                "BitsPerComponent" => 8_i64,
+                "Filter" => "FlateDecode",
+            },
+            payload,
+        ));
+        let pdf = wrap_image_pdf(&mut doc, img_id, 100);
+
+        let out = optimize(&pdf);
+        let (w, h) = image_dims(&out);
+        assert!((150..=210).contains(&w) && w == h, "unexpected dims {w}x{h}");
+        assert!(out.len() < pdf.len());
+        assert!(Document::load_mem(&out).is_ok());
+    }
+
+    /// Build an over-resolution Flate image PDF whose dict is customized by
+    /// `mutate` before saving — for the "provably untouched" gate tests.
+    fn build_flate_pdf_with_dict(
+        px: u32,
+        channels: usize,
+        mutate: impl FnOnce(&mut Document, &mut lopdf::Dictionary),
+    ) -> Vec<u8> {
+        let raw = flate_pixels(px, px, channels);
+        let payload = deflate_level9(&raw).unwrap();
+        let mut doc = Document::with_version("1.5");
+        let mut dict = dictionary! {
+            "Type" => "XObject",
+            "Subtype" => "Image",
+            "Width" => px as i64,
+            "Height" => px as i64,
+            "ColorSpace" => if channels == 1 { "DeviceGray" } else { "DeviceRGB" },
+            "BitsPerComponent" => 8_i64,
+            "Filter" => "FlateDecode",
+        };
+        mutate(&mut doc, &mut dict);
+        let img_id = doc.add_object(Stream::new(dict, payload));
+        wrap_image_pdf(&mut doc, img_id, 100)
+    }
+
+    #[test]
+    fn flate_ineligible_images_are_untouched() {
+        // Each ineligible shape must return the ORIGINAL bytes — dims and
+        // stream bytes provably unchanged (whole-file equality implies both).
+        let cases: Vec<(&str, Vec<u8>)> = vec![
+            (
+                "Indexed color space",
+                build_flate_pdf_with_dict(400, 3, |_, d| {
+                    d.set(
+                        "ColorSpace",
+                        vec![
+                            Object::Name(b"Indexed".to_vec()),
+                            Object::Name(b"DeviceRGB".to_vec()),
+                            Object::Integer(255),
+                            Object::String(vec![0u8; 768], lopdf::StringFormat::Hexadecimal),
+                        ],
+                    );
+                }),
+            ),
+            (
+                "1-bit",
+                build_flate_pdf_with_dict(400, 1, |_, d| {
+                    d.set("BitsPerComponent", 1_i64);
+                }),
+            ),
+            (
+                "16-bit",
+                build_flate_pdf_with_dict(400, 3, |_, d| {
+                    d.set("BitsPerComponent", 16_i64);
+                }),
+            ),
+            (
+                "SMask present",
+                build_flate_pdf_with_dict(400, 3, |doc, d| {
+                    let mask = doc.add_object(Stream::new(
+                        dictionary! {
+                            "Type" => "XObject",
+                            "Subtype" => "Image",
+                            "Width" => 400_i64,
+                            "Height" => 400_i64,
+                            "ColorSpace" => "DeviceGray",
+                            "BitsPerComponent" => 8_i64,
+                            "Filter" => "FlateDecode",
+                        },
+                        deflate_level9(&flate_pixels(400, 400, 1)).unwrap(),
+                    ));
+                    d.set("SMask", mask);
+                }),
+            ),
+            (
+                "/Decode array present",
+                build_flate_pdf_with_dict(400, 3, |_, d| {
+                    d.set(
+                        "Decode",
+                        vec![
+                            1.into(), 0.into(), 1.into(), 0.into(), 1.into(), 0.into(),
+                        ],
+                    );
+                }),
+            ),
+        ];
+        for (label, pdf) in cases {
+            let out = optimize(&pdf);
+            assert_eq!(out, pdf, "{label}: must be byte-identical to the input");
+        }
+    }
+
+    #[test]
+    fn flate_corrupt_streams_return_original_bytes() {
+        // Degradation contract: corruption must yield the EXACT original
+        // bytes, never a partially rewritten document.
+        // (a) Truncated zlib body — lopdf returns partial data as Ok, so the
+        //     exact-length check is what catches this.
+        let pdf = build_pdf_flate(400, 100, None);
+        let mut doc = Document::load_mem(&pdf).unwrap();
+        for obj in doc.objects.values_mut() {
+            if let Object::Stream(s) = obj {
+                if matches!(s.dict.get(b"Subtype"), Ok(Object::Name(n)) if n == b"Image") {
+                    let half = s.content.len() / 2;
+                    let truncated = s.content[..half].to_vec();
+                    s.set_content(truncated);
+                }
+            }
+        }
+        let mut truncated_pdf: Vec<u8> = Vec::new();
+        doc.save_to(&mut truncated_pdf).unwrap();
+        let out = optimize(&truncated_pdf);
+        assert_eq!(out, truncated_pdf, "truncated zlib must return original bytes");
+
+        // (b) Decoded-length mismatch: dict claims 400x400 but the stream
+        //     holds 200x200 worth of pixels.
+        let small = deflate_level9(&flate_pixels(200, 200, 3)).unwrap();
+        let mut doc = Document::with_version("1.5");
+        let img_id = doc.add_object(Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Image",
+                "Width" => 400_i64,
+                "Height" => 400_i64,
+                "ColorSpace" => "DeviceRGB",
+                "BitsPerComponent" => 8_i64,
+                "Filter" => "FlateDecode",
+            },
+            small,
+        ));
+        let mismatched = wrap_image_pdf(&mut doc, img_id, 100);
+        let out = optimize(&mismatched);
+        assert_eq!(out, mismatched, "length mismatch must return original bytes");
+
+        // (c) A predictor value lopdf rejects/ignores (99).
+        let bad_pred = build_flate_pdf_with_dict(400, 3, |_, d| {
+            d.set(
+                "DecodeParms",
+                dictionary! { "Predictor" => 99_i64, "Colors" => 3_i64, "Columns" => 400_i64 },
+            );
+        });
+        let out = optimize(&bad_pred);
+        assert_eq!(out, bad_pred, "unknown predictor must return original bytes");
+    }
+
+    #[test]
+    fn flate_optimize_is_idempotent() {
+        // Characterization: a second pass over already-optimized output must
+        // be byte-stable — the downsampled image sits at the target DPI
+        // (inside the margin), so no further work is planned and the fail-safe
+        // path hands back the input unchanged.
+        let pdf = build_pdf_flate(400, 100, Some(2));
+        let once = optimize(&pdf);
+        assert!(once.len() < pdf.len(), "first pass must shrink");
+        let twice = optimize(&once);
+        assert_eq!(twice, once, "second pass must be byte-stable");
+    }
+
+    #[test]
+    fn flate_under_resolution_is_untouched() {
+        // 120px drawn into 100pt => ~86 DPI, below target: exact original bytes.
+        let pdf = build_pdf_flate(120, 100, None);
+        let out = optimize(&pdf);
+        assert_eq!(out, pdf, "under-resolution Flate image must be untouched");
+    }
+
+    #[test]
+    fn downsample_flate_images_off_leaves_flate_untouched() {
+        let pdf = build_pdf_flate(400, 100, Some(2));
+        let opts = OptimizeOptions::default().with_downsample_flate_images(false);
+        let out = optimize_with_options(&pdf, opts);
+        assert_eq!(out, pdf, "flag off must leave Flate images untouched");
+    }
+
     #[test]
     fn pack_object_streams_produces_loadable_output() {
         // With packing on, the output must still be a valid, loadable PDF whose
@@ -1224,6 +2084,7 @@ mod tests {
         assert_eq!(d.dpi_margin, 1.15);
         assert!(!d.strip_accessibility);
         assert!(!d.pack_object_streams);
+        assert!(d.downsample_flate_images, "Flate downsampling is default-ON (0.2.0)");
     }
 
     #[test]
@@ -1233,12 +2094,14 @@ mod tests {
             .with_jpeg_quality(60)
             .with_dpi_margin(1.5)
             .with_strip_accessibility(true)
-            .with_pack_object_streams(true);
+            .with_pack_object_streams(true)
+            .with_downsample_flate_images(false);
         assert_eq!(o.target_dpi, 96.0);
         assert_eq!(o.jpeg_quality, 60);
         assert_eq!(o.dpi_margin, 1.5);
         assert!(o.strip_accessibility);
         assert!(o.pack_object_streams);
+        assert!(!o.downsample_flate_images);
     }
 
     #[test]

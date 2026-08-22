@@ -1,7 +1,7 @@
 [package]
 name = "amatl"
-version = "0.1.0"
-description = "Pure-Rust PDF size optimizer: CTM-aware effective-DPI downsampling of embedded JPEGs via mozjpeg, with a hard fail-safe contract"
+version = "0.2.0"
+description = "Pure-Rust PDF size optimizer: CTM-aware effective-DPI downsampling of embedded JPEG and Flate images, with a hard fail-safe contract"
 authors = ["Xchel Dominguez <xjdom2@gmail.com>"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/xcheljd/amatl"
@@ -23,5 +23,9 @@ targets = ["x86_64-unknown-linux-gnu"]
 lopdf = "0.42"
 image = { version = "0.25", default-features = false, features = ["jpeg"] }
 mozjpeg = "0.10"
+# Re-deflating downsampled FlateDecode images at a controlled level (9) with
+# our own predictor choice. Already in the tree transitively via lopdf, so this
+# adds zero new code to the build.
+flate2 = "1"
 # Parallel image work. Pure Rust, MIT OR Apache-2.0, no native deps.
 rayon = "1"
