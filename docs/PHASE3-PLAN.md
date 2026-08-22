@@ -8,8 +8,8 @@ Every API name, crate version, and behavior claim below was verified on
 2026-08-21 against the actual `lopdf 0.42.0` build in this repo's lockfile
 (rustdoc + an empirical probe test, since docs.rs was unreachable from this
 session) and against crates.io via `cargo info` / `cargo tree`. Nothing here is
-from memory alone; the few remaining unknowns are flagged inline and collected
-in [Open questions](#open-questions--decisions-needed).
+from memory alone; the few remaining unknowns were flagged inline and are now
+resolved in [Decisions — RESOLVED](#decisions--resolved).
 
 ---
 
@@ -52,6 +52,31 @@ per-object uncertainty → leave that object untouched.
    Estimated effort: **2–3 weeks** for M1.
 
 Recommended order: **A-M1 → C-M1 → B-M1**, then the M2s as interest warrants.
+
+---
+
+## Resolved decision set
+
+All nine open questions are resolved (details and rationale in
+[Decisions — RESOLVED](#decisions--resolved)). The compact outcomes an
+implementer should internalize before reading further:
+
+1. `downsample_flate_images` **defaults ON** (0.2.0, minor bump + changelog).
+2. Flate→JPEG conversion **deferred wholesale to A-M2** — no dormant flag in M1.
+3. `subset_fonts` ships **opt-in (default OFF)** at 0.3.0; flip to default-ON is
+   the explicit target after a clean corpus soak.
+4. **Commit an OFL font fixture** (Noto Sans Regular + OFL license text) under
+   `fixtures/fonts/`.
+5. **Skip font subsetting for PDF/A-declared documents** in C-M1 (detect
+   `pdfaid:part` in XMP); revisit with `/CIDSet` regeneration in C-M2.
+6. Predefined CJK CMaps (`UniGB-UCS2-H` etc.): **permanent skip** — affected
+   fonts are left untouched, never broken.
+7. Simple-font (non-Type0) subsetting: **out of scope** — documented in the
+   README honest-limitations section.
+8. Symbol-mode JBIG2: **permanent public commitment against it** in the README.
+9. Dependencies **approved as listed**: `flate2` (direct), `subsetter 0.2.6`
+   (`default-features = false`), `fax 0.3.0` (at B-M1, post-spike),
+   `ttf-parser` (dev-only). `jbig2enc-rust` **not** approved.
 
 ---
 
@@ -190,8 +215,8 @@ pub convert_flate_to_jpeg: bool,     // default FALSE, opt-in, ships in M2
 documented behavior (over-resolution → target DPI) applied to a second filter,
 not a new kind of lossiness; semver-wise `#[non_exhaustive]` protects the API
 and 0.x allows the behavior delta with a changelog entry (ship as 0.2.0, not
-0.1.x). Callers who need bit-stable output across upgrades can pin. This is
-Open question **Q1** — default-off is the conservative alternative.
+0.1.x). Callers who need bit-stable output across upgrades can pin. **RESOLVED
+as Q1: default ON** (see [Decisions — RESOLVED](#decisions--resolved)).
 
 ### A.4 Test strategy
 
@@ -531,44 +556,68 @@ MSRV: no change — all candidate deps have `rust-version` ≤ 1.85 (subsetter
 
 ---
 
-## Open questions — decisions needed
+## Decisions — RESOLVED
 
-Each with my recommendation; none block starting A-M1 except Q1.
+All nine questions below were delegated to and resolved on the stated
+project lens: **best and widest overall compatibility to compete with
+Ghostscript, with the best defaults for overall usage.** Each was re-examined
+through that lens before finalizing. **No final decision differs from the
+original recommendation.** The lens did sharpen three of them: it raises the
+priority of A-M2's Flate→JPEG conversion (Q2, where Ghostscript's AutoFilter
+converts by default), it makes default-ON the explicit end-state for font
+subsetting after soak rather than an open question (Q3, Ghostscript subsets
+by default), and it was weighed and rejected for predefined CJK CMaps (Q6,
+where "skip" degrades gracefully — affected fonts are left untouched, so
+compatibility is never broken, unlike Ghostscript-style bundling of Adobe
+tables for a shrinking legacy corpus). Decided-by is noted per item.
 
-1. **Should `downsample_flate_images` default ON?** Existing callers' outputs
-   change (more images touched) in 0.2.0. **Recommendation: yes, default ON**
-   — it is the library's documented behavior applied to a second filter, the
-   fail-safe contract fully covers it, and default-off would make amatl
-   quietly ignore its second-most-common image class. Changelog + minor bump.
-2. **Flate→JPEG conversion — build the flag now or defer wholesale?**
-   **Recommendation: defer entirely to A-M2** (no dormant flag in M1); ship
-   M1 lean and let benchmark data justify the conversion heuristic.
-3. **`subset_fonts` default.** **Recommendation: opt-in (default OFF) at
-   introduction (0.3.0)**; revisit default-ON only after a clean soak on the
-   NASA + personal corpora with the verification harness green.
-4. **Commit an OFL font fixture (~300–600 KB, e.g. Noto Sans Regular + OFL
-   license text) under `fixtures/fonts/`?** Needed for real subsetting tests.
-   **Recommendation: yes** — OFL is unambiguous for redistribution and the
-   repo stays well under any size concern.
-5. **PDF/A-declared documents: skip font subsetting?** Subsetting alters
-   `/CIDSet`-adjacent conformance details. **Recommendation: yes for M1 —
-   detect `pdfaid:part` in the XMP metadata stream and skip subsetting for
-   those documents**; revisit with proper `/CIDSet` regeneration in C-M2.
-6. **Predefined CJK CMaps (`UniGB-UCS2-H` etc.): permanent skip?** Supporting
-   them means bundling Adobe CMap data (megabytes). **Recommendation: yes,
-   permanent skip** — legacy corpus, poor value per byte; embedded CMaps
-   (C-M2) cover the parseable remainder.
-7. **Simple-font (non-Type0) subsetting: declare out of scope?** Requires
-   Type0 conversion + full text rewriting (subsetter removes `cmap`).
-   **Recommendation: yes, out of scope** — document it in the README's
-   honest-limitations section.
-8. **Symbol-mode JBIG2: permanent public commitment against it?**
-   **Recommendation: yes** — add the "amatl will never lossy-symbol-encode
-   your scans" statement to the README alongside the accessibility angle;
-   it converts a scope cut into a trust differentiator.
-9. **New dependencies sign-off:** direct `flate2` (already transitive via
-   lopdf — zero new code in tree), `subsetter 0.2.6` w/
-   `default-features=false` (+`rustc-hash`), `fax 0.3.0` (at B-M1, post-
-   spike), `ttf-parser` (dev-only). `jbig2enc-rust` explicitly **not**
-   approved yet (unvetted, and its default feature is symbol mode).
-   **Recommendation: approve as listed.**
+1. **`downsample_flate_images` defaults ON** (0.2.0, changelog + minor bump).
+   Lens: Ghostscript's presets downsample all raster classes by default;
+   default-OFF would quietly ignore the second-most-common image class, and
+   the fail-safe contract fully covers the change.
+   *Decided: Xchel via delegation, 2026-08-22.*
+2. **Flate→JPEG conversion deferred wholesale to A-M2** — no dormant flag in
+   M1. Lens: this is where Ghostscript still wins on ratio (AutoFilter →
+   DCTEncode), so A-M2 rises in priority — but a lean, benchmark-informed M1
+   is the better default path than shipping an untested heuristic now.
+   *Decided: Xchel via delegation, 2026-08-22.*
+3. **`subset_fonts` ships opt-in (default OFF) at 0.3.0.** Lens: Ghostscript
+   subsets by default, so **default-ON is the explicit target** once the NASA
+   + personal corpora soak cleanly with the verification harness green; until
+   then OFF is the best default for overall usage (never-corrupt beats ratio).
+   *Decided: Xchel via delegation, 2026-08-22.*
+4. **Commit the OFL font fixture** (~300–600 KB, Noto Sans Regular + OFL
+   license text) under `fixtures/fonts/`. Lens: real subsetting tests against
+   a real font are what make a compatibility claim credible; OFL is
+   unambiguous for redistribution.
+   *Decided: Xchel via delegation, 2026-08-22.*
+5. **Skip font subsetting for PDF/A-declared documents in C-M1** (detect
+   `pdfaid:part` in the XMP metadata stream); revisit with proper `/CIDSet`
+   regeneration in C-M2. Lens: widest compatibility includes not silently
+   breaking a document's declared conformance.
+   *Decided: Xchel via delegation, 2026-08-22.*
+6. **Predefined CJK CMaps (`UniGB-UCS2-H` etc.): permanent skip.** Lens
+   examined and rejected bundling: skip degrades gracefully (those fonts are
+   left untouched — output is always valid), while support means shipping
+   megabytes of Adobe tables for a legacy corpus; embedded CMaps (C-M2) cover
+   the parseable remainder.
+   *Decided: Xchel via delegation, 2026-08-22.*
+7. **Simple-font (non-Type0) subsetting: out of scope**, documented in the
+   README's honest-limitations section. Lens: it would require Type0
+   conversion + full text rewriting (subsetter removes `cmap`) — the exact
+   bug class M1's design eliminates; skipped fonts remain untouched, so
+   compatibility is preserved, not reduced.
+   *Decided: Xchel via delegation, 2026-08-22.*
+8. **Symbol-mode JBIG2: permanent public commitment against it** — add the
+   "amatl will never lossy-symbol-encode your scans" statement to the README
+   alongside the accessibility angle. Lens: never silently corrupting glyphs
+   (the Xerox hazard) is itself a compatibility/trust differentiator vs
+   less-careful pipelines.
+   *Decided: Xchel via delegation, 2026-08-22.*
+9. **Dependencies approved as listed:** direct `flate2` (already transitive
+   via lopdf — zero new code in tree), `subsetter 0.2.6` w/
+   `default-features = false` (+`rustc-hash`), `fax 0.3.0` (at B-M1,
+   post-spike), `ttf-parser` (dev-only). `jbig2enc-rust` explicitly **not**
+   approved (unvetted, and its default feature is symbol mode). Lens: the
+   minimal vetted set that unlocks the compatibility wins above.
+   *Decided: Xchel via delegation, 2026-08-22.*
