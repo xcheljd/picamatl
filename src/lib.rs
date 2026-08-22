@@ -37,9 +37,9 @@ mod fonts;
 use std::collections::HashMap;
 
 use image::{DynamicImage, ImageFormat};
-use rayon::prelude::*;
 use lopdf::content::Content;
 use lopdf::{dictionary, Document, Object, ObjectId};
+use rayon::prelude::*;
 
 /// Target resolution for downsampled images, in dots per inch.
 const TARGET_DPI: f32 = 130.0;
@@ -256,7 +256,14 @@ struct Mat {
 }
 
 impl Mat {
-    const IDENTITY: Mat = Mat { a: 1.0, b: 0.0, c: 0.0, d: 1.0, e: 0.0, f: 0.0 };
+    const IDENTITY: Mat = Mat {
+        a: 1.0,
+        b: 0.0,
+        c: 0.0,
+        d: 1.0,
+        e: 0.0,
+        f: 0.0,
+    };
 
     /// Concatenate: `self` applied first, then `then` (PDF `cm` semantics with
     /// `then` being the pre-existing CTM).
@@ -406,7 +413,9 @@ enum DictUpdate {
     Dct,
     /// Flate path: normalize `/Filter` to the scalar name and set the new
     /// `/DecodeParms` (Up-predictor variant) or remove it (plain deflate).
-    Flate { decode_parms: Option<lopdf::Dictionary> },
+    Flate {
+        decode_parms: Option<lopdf::Dictionary>,
+    },
 }
 
 /// A planned image replacement, computed read-only before mutating the doc.
@@ -515,8 +524,7 @@ fn plan_replacement(
             if !options.downsample_flate_images {
                 return None;
             }
-            let (out, decode_parms) =
-                plan_flate(doc, stream, px_w, px_h, target_w, target_h)?;
+            let (out, decode_parms) = plan_flate(doc, stream, px_w, px_h, target_w, target_h)?;
             (out, DictUpdate::Flate { decode_parms })
         }
         FilterClass::Other => return None,
@@ -547,8 +555,8 @@ fn plan_dct(
 
     // Prefer scaled decoding; fall back to a full decode for color spaces the
     // scaled path declines (CMYK/YCCK) or if libjpeg refuses the stream.
-    let (decoded, is_gray) = decode_jpeg_scaled(&stream.content, target_w, target_h)
-        .or_else(|| {
+    let (decoded, is_gray) =
+        decode_jpeg_scaled(&stream.content, target_w, target_h).or_else(|| {
             let decoded =
                 image::load_from_memory_with_format(&stream.content, ImageFormat::Jpeg).ok()?;
             let is_gray = matches!(
@@ -705,17 +713,16 @@ enum FlateEncoding {
 /// PNG predictors the declared Colors/Columns/BitsPerComponent must match the
 /// image dictionary or the row stride would be wrong. Defaults mirror the PDF
 /// spec (Predictor 1, Colors 1, Columns 1, BitsPerComponent 8).
-fn flate_encoding(
-    dict: &lopdf::Dictionary,
-    channels: usize,
-    px_w: u32,
-) -> Option<FlateEncoding> {
+fn flate_encoding(dict: &lopdf::Dictionary, channels: usize, px_w: u32) -> Option<FlateEncoding> {
     let parms = match dict.get(b"DecodeParms") {
         Err(_) => return Some(FlateEncoding::Plain), // no parms: plain deflate
         Ok(Object::Dictionary(d)) => d,
         Ok(_) => return None, // array / reference form: out of M1 scope
     };
-    let predictor = parms.get(b"Predictor").and_then(Object::as_i64).unwrap_or(1);
+    let predictor = parms
+        .get(b"Predictor")
+        .and_then(Object::as_i64)
+        .unwrap_or(1);
     match predictor {
         1 => Some(FlateEncoding::Plain),
         10..=15 => {
@@ -725,9 +732,8 @@ fn flate_encoding(
                 .get(b"BitsPerComponent")
                 .and_then(Object::as_i64)
                 .unwrap_or(8);
-            let matches_image = colors == channels as i64
-                && columns == i64::from(px_w)
-                && parms_bpc == 8;
+            let matches_image =
+                colors == channels as i64 && columns == i64::from(px_w) && parms_bpc == 8;
             matches_image.then_some(FlateEncoding::PngPredictor)
         }
         _ => None,
@@ -864,11 +870,7 @@ fn deflate_level9(data: &[u8]) -> Option<Vec<u8>> {
 /// Returns `(image, is_grayscale)`, or `None` for anything that is not plain
 /// RGB or grayscale (e.g. CMYK/YCCK) so the caller can fall back to the
 /// general-purpose decoder rather than risk mis-handling color.
-fn decode_jpeg_scaled(
-    data: &[u8],
-    target_w: u32,
-    target_h: u32,
-) -> Option<(DynamicImage, bool)> {
+fn decode_jpeg_scaled(data: &[u8], target_w: u32, target_h: u32) -> Option<(DynamicImage, bool)> {
     let mut dec = mozjpeg::Decompress::new_mem(data).ok()?;
     let (full_w, full_h) = (dec.width(), dec.height());
     if full_w == 0 || full_h == 0 {
@@ -893,7 +895,10 @@ fn decode_jpeg_scaled(
     use mozjpeg::ColorSpace;
     let is_gray = dec.color_space() == ColorSpace::JCS_GRAYSCALE;
     // CMYK/YCCK need a color conversion we don't want to hand-roll.
-    if matches!(dec.color_space(), ColorSpace::JCS_CMYK | ColorSpace::JCS_YCCK) {
+    if matches!(
+        dec.color_space(),
+        ColorSpace::JCS_CMYK | ColorSpace::JCS_YCCK
+    ) {
         return None;
     }
 
@@ -1109,10 +1114,7 @@ fn dedup_streams(doc: &mut Document) -> bool {
 /// Returns `Ok(None)` when there was genuinely nothing to do, so the caller can
 /// hand back the original bytes without anyone allocating a throwaway copy of
 /// them. `Ok(Some(bytes))` is a real, rewritten document.
-fn try_optimize(
-    input: &[u8],
-    options: OptimizeOptions,
-) -> Result<Option<Vec<u8>>, lopdf::Error> {
+fn try_optimize(input: &[u8], options: OptimizeOptions) -> Result<Option<Vec<u8>>, lopdf::Error> {
     let mut doc = Document::load_mem(input)?;
 
     // Collapse repeated images first: every downstream step (placement
@@ -1217,10 +1219,7 @@ fn try_optimize(
 /// `options.pack_object_streams` is true. The packed path produces smaller
 /// output for object-heavy documents but is more complex; the classic path is
 /// the always-available fallback and matches what lopdf ships.
-fn save_document(
-    doc: &mut Document,
-    options: OptimizeOptions,
-) -> Result<Vec<u8>, lopdf::Error> {
+fn save_document(doc: &mut Document, options: OptimizeOptions) -> Result<Vec<u8>, lopdf::Error> {
     if options.pack_object_streams {
         pack_and_save(doc)
     } else {
@@ -1316,8 +1315,7 @@ mod tests {
                 Operation::new("Q", vec![]),
             ],
         };
-        let content_id =
-            doc.add_object(Stream::new(dictionary! {}, content.encode().unwrap()));
+        let content_id = doc.add_object(Stream::new(dictionary! {}, content.encode().unwrap()));
 
         let pages_id = doc.new_object_id();
         let page_id = doc.add_object(dictionary! {
@@ -1379,7 +1377,14 @@ mod tests {
             ops.push(Operation::new("q", vec![]));
             ops.push(Operation::new(
                 "cm",
-                vec![100.into(), 0.into(), 0.into(), 100.into(), 0.into(), 0.into()],
+                vec![
+                    100.into(),
+                    0.into(),
+                    0.into(),
+                    100.into(),
+                    0.into(),
+                    0.into(),
+                ],
             ));
             ops.push(Operation::new("Do", vec![Object::Name(name.into_bytes())]));
             ops.push(Operation::new("Q", vec![]));
@@ -1648,7 +1653,10 @@ mod tests {
         let pdf = build_pdf_flate_ext(400, 100, 3, Some(2), true, false);
         let out = optimize(&pdf);
         let (w, h) = image_dims(&out);
-        assert!((150..=210).contains(&w) && w == h, "unexpected dims {w}x{h}");
+        assert!(
+            (150..=210).contains(&w) && w == h,
+            "unexpected dims {w}x{h}"
+        );
         assert!(out.len() < pdf.len());
         assert!(Document::load_mem(&out).is_ok());
     }
@@ -1661,7 +1669,10 @@ mod tests {
         // must skip such images entirely (original bytes returned).
         let pdf = build_pdf_flate_ext(400, 100, 3, Some(2), false, true);
         let out = optimize(&pdf);
-        assert_eq!(out, pdf, "array-form DecodeParms must leave the file untouched");
+        assert_eq!(
+            out, pdf,
+            "array-form DecodeParms must leave the file untouched"
+        );
     }
 
     #[test]
@@ -1708,12 +1719,19 @@ mod tests {
         let pdf = build_pdf_flate_ext(400, 100, 1, Some(2), false, false);
         let out = optimize(&pdf);
         let (w, h) = image_dims(&out);
-        assert!((150..=210).contains(&w) && w == h, "unexpected dims {w}x{h}");
+        assert!(
+            (150..=210).contains(&w) && w == h,
+            "unexpected dims {w}x{h}"
+        );
         assert!(out.len() < pdf.len());
         // 1 channel in, 1 channel out — the DeviceGray /ColorSpace is unchanged
         // so 3-channel data here would be a corrupt image.
         let pixels = flate_image_pixels(&out);
-        assert_eq!(pixels.len(), (w * h) as usize, "grayscale must stay 1-channel");
+        assert_eq!(
+            pixels.len(),
+            (w * h) as usize,
+            "grayscale must stay 1-channel"
+        );
     }
 
     #[test]
@@ -1725,10 +1743,7 @@ mod tests {
         let payload = deflate_level9(&raw).unwrap();
         let mut doc = Document::with_version("1.5");
         // A stand-in ICC profile stream: /N is what matters to the gate.
-        let icc_id = doc.add_object(Stream::new(
-            dictionary! { "N" => 3_i64 },
-            vec![0u8; 128],
-        ));
+        let icc_id = doc.add_object(Stream::new(dictionary! { "N" => 3_i64 }, vec![0u8; 128]));
         let img_id = doc.add_object(Stream::new(
             dictionary! {
                 "Type" => "XObject",
@@ -1745,7 +1760,10 @@ mod tests {
 
         let out = optimize(&pdf);
         let (w, h) = image_dims(&out);
-        assert!((150..=210).contains(&w) && w == h, "unexpected dims {w}x{h}");
+        assert!(
+            (150..=210).contains(&w) && w == h,
+            "unexpected dims {w}x{h}"
+        );
         assert!(out.len() < pdf.len());
         assert!(Document::load_mem(&out).is_ok());
     }
@@ -1828,9 +1846,7 @@ mod tests {
                 build_flate_pdf_with_dict(400, 3, |_, d| {
                     d.set(
                         "Decode",
-                        vec![
-                            1.into(), 0.into(), 1.into(), 0.into(), 1.into(), 0.into(),
-                        ],
+                        vec![1.into(), 0.into(), 1.into(), 0.into(), 1.into(), 0.into()],
                     );
                 }),
             ),
@@ -1861,7 +1877,10 @@ mod tests {
         let mut truncated_pdf: Vec<u8> = Vec::new();
         doc.save_to(&mut truncated_pdf).unwrap();
         let out = optimize(&truncated_pdf);
-        assert_eq!(out, truncated_pdf, "truncated zlib must return original bytes");
+        assert_eq!(
+            out, truncated_pdf,
+            "truncated zlib must return original bytes"
+        );
 
         // (b) Decoded-length mismatch: dict claims 400x400 but the stream
         //     holds 200x200 worth of pixels.
@@ -1881,7 +1900,10 @@ mod tests {
         ));
         let mismatched = wrap_image_pdf(&mut doc, img_id, 100);
         let out = optimize(&mismatched);
-        assert_eq!(out, mismatched, "length mismatch must return original bytes");
+        assert_eq!(
+            out, mismatched,
+            "length mismatch must return original bytes"
+        );
 
         // (c) A predictor value lopdf rejects/ignores (99).
         let bad_pred = build_flate_pdf_with_dict(400, 3, |_, d| {
@@ -1891,7 +1913,10 @@ mod tests {
             );
         });
         let out = optimize(&bad_pred);
-        assert_eq!(out, bad_pred, "unknown predictor must return original bytes");
+        assert_eq!(
+            out, bad_pred,
+            "unknown predictor must return original bytes"
+        );
     }
 
     #[test]
@@ -2027,7 +2052,10 @@ mod tests {
             .map(|(a, b)| (*a as f64 - *b as f64).abs())
             .sum();
         let mad = sad / produced.as_raw().len() as f64;
-        assert!(mad < 12.0, "scaled decode diverges from full decode: MAD={mad}");
+        assert!(
+            mad < 12.0,
+            "scaled decode diverges from full decode: MAD={mad}"
+        );
     }
 
     #[test]
@@ -2126,7 +2154,10 @@ mod tests {
         assert_eq!(d.dpi_margin, 1.15);
         assert!(!d.strip_accessibility);
         assert!(!d.pack_object_streams);
-        assert!(d.downsample_flate_images, "Flate downsampling is default-ON (0.2.0)");
+        assert!(
+            d.downsample_flate_images,
+            "Flate downsampling is default-ON (0.2.0)"
+        );
         assert!(!d.subset_fonts, "font subsetting is opt-in (decision #3)");
     }
 
@@ -2161,7 +2192,10 @@ mod tests {
 
         let (w130, _) = image_dims(&at_130);
         let (w72, _) = image_dims(&at_72);
-        assert!(w72 < w130, "lower target DPI must yield fewer pixels: {w72} !< {w130}");
+        assert!(
+            w72 < w130,
+            "lower target DPI must yield fewer pixels: {w72} !< {w130}"
+        );
         // 100pt / 72 * 72 DPI = 100px target.
         assert!((90..=110).contains(&w72), "unexpected 72-DPI width: {w72}");
     }
@@ -2176,7 +2210,11 @@ mod tests {
 
         // No image work and no strip => fail-safe path returns the original bytes.
         let (w, h) = image_dims(&out);
-        assert_eq!((w, h), (400, 400), "zero target DPI must not resize the image");
+        assert_eq!(
+            (w, h),
+            (400, 400),
+            "zero target DPI must not resize the image"
+        );
     }
 
     #[test]
@@ -2260,8 +2298,8 @@ mod tests {
         // strip_accessibility should still produce (smaller) output. Build a
         // tiny PDF with a low-res image and an explicit StructTreeRoot entry.
         let pdf = build_pdf(80, 100); // 80px @ 100pt ≈ 58 DPI, won't downsample
-        // Inject a fake structure tree so stripping has something to remove.
-        // We reload, add the entries, re-save, then run the optimizer.
+                                      // Inject a fake structure tree so stripping has something to remove.
+                                      // We reload, add the entries, re-save, then run the optimizer.
         let mut doc = Document::load_mem(&pdf).unwrap();
         let struct_id = doc.add_object(dictionary! {
             "Type" => "StructTreeRoot",
@@ -2334,7 +2372,10 @@ mod tests {
         let dict = doc.get_object(holder).unwrap().as_dict().unwrap();
         let first = dict.get(b"First").unwrap();
         let second = dict.get(b"Second").unwrap();
-        assert_ne!(first, second, "distinct objects must keep distinct references");
+        assert_ne!(
+            first, second,
+            "distinct objects must keep distinct references"
+        );
     }
 
     /// Real-file check. Defaults to the committed fixture
@@ -2360,7 +2401,10 @@ mod tests {
             out.len() * 100 / input.len()
         );
         assert!(out.len() < input.len(), "expected real file to shrink");
-        assert!(Document::load_mem(&out).is_ok(), "output must be a valid PDF");
+        assert!(
+            Document::load_mem(&out).is_ok(),
+            "output must be a valid PDF"
+        );
         if let Ok(dest) = std::env::var("AMATL_TEST_OUT") {
             std::fs::write(&dest, &out).unwrap();
         }
@@ -2390,7 +2434,14 @@ mod tests {
                 Operation::new("q", vec![]),
                 Operation::new(
                     "cm",
-                    vec![100.into(), 0.into(), 0.into(), 100.into(), 0.into(), 0.into()],
+                    vec![
+                        100.into(),
+                        0.into(),
+                        0.into(),
+                        100.into(),
+                        0.into(),
+                        0.into(),
+                    ],
                 ),
                 Operation::new("Do", vec![Object::Name(b"Im0".to_vec())]),
                 Operation::new("Q", vec![]),
@@ -2419,12 +2470,13 @@ mod tests {
         doc.save_to(&mut input).unwrap();
 
         let out = optimize(&input);
-        assert_eq!(out, input, "corrupt image must leave the document unchanged");
-        assert!(Document::load_mem(&out).is_ok(), "output must remain a valid PDF");
+        assert_eq!(
+            out, input,
+            "corrupt image must leave the document unchanged"
+        );
+        assert!(
+            Document::load_mem(&out).is_ok(),
+            "output must remain a valid PDF"
+        );
     }
 }
-
-
-
-
-

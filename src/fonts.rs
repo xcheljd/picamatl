@@ -107,11 +107,8 @@ pub(crate) fn plan_font_subsets(doc: &Document) -> Vec<FontPlan> {
 /// Apply planned subsets. Each plan is independent; the set may be empty.
 pub(crate) fn apply_font_subsets(doc: &mut Document, plans: Vec<FontPlan>) {
     for plan in plans {
-        let map_stream = Stream::new(
-            dictionary! { "Filter" => "FlateDecode" },
-            plan.deflated_map,
-        )
-        .with_compression(false);
+        let map_stream = Stream::new(dictionary! { "Filter" => "FlateDecode" }, plan.deflated_map)
+            .with_compression(false);
         let map_id = doc.add_object(map_stream);
 
         let font_stream = Stream::new(
@@ -122,7 +119,8 @@ pub(crate) fn apply_font_subsets(doc: &mut Document, plans: Vec<FontPlan>) {
             plan.deflated_font,
         )
         .with_compression(false);
-        doc.objects.insert(plan.font_file_id, Object::Stream(font_stream));
+        doc.objects
+            .insert(plan.font_file_id, Object::Stream(font_stream));
 
         if let Ok(Object::Dictionary(d)) = doc.get_object_mut(plan.descendant_id) {
             d.set("CIDToGIDMap", Object::Reference(map_id));
@@ -329,11 +327,7 @@ impl<'a> Walker<'a> {
         // boundaries, so they are parsed as one unit, per spec).
         let mut content = Vec::new();
         for stream_id in self.doc.get_page_contents(page_id) {
-            let Ok(stream) = self
-                .doc
-                .get_object(stream_id)
-                .and_then(Object::as_stream)
-            else {
+            let Ok(stream) = self.doc.get_object(stream_id).and_then(Object::as_stream) else {
                 self.abort();
                 return;
             };
@@ -352,11 +346,7 @@ impl<'a> Walker<'a> {
     }
 
     fn walk_annotations(&mut self, page_id: ObjectId, path: &mut Vec<ObjectId>) {
-        let Ok(page) = self
-            .doc
-            .get_object(page_id)
-            .and_then(Object::as_dict)
-        else {
+        let Ok(page) = self.doc.get_object(page_id).and_then(Object::as_dict) else {
             self.abort();
             return;
         };
@@ -392,9 +382,7 @@ impl<'a> Walker<'a> {
                     (_, Object::Dictionary(states)) => {
                         for (_, state) in states.iter() {
                             match resolve_ref(self.doc, state) {
-                                (Some(id), Object::Stream(_)) => {
-                                    self.walk_appearance(id, path)
-                                }
+                                (Some(id), Object::Stream(_)) => self.walk_appearance(id, path),
                                 (_, Object::Reference(_)) => continue, // dangling
                                 _ => self.abort(),
                             }
@@ -516,8 +504,7 @@ impl<'a> Walker<'a> {
                         self.abort();
                         return fallback;
                     };
-                    let Some((font, from_fallback)) =
-                        self.lookup_font(&chain, own_count, name)
+                    let Some((font, from_fallback)) = self.lookup_font(&chain, own_count, name)
                     else {
                         self.abort();
                         return fallback;
@@ -633,8 +620,8 @@ impl<'a> Walker<'a> {
                     return;
                 }
                 let set = self.used.entry(*id).or_default();
-                for pair in bytes.chunks_exact(2) {
-                    set.insert(u16::from_be_bytes([pair[0], pair[1]]));
+                for pair in bytes.as_chunks::<2>().0 {
+                    set.insert(u16::from_be_bytes(*pair));
                 }
             }
         }
@@ -688,13 +675,8 @@ impl<'a> Walker<'a> {
                 };
                 match stream.dict.get(b"Subtype").map(|s| resolve(self.doc, s)) {
                     Ok(Object::Name(n)) if n == b"Form" => {
-                        fallback |= self.walk_stream_object(
-                            *id,
-                            OwnResources::OfStream,
-                            chain,
-                            path,
-                            true,
-                        );
+                        fallback |=
+                            self.walk_stream_object(*id, OwnResources::OfStream, chain, path, true);
                     }
                     Ok(Object::Name(n)) if n == b"Image" || n == b"PS" => {}
                     _ => {
@@ -883,14 +865,21 @@ impl CidMap {
 fn load_cid_map(doc: &Document, descendant: &Dictionary) -> Option<CidMap> {
     match descendant.get(b"CIDToGIDMap") {
         // Absent defaults to /Identity per spec.
-        Err(_) => Some(CidMap { map: CidToGid::Identity, stored_len: 0 }),
+        Err(_) => Some(CidMap {
+            map: CidToGid::Identity,
+            stored_len: 0,
+        }),
         Ok(obj) => match resolve_ref(doc, obj).1 {
-            Object::Name(n) if n == b"Identity" => {
-                Some(CidMap { map: CidToGid::Identity, stored_len: 0 })
-            }
+            Object::Name(n) if n == b"Identity" => Some(CidMap {
+                map: CidToGid::Identity,
+                stored_len: 0,
+            }),
             Object::Stream(stream) => {
                 let table = strict_stream_bytes(doc, stream)?;
-                Some(CidMap { map: CidToGid::Table(table), stored_len: stream.content.len() })
+                Some(CidMap {
+                    map: CidToGid::Table(table),
+                    stored_len: stream.content.len(),
+                })
             }
             _ => None,
         },
@@ -911,9 +900,8 @@ fn num_glyphs(font: &[u8]) -> Option<u16> {
     for i in 0..table_count {
         let record = 12 + i * 16;
         if font.get(record..record + 4)? == b"maxp" {
-            let offset = u32::from_be_bytes(
-                font.get(record + 8..record + 12)?.try_into().ok()?,
-            ) as usize;
+            let offset =
+                u32::from_be_bytes(font.get(record + 8..record + 12)?.try_into().ok()?) as usize;
             return be16(font, offset.checked_add(4)?);
         }
     }
@@ -980,8 +968,7 @@ fn plan_one_font(
         return None;
     }
 
-    let (descriptor_id, descriptor) =
-        resolve_ref(doc, descendant.get(b"FontDescriptor").ok()?);
+    let (descriptor_id, descriptor) = resolve_ref(doc, descendant.get(b"FontDescriptor").ok()?);
     let descriptor_id = descriptor_id?;
     let descriptor = descriptor.as_dict().ok()?;
     // A descriptor carrying additional font programs is a shape we do not
@@ -1040,9 +1027,7 @@ fn plan_one_font(
     let deflated_map = deflate_level9(&map)?;
     // Net-smaller guard on stored bytes: the new font program plus the new
     // map stream must undercut the old font program plus the old map stream.
-    if deflated_font.len() + deflated_map.len()
-        >= font_file.content.len() + cid_map.stored_len
-    {
+    if deflated_font.len() + deflated_map.len() >= font_file.content.len() + cid_map.stored_len {
         return None;
     }
 
@@ -1139,7 +1124,10 @@ mod tests {
             cmap.push_str(line);
             cmap.push('\u{a}');
         }
-        cmap.push_str(&format!("{} beginbfchar\u{a}{body}endbfchar\u{a}", pairs.len()));
+        cmap.push_str(&format!(
+            "{} beginbfchar\u{a}{body}endbfchar\u{a}",
+            pairs.len()
+        ));
         for line in [
             "endcmap",
             "CMapName currentdict /CMap defineresource pop",
@@ -1251,10 +1239,7 @@ mod tests {
                 vec![Object::Name(font.as_bytes().to_vec()), 10.into()],
             ),
             Operation::new("Td", vec![72.into(), 700.into()]),
-            Operation::new(
-                "Tj",
-                vec![Object::String(bytes, StringFormat::Hexadecimal)],
-            ),
+            Operation::new("Tj", vec![Object::String(bytes, StringFormat::Hexadecimal)]),
             Operation::new("ET", vec![]),
         ]
     }
@@ -1288,7 +1273,11 @@ mod tests {
     ) -> ObjectId {
         let content_id = doc.add_object(Stream::new(
             dictionary! {},
-            Content { operations: content }.encode().unwrap(),
+            Content {
+                operations: content,
+            }
+            .encode()
+            .unwrap(),
         ));
         doc.add_object(dictionary! {
             "Type" => "Page",
@@ -1331,7 +1320,9 @@ mod tests {
         let doc = Document::load_mem(pdf).unwrap();
         let mut found = None;
         for obj in doc.objects.values() {
-            let Object::Dictionary(type0) = obj else { continue };
+            let Object::Dictionary(type0) = obj else {
+                continue;
+            };
             if !matches!(type0.get(b"Subtype"), Ok(Object::Name(n)) if n == b"Type0") {
                 continue;
             }
@@ -1362,7 +1353,14 @@ mod tests {
         }
         let (type0, descendant, descriptor, font, cid_map) =
             found.expect("no Type0 font in output");
-        SubsetView { type0, descendant, descriptor, font, cid_map, doc }
+        SubsetView {
+            type0,
+            descendant,
+            descriptor,
+            font,
+            cid_map,
+            doc,
+        }
     }
 
     impl SubsetView {
@@ -1429,10 +1427,11 @@ mod tests {
     #[test]
     fn subset_shrinks_and_never_touches_text_or_cid_keyed_tables() {
         let cids = gids_for("Hello, World!");
-        let pairs: Vec<(u16, char)> =
-            cids.iter().copied().zip("Hello, World!".chars()).collect();
-        let pdf =
-            build_text_pdf(&FontSpec::identity(pairs.clone()), std::slice::from_ref(&cids));
+        let pairs: Vec<(u16, char)> = cids.iter().copied().zip("Hello, World!".chars()).collect();
+        let pdf = build_text_pdf(
+            &FontSpec::identity(pairs.clone()),
+            std::slice::from_ref(&cids),
+        );
         let out = optimize_with_options(&pdf, subset_opts());
 
         assert!(out.len() < pdf.len(), "subsetting must shrink the file");
@@ -1463,7 +1462,11 @@ mod tests {
         let tou_bytes = tou
             .decompressed_content()
             .unwrap_or_else(|_| tou.content.clone());
-        assert_eq!(tou_bytes, to_unicode_bytes(&pairs), "/ToUnicode must be untouched");
+        assert_eq!(
+            tou_bytes,
+            to_unicode_bytes(&pairs),
+            "/ToUnicode must be untouched"
+        );
 
         // Names re-tagged consistently, map now a stream, font smaller.
         let tagged = base_name_of(&view.type0, b"BaseFont");
@@ -1500,7 +1503,10 @@ mod tests {
         let pre = pre.expect("fixture text must extract");
         let post = post.expect("subset text must extract");
         assert_eq!(pre, post, "extracted text must be identical");
-        assert!(pre.contains("The quick brown fox"), "oracle must see the text");
+        assert!(
+            pre.contains("The quick brown fox"),
+            "oracle must see the text"
+        );
     }
 
     #[test]
@@ -1596,9 +1602,11 @@ mod tests {
                 "BBox" => vec![0.into(), 0.into(), 200.into(), 200.into()],
                 "Resources" => dictionary! { "Font" => dictionary! { "F1" => font_id } },
             },
-            Content { operations: show_text_ops("F1", &form_cids) }
-                .encode()
-                .unwrap(),
+            Content {
+                operations: show_text_ops("F1", &form_cids),
+            }
+            .encode()
+            .unwrap(),
         ));
         let ap_id = doc.add_object(Stream::new(
             dictionary! {
@@ -1607,9 +1615,11 @@ mod tests {
                 "BBox" => vec![0.into(), 0.into(), 200.into(), 50.into()],
                 "Resources" => dictionary! { "Font" => dictionary! { "F1" => font_id } },
             },
-            Content { operations: show_text_ops("F1", &ap_cids) }
-                .encode()
-                .unwrap(),
+            Content {
+                operations: show_text_ops("F1", &ap_cids),
+            }
+            .encode()
+            .unwrap(),
         ));
         let annot_id = doc.add_object(dictionary! {
             "Type" => "Annot",
@@ -1642,7 +1652,11 @@ mod tests {
 
         let view = subset_view(&out);
         let original = noto_bytes();
-        for &cid in page_cids.iter().chain(form_cids.iter()).chain(ap_cids.iter()) {
+        for &cid in page_cids
+            .iter()
+            .chain(form_cids.iter())
+            .chain(ap_cids.iter())
+        {
             assert_glyph_preserved(&view, &original, cid, cid);
         }
     }
@@ -1670,7 +1684,10 @@ mod tests {
         let pdf = finish_pdf(&mut doc, pages_id, vec![text_page, bad_page]);
 
         let out = optimize_with_options(&pdf, subset_opts());
-        assert_eq!(out, pdf, "one unparseable stream must disable subsetting entirely");
+        assert_eq!(
+            out, pdf,
+            "one unparseable stream must disable subsetting entirely"
+        );
     }
 
     #[test]
@@ -1684,9 +1701,11 @@ mod tests {
         let font_id = add_type0_font(&mut doc, &FontSpec::identity(pairs));
         let content_id = doc.add_object(Stream::new(
             dictionary! {},
-            Content { operations: show_text_ops("F1", &cids) }
-                .encode()
-                .unwrap(),
+            Content {
+                operations: show_text_ops("F1", &cids),
+            }
+            .encode()
+            .unwrap(),
         ));
         let page_id = doc.add_object(dictionary! {
             "Type" => "Page",
@@ -1783,15 +1802,18 @@ mod tests {
 
         let view = subset_view(&out);
         let tagged = base_name_of(&view.type0, b"BaseFont");
-        assert_eq!(&tagged[7..], b"NotoSans-Regular", "old tag must be stripped");
+        assert_eq!(
+            &tagged[7..],
+            b"NotoSans-Regular",
+            "old tag must be stripped"
+        );
         assert_eq!(tagged.iter().filter(|&&b| b == b'+').count(), 1);
     }
 
     #[test]
     fn subsetting_is_idempotent() {
         let cids = gids_for("Hello, World!");
-        let pairs: Vec<(u16, char)> =
-            cids.iter().copied().zip("Hello, World!".chars()).collect();
+        let pairs: Vec<(u16, char)> = cids.iter().copied().zip("Hello, World!".chars()).collect();
         let pdf = build_text_pdf(&FontSpec::identity(pairs), &[cids]);
         let once = optimize_with_options(&pdf, subset_opts());
         assert!(once.len() < pdf.len(), "first pass must shrink");
