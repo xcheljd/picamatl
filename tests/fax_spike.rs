@@ -379,7 +379,10 @@ fn g4_wide_rows_extended_makeup_round_trip() {
         let encoded = g4_encode(&pattern, WIDE);
         let decoded = g4_decode(&encoded, WIDE, pattern.len())
             .unwrap_or_else(|| panic!("{name}: decode failed"));
-        assert_eq!(decoded, pattern, "{name}: pixels differ after G4 round-trip");
+        assert_eq!(
+            decoded, pattern,
+            "{name}: pixels differ after G4 round-trip"
+        );
     }
 }
 
@@ -401,7 +404,10 @@ fn g4_degenerate_dims_round_trip() {
         let encoded = g4_encode(&pattern, w);
         let decoded = g4_decode(&encoded, w, pattern.len())
             .unwrap_or_else(|| panic!("{name}: decode failed"));
-        assert_eq!(decoded, pattern, "{name}: pixels differ after G4 round-trip");
+        assert_eq!(
+            decoded, pattern,
+            "{name}: pixels differ after G4 round-trip"
+        );
     }
 }
 
@@ -428,7 +434,10 @@ fn g3_1d_round_trip_pixel_equality() {
         let encoded = g3_encode_1d(&pattern, w);
         let decoded = g3_decode_1d(&encoded, w, pattern.len())
             .unwrap_or_else(|| panic!("{name}: G3 decode failed"));
-        assert_eq!(decoded, pattern, "{name}: pixels differ after G3 round-trip");
+        assert_eq!(
+            decoded, pattern,
+            "{name}: pixels differ after G3 round-trip"
+        );
     }
 }
 

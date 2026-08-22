@@ -67,9 +67,7 @@ pub(crate) fn plan_bitonal_recompressions(doc: &Document) -> Vec<BitonalReplacem
             .then_some(id)
         })
         .collect();
-    ids.par_iter()
-        .filter_map(|&id| plan_one(doc, id))
-        .collect()
+    ids.par_iter().filter_map(|&id| plan_one(doc, id)).collect()
 }
 
 /// Decode one bitonal image to packed samples, re-encode as G4, and return a
@@ -238,7 +236,12 @@ fn decode_flate_bitonal(stream: &lopdf::Stream, w: u32, h: usize) -> Option<Vec<
     match stream.dict.get(b"DecodeParms") {
         Err(_) => {}
         Ok(Object::Dictionary(d)) => {
-            if d.get(b"Predictor").ok().and_then(|o| o.as_i64().ok()).unwrap_or(1) != 1 {
+            if d.get(b"Predictor")
+                .ok()
+                .and_then(|o| o.as_i64().ok())
+                .unwrap_or(1)
+                != 1
+            {
                 return None;
             }
         }
