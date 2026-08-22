@@ -381,6 +381,20 @@ registry tarball:
   every call site is commented out; the `debug!` macro is gated behind the
   off-by-default `debug` feature.
 
+### B.5 Status
+
+**B-M1 SHIPPED** (0.3.0-dev, 2026-08-22): opt-in
+`OptimizeOptions::recompress_bitonal_images` in `src/bitonal.rs` — both source
+shapes (CCITT-stored and Flate-stored 1-bit, incl. `/ImageMask`), strict
+decoders per the §B.3.1 contract facts, `/BlackIs1` normalization, never-larger
+guard with parms-overhead accounting, and production decode-back verification.
+14-test battery in `src/bitonal.rs` mirrors the A-M1 corruption/idempotence/
+polarity posture. Deviations from the §B.2 sketch: CCITT-source eligibility is
+`/K -1` primary plus `/K 0` only with `/EndOfLine true` (`/K > 0` and EOL-less
+`/K 0` are fail-safe skips — fax decoder limits, §B.3.1); the bitonal pass runs
+over all image XObjects rather than inside the placement-keyed A dispatch
+(lossless ⇒ placement-independent). B-M2 (JBIG2) remains unscheduled.
+
 ### B.4 Risk register
 
 | Risk | Assessment / recommendation |
