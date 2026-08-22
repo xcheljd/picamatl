@@ -113,6 +113,21 @@ Same unit rule for the 37 Flate+SMask images (2.14 MB): downsample in place
 ≤130 dpi. Lower priority: smaller pool, existing path does most work once
 eligibility opens.
 
+**D-M3 SHIPPED** (0.2.1-dev, 2026-08-22): SMask-coupled Flate-base
+downsampling (`plan_flate_smask_pair_downsample`). Over-resolution FlateDecode
+bases with an eligible `/SMask` now take the same atomic coupled downsample as
+D-M2: base through the format-preserving Flate→Flate path (`plan_flate` —
+same `/ColorSpace`, predictor handling unchanged), mask through
+`plan_mask_resample`, both to identical target geometry, replaced together or
+not at all via the shared `Replacement.smask` mechanism. The combined
+never-larger/5% guard uses the exact D-M2 arithmetic (incl.
+`MASK_DICT_OVERHEAD`); the shared-mask refcount fail-safe and all D-M1 skip
+rules carry over; the pair honors `downsample_flate_images`. Under-resolution
+pairs are untouched — no requantization analogue exists for lossless payloads
+without a lossy re-encode consent surface. Measured on the reference corpus:
+amatl 6.03 MB (D-M2) → 5,547,684 B (5.55 MB, 33.0% of the 16,804,107 B
+original) vs Ghostscript's 3.72 MB; byte-stable on a second pass.
+
 ## D-M4 — Indexed/palette and low-bpc images (stretch)
 
 Currently skipped (src/lib.rs:633 M1 scope note). GS re-encodes these too.

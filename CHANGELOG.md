@@ -10,6 +10,21 @@ and this project adheres to
 
 ### Added
 
+- **SMask-coupled Flate-base downsampling (Phase 5 D-M3).** Over-resolution
+  FlateDecode images with an eligible `/SMask` are now downsampled with the
+  same atomic pair mechanics as D-M2: the base goes through the existing
+  format-preserving Flate→Flate path (same `/ColorSpace`, predictor handling
+  unchanged), the mask through the same resample-to-Flate path, both to the
+  SAME target geometry — replaced together or not at all. The combined
+  never-larger/5% minimum-savings guard, the shared-mask fail-safe, and every
+  D-M1 skip rule (`/Matte`, stencils, ineligible mask shapes, corrupt
+  streams) apply unchanged, and the pair honors `downsample_flate_images`.
+  Pairs already at/below the DPI threshold are left byte-for-byte untouched —
+  there is no requantization analogue for lossless Flate payloads (that would
+  be a lossy re-encode, which still has no consent surface). On the 16.8 MB
+  NASA reference report this takes amatl from 6.03 MB (D-M2) to 5.55 MB
+  (5,547,684 B) vs Ghostscript's 3.72 MB, byte-stable across passes.
+
 - **SMask-coupled downsampling (Phase 5 D-M2).** Over-resolution JPEG images
   with an eligible `/SMask` are now downsampled as an atomic pair: base
   (Lanczos3 → JPEG at `jpeg_quality`) and mask (Triangle → plain FlateDecode
@@ -35,7 +50,7 @@ and this project adheres to
   `/Mask` color-key/stencil images and all ineligible `/SMask` shapes
   (unresolvable reference, non-image object, non-DeviceGray color space,
   non-8-bit samples, `/Matte` anywhere in the pair, FlateDecode bases — those
-  are D-M3) are left byte-for-byte untouched, and the panic-safe
+  are covered by the D-M3 entry above) are left byte-for-byte untouched, and the panic-safe
   `catch_unwind` boundary is unchanged. Attacks the 9.16 MB masked-JPEG class
   on the reference corpus at zero geometric risk.
 
