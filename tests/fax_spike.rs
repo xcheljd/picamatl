@@ -138,7 +138,9 @@ fn noise(width: usize, height: usize) -> Vec<Vec<bool>> {
 }
 
 /// Long flat runs: mostly white with sparse wide black bars — best case for
-/// both codecs, exercises run-lengths past the 2560 makeup-code boundary.
+/// both codecs. At the standard W=1728 no run can exceed 1728 pels, so this
+/// exercises terminating + ordinary makeup codes only, not the extended
+/// makeup codes (>2560); those need rows wider than 2560 pels.
 fn flat_runs(width: usize, height: usize) -> Vec<Vec<bool>> {
     let mut rows = vec![vec![false; width]; height];
     for r in 0..height {

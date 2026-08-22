@@ -315,16 +315,26 @@ has no such hazard and remains a legitimate B-M2 candidate.
 - **Out of scope, recommend permanently:** symbol/lossy JBIG2, bitonal
   downsampling, and MRC (below).
 
-### B.3 Vetting spike results (2026-08-22) — PASS
+### B.3 Vetting spike results (2026-08-22) — PASS (partial scope; see note)
 
-All checks against `fax 0.3.0` (probes live in `tests/fax_spike.rs`, kept as a
+Checks run against `fax 0.3.0` (probes live in `tests/fax_spike.rs`, kept as a
 permanent regression harness):
+
+**Scope note (honesty vs §B.2's spike definition):** the original spike covered
+G4 round-trip fuzzing, the panic battery, and byte economy — it did **not**
+cover the §B.2 items "parameter coverage (`/K`, `/Columns`, `/Rows`,
+`/BlackIs1`, `/EncodedByteAlign`)" or "decode-vs-Ghostscript comparison on real
+scans". Those gaps are closed by the B-M1 pre-work probes: G3 (`/K` ≥ 0) decode
+behavior and wide-row/degenerate-`/Columns` coverage land as additional spike
+tests, and a PDF-embedded G4 stream is rendered through Ghostscript for foreign
+-decoder interop; `/BlackIs1` polarity and `/EncodedByteAlign` handling are
+resolved as B-M1 eligibility-gate tests.
 
 | Check | Result | Detail |
 | --- | --- | --- |
 | License | PASS | MIT LICENSE file present in the crate |
 | Unsafe | PASS | `#![deny(unsafe_code)]` crate-wide |
-| MSRV | PASS | `rust-version = "1.88.0"` — exactly at our floor |
+| MSRV | PASS | `rust-version = "1.71"` (fax's own Cargo.toml, verified from registry source) — well under our 1.88 floor |
 | Transitive deps | PASS | none beyond std |
 | G4 round-trip | PASS | pixel equality on noise / flat-run / document-like / tiny-8×8 / single-row patterns (all five row filters of synthetic content) |
 | Panic safety | PASS | truncations at 5 offsets (incl. inside EOFB), every single-byte bit-flip across a valid stream, and 64 pure-garbage streams — zero panics, all fold to clean `None`/error |
