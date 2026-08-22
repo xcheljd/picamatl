@@ -1292,8 +1292,8 @@ mod tests {
     /// a malformed JPEG stream must not abort the process. Before the
     /// `catch_unwind` wrapper in `optimize_with_options`, this could panic in
     /// the image decoder; the wrapper turns any panic into the same graceful
-    /// fallback as a parse error. This is the exact regression that F1 fixed
-    /// (commit f4c18e4) — keep it pinned so it can't silently regress.
+    /// fallback as a parse error. This pins that regression so the panic
+    /// boundary can't silently disappear.
     #[test]
     fn crafted_pdf_panic_is_caught_not_unwound() {
         let pdf = build_pdf(400, 100);
