@@ -2584,7 +2584,10 @@ fn try_compress_xref_stream(out: &[u8]) -> Option<Vec<u8>> {
     while out.get(p).is_some_and(|b| b.is_ascii_digit()) {
         p += 1;
     }
-    let xref_start: usize = std::str::from_utf8(out.get(digits..p)?).ok()?.parse().ok()?;
+    let xref_start: usize = std::str::from_utf8(out.get(digits..p)?)
+        .ok()?
+        .parse()
+        .ok()?;
     if xref_start >= sx {
         return None;
     }
@@ -2628,7 +2631,10 @@ fn try_compress_xref_stream(out: &[u8]) -> Option<Vec<u8>> {
     // anything: if `endstream` is not exactly there, this is not the object we
     // think it is.
     let content = out.get(content_start..content_start.checked_add(content_len)?)?;
-    if !out.get(content_start + content_len..)?.starts_with(b"\nendstream") {
+    if !out
+        .get(content_start + content_len..)?
+        .starts_with(b"\nendstream")
+    {
         return None;
     }
 
@@ -4218,8 +4224,7 @@ mod tests {
     fn build_pdf_weakly_deflated(px: u32, draw_pts: i64) -> Vec<u8> {
         use std::io::Write;
         let raw = flate_pixels(px, px, 3);
-        let mut enc =
-            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::new(1));
+        let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::new(1));
         enc.write_all(&raw).unwrap();
         let payload = enc.finish().unwrap();
 
