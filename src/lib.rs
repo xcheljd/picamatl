@@ -2456,6 +2456,480 @@ fn dedup_decoded_streams(doc: &mut Document) -> bool {
     true
 }
 
+/// Decoded bytes of a content stream, accepting only shapes whose decode is
+/// beyond doubt: no filter at all, or scalar/array `FlateDecode` with no
+/// `/DecodeParms`. Anything else (LZW, predictors, exotic filters, inflate
+/// failure) returns `None` and the stream is left untouched.
+fn content_stream_plain(doc: &Document, stream: &lopdf::Stream) -> Option<Vec<u8>> {
+    match stream.dict.get(b"Filter") {
+        Err(_) | Ok(Object::Null) => Some(stream.content.clone()),
+        Ok(filter) => {
+            if classify_filter(doc, filter) != FilterClass::FlateOnly {
+                return None;
+            }
+            if !matches!(stream.dict.get(b"DecodeParms"), Err(_) | Ok(Object::Null)) {
+                return None;
+            }
+            inflate_capped(&stream.content, MAX_REDEFLATE_BYTES)
+        }
+    }
+}
+
+/// Count how many `Object::Reference`s point at each object id, across every
+/// object body and the trailer. Used by the content minifier to prove a
+/// multi-stream page's content objects are referenced ONLY by that page before
+/// replacing the array with a single merged stream.
+fn count_object_references(doc: &Document) -> HashMap<ObjectId, usize> {
+    fn walk(obj: &Object, counts: &mut HashMap<ObjectId, usize>) {
+        match obj {
+            Object::Reference(id) => *counts.entry(*id).or_insert(0) += 1,
+            Object::Array(items) => items.iter().for_each(|o| walk(o, counts)),
+            Object::Dictionary(d) => d.iter().for_each(|(_, v)| walk(v, counts)),
+            Object::Stream(s) => s.dict.iter().for_each(|(_, v)| walk(v, counts)),
+            _ => {}
+        }
+    }
+    let mut counts = HashMap::new();
+    for obj in doc.objects.values() {
+        walk(obj, &mut counts);
+    }
+    for (_, v) in doc.trailer.iter() {
+        walk(v, &mut counts);
+    }
+    counts
+}
+
+/// Semantic equality for re-parsed content operands. Plain `PartialEq` is too
+/// strict for one deliberate case: `Real(1.0)` re-emits as `1` (Rust's
+/// shortest round-trip formatting), which re-parses as `Integer(1)`. The
+/// number a viewer computes is identical, so Integer/Real pairs compare by
+/// value. The integer side always came from re-parsing the Real's exact
+/// printed digits, so the `as f32` conversion reproduces the original bit
+/// pattern — there is no precision loophole. Everything else (names, strings
+/// with their format, booleans, references) must match exactly.
+fn objects_equivalent(a: &Object, b: &Object) -> bool {
+    match (a, b) {
+        (Object::Integer(i), Object::Real(r)) | (Object::Real(r), Object::Integer(i)) => {
+            *i as f32 == *r
+        }
+        (Object::Array(x), Object::Array(y)) => {
+            x.len() == y.len() && x.iter().zip(y).all(|(p, q)| objects_equivalent(p, q))
+        }
+        (Object::Dictionary(x), Object::Dictionary(y)) => {
+            x.len() == y.len()
+                && x.iter()
+                    .all(|(k, v)| y.get(k).map(|w| objects_equivalent(v, w)).unwrap_or(false))
+        }
+        _ => a == b,
+    }
+}
+
+/// The numeric literals of a content stream, in order, as f64 — the precision
+/// a real viewer parses at. lopdf holds operands as f32, so its re-emit can
+/// print a *shorter* decimal that maps to the same f32 but a different f64
+/// (e.g. `0.30000001` -> `0.3`), and that sub-1e-7 drift is enough to flip an
+/// antialiased pixel in a strict render-hash comparison. The minifier
+/// therefore requires the original and re-emitted number sequences to be
+/// f64-identical; trailing-zero/whitespace rewrites pass (same decimal value),
+/// true precision changes don't. `None` = lexing confusion; caller must skip.
+///
+/// The lexer only needs to be exact about what can HIDE digits: literal
+/// strings (with escapes and balanced parens), hex strings, names (regular
+/// chars include digits), and comments. Numbers are `[+-]?[0-9.]+`; a token
+/// like `1.2.3` (two PDF numbers) fails the f64 parse and returns `None`,
+/// erring toward keeping the original bytes.
+fn content_number_values(bytes: &[u8]) -> Option<Vec<f64>> {
+    let tokens = content_number_tokens(bytes)?;
+    let mut out = Vec::with_capacity(tokens.len());
+    for span in tokens {
+        let text = std::str::from_utf8(&bytes[span])
+            .ok()
+            .filter(|t| t.bytes().filter(|&b| b == b'.').count() <= 1)?;
+        out.push(text.parse::<f64>().ok()?);
+    }
+    Some(out)
+}
+
+/// Byte spans of every numeric literal in a content stream, in order. See
+/// `content_number_values` for the lexer's scope and failure posture.
+fn content_number_tokens(bytes: &[u8]) -> Option<Vec<std::ops::Range<usize>>> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        match b {
+            b'\0' | b'\t' | b'\n' | b'\x0C' | b'\r' | b' ' => i += 1,
+            b'%' => {
+                while i < bytes.len() && bytes[i] != b'\n' && bytes[i] != b'\r' {
+                    i += 1;
+                }
+            }
+            b'(' => {
+                let mut depth = 1usize;
+                i += 1;
+                while i < bytes.len() && depth > 0 {
+                    match bytes[i] {
+                        b'\\' => i += 1, // skip the escaped byte too
+                        b'(' => depth += 1,
+                        b')' => depth -= 1,
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                if depth > 0 {
+                    return None;
+                }
+            }
+            b'<' => {
+                if bytes.get(i + 1) == Some(&b'<') {
+                    i += 2;
+                } else {
+                    i += 1;
+                    while i < bytes.len() && bytes[i] != b'>' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+            }
+            b'/' => {
+                i += 1;
+                while i < bytes.len() && is_regular_content_char(bytes[i]) {
+                    i += 1;
+                }
+            }
+            b'+' | b'-' | b'.' | b'0'..=b'9' => {
+                let start = i;
+                i += 1;
+                while i < bytes.len() && matches!(bytes[i], b'0'..=b'9' | b'.') {
+                    i += 1;
+                }
+                out.push(start..i);
+            }
+            b'>' | b']' | b'[' | b'{' | b'}' | b')' => i += 1,
+            _ => {
+                i += 1;
+                while i < bytes.len() && is_regular_content_char(bytes[i]) {
+                    i += 1;
+                }
+            }
+        }
+    }
+    Some(out)
+}
+
+/// Shortest decimal-EXACT form of a PDF number literal: drop a `+` sign,
+/// leading integer zeros, trailing fraction zeros, and a bare trailing `.`.
+/// Never changes the decimal value, so the f64 a viewer parses is identical —
+/// unlike shortest-f32 re-printing. `-0`/`-0.000` normalize to `0`.
+fn minify_number_literal(text: &str) -> String {
+    let (neg, rest) = match text.as_bytes().first() {
+        Some(b'-') => (true, &text[1..]),
+        Some(b'+') => (false, &text[1..]),
+        _ => (false, text),
+    };
+    let (int, frac) = match rest.split_once('.') {
+        Some((i, f)) => (i, f),
+        None => (rest, ""),
+    };
+    let int = int.trim_start_matches('0');
+    let frac = frac.trim_end_matches('0');
+    let sign = if neg && !(int.is_empty() && frac.is_empty()) {
+        "-"
+    } else {
+        ""
+    };
+    if frac.is_empty() {
+        if int.is_empty() {
+            "0".to_string()
+        } else {
+            format!("{sign}{int}")
+        }
+    } else {
+        format!("{sign}{int}.{frac}")
+    }
+}
+
+fn is_regular_content_char(b: u8) -> bool {
+    !matches!(
+        b,
+        b'\0'
+            | b'\t'
+            | b'\n'
+            | b'\x0C'
+            | b'\r'
+            | b' '
+            | b'('
+            | b')'
+            | b'<'
+            | b'>'
+            | b'['
+            | b']'
+            | b'{'
+            | b'}'
+            | b'/'
+            | b'%'
+    )
+}
+
+fn operations_equivalent(a: &[lopdf::content::Operation], b: &[lopdf::content::Operation]) -> bool {
+    a.len() == b.len()
+        && a.iter().zip(b).all(|(x, y)| {
+            x.operator == y.operator
+                && x.operands.len() == y.operands.len()
+                && x.operands
+                    .iter()
+                    .zip(&y.operands)
+                    .all(|(p, q)| objects_equivalent(p, q))
+        })
+}
+
+/// Re-emit one decoded content payload compactly; `None` unless every guard
+/// passes. Returns the winning stored bytes and whether they are deflated.
+///
+/// Guards, in order:
+/// - `Content::decode_strict` — the lenient decoder silently TRUNCATES
+///   malformed input, which re-encoding would turn into dropped operators.
+///   Strict parsing errors instead, and we skip the stream.
+/// - No `BI` operator: lopdf represents an unparseable inline image as a bare
+///   `BI` with the binary data dropped, so any stream carrying inline images
+///   is left untouched wholesale.
+/// - Re-parse equality: the re-emitted bytes must strict-parse back to
+///   operations semantically identical to the original (see
+///   `objects_equivalent`) — the emit is verified, not trusted.
+/// - `encoded < plain_stored`: the pass claims work only for TRUE text
+///   minification. A stream whose text merely re-deflates smaller is the
+///   final serialization pass's business and must not, on its own, cause an
+///   otherwise-untouched file to be rewritten.
+/// - `best < disk_stored`: whatever we store must be strictly smaller than
+///   the caller's bar — the smaller of the stored bytes and the redeflated
+///   original text, i.e. what the pipeline would produce with no minify.
+///   When the original had no `/Filter` and the winner is deflated, the
+///   19 bytes of `/Filter/FlateDecode` dict text the rewrite adds are charged
+///   to the candidate (measured: without this, ~350 tiny uncompressed Form
+///   XObjects each "won" by 2 stream bytes while growing 17 on disk).
+const FILTER_DICT_COST: usize = b"/Filter/FlateDecode".len();
+
+fn replan_content(
+    decoded: &[u8],
+    plain_stored: usize,
+    disk_stored: usize,
+    gains_filter_cost: bool,
+    backend: DeflateBackend,
+) -> Option<(Vec<u8>, bool)> {
+    let ops = Content::decode_strict(decoded).ok()?;
+    if ops.operations.iter().any(|op| op.operator == "BI") {
+        return None;
+    }
+    let emitted = ops.encode().ok()?;
+    // lopdf re-emits numbers from its f32 operands, which can silently move
+    // the f64 value a viewer parses (see `content_number_values`). Splice the
+    // ORIGINAL literals back in, in their shortest decimal-exact form: the
+    // token sequences correspond 1:1 because the operations are the same.
+    let original_tokens = content_number_tokens(decoded)?;
+    let emitted_tokens = content_number_tokens(&emitted)?;
+    if original_tokens.len() != emitted_tokens.len() {
+        return None;
+    }
+    let mut encoded = Vec::with_capacity(emitted.len());
+    let mut cursor = 0usize;
+    for (orig, emit) in original_tokens.iter().zip(&emitted_tokens) {
+        let literal = std::str::from_utf8(&decoded[orig.clone()]).ok()?;
+        encoded.extend_from_slice(&emitted[cursor..emit.start]);
+        encoded.extend_from_slice(minify_number_literal(literal).as_bytes());
+        cursor = emit.end;
+    }
+    encoded.extend_from_slice(&emitted[cursor..]);
+    if encoded.len() >= plain_stored {
+        return None;
+    }
+    let reparsed = Content::decode_strict(&encoded).ok()?;
+    if !operations_equivalent(&ops.operations, &reparsed.operations) {
+        return None;
+    }
+    // Belt and braces: the spliced stream's numbers must be f64-identical to
+    // the original's. Holds by construction; verified anyway because this is
+    // the guard the render-hash contract rests on.
+    if content_number_values(decoded)? != content_number_values(&encoded)? {
+        return None;
+    }
+    let (best, is_deflated) = match deflate_backend(&encoded, backend) {
+        Some(d) if d.len() < encoded.len() => (d, true),
+        _ => (encoded, false),
+    };
+    let cost = best.len()
+        + if is_deflated && gains_filter_cost {
+            FILTER_DICT_COST
+        } else {
+            0
+        };
+    (cost < disk_stored).then_some((best, is_deflated))
+}
+
+/// Minify page content streams and Form XObject content: decode the operator
+/// stream, re-emit it with single-space operand separation and Rust's
+/// shortest-round-trip float formatting, and keep the result only when it is
+/// strictly smaller (see `replan_content` for the full guard list). A page
+/// whose `/Contents` is an array is re-emitted as ONE merged stream — the
+/// array elements are concatenated before parsing (operators may span element
+/// boundaries, so per-element parsing would be wrong), and the merge is
+/// applied only when every element is referenced solely by this page.
+///
+/// Why this is render-equivalent: the operations a viewer executes are the
+/// parsed ones, and the re-parse-equality guard proves the new bytes parse to
+/// the same operations. Comments and redundant whitespace are the only
+/// casualties. Prior spike measurements showed the effect is CONDITIONAL
+/// per file (some producers already emit compactly; floats like `.1531`
+/// re-print longer as `0.1531`), which is exactly why every stream keeps its
+/// original bytes unless the rewrite wins.
+///
+/// Declined wholesale for encrypted, PDF/A-declared, and signed documents,
+/// same posture as `redeflate_flate_streams`.
+fn minify_content_streams(doc: &mut Document, backend: DeflateBackend) -> bool {
+    if doc.is_encrypted() || fonts::pdfa_blocked(doc) || signature_present(doc) {
+        return false;
+    }
+    let refcounts = count_object_references(doc);
+    let mut changed = false;
+
+    struct PageRewrite {
+        page_id: ObjectId,
+        ids: Vec<ObjectId>,
+        content: Vec<u8>,
+        deflated: bool,
+    }
+    let mut rewrites: Vec<PageRewrite> = Vec::new();
+    for (_, page_id) in doc.get_pages() {
+        let ids = doc.get_page_contents(page_id);
+        if ids.is_empty() {
+            continue;
+        }
+        let mut plain_stored = 0usize;
+        let mut disk_stored = 0usize;
+        let mut decoded = Vec::new();
+        let mut eligible = true;
+        let mut any_unfiltered = false;
+        for &sid in &ids {
+            let Ok(stream) = doc.get_object(sid).and_then(Object::as_stream) else {
+                eligible = false;
+                break;
+            };
+            let Some(bytes) = content_stream_plain(doc, stream) else {
+                eligible = false;
+                break;
+            };
+            let has_filter = !matches!(stream.dict.get(b"Filter"), Err(_) | Ok(Object::Null));
+            any_unfiltered |= !has_filter;
+            plain_stored += bytes.len();
+            // The bar to beat is not what the file stores today but what the
+            // final redeflate pass would store WITHOUT minification — else a
+            // weakly-deflated original lets a longer-but-freshly-deflated
+            // re-emit "win" while losing to the counterfactual (measured:
+            // +8 KB on a pdfTeX file whose floats mostly re-print longer). An
+            // unfiltered original that the pipeline would compress also pays
+            // the filter-name dict cost in that counterfactual.
+            let redeflated = deflate_backend(&bytes, backend)
+                .map(|d| d.len() + if has_filter { 0 } else { FILTER_DICT_COST });
+            disk_stored += match redeflated {
+                Some(n) => n.min(stream.content.len()),
+                None => stream.content.len(),
+            };
+            decoded.extend_from_slice(&bytes);
+            // Separator between elements, per spec concatenation semantics.
+            decoded.push(b'\n');
+        }
+        if !eligible {
+            continue;
+        }
+        let Some((content, deflated)) =
+            replan_content(&decoded, plain_stored, disk_stored, any_unfiltered, backend)
+        else {
+            continue;
+        };
+        // Merging an array into one stream deletes the elements (via the later
+        // orphan prune); that is only sound — and only the size win we
+        // measured — when nothing else references them.
+        if ids.len() > 1 && ids.iter().any(|id| refcounts.get(id) != Some(&1)) {
+            continue;
+        }
+        rewrites.push(PageRewrite {
+            page_id,
+            ids,
+            content,
+            deflated,
+        });
+    }
+    for r in rewrites {
+        if let [only] = r.ids[..] {
+            if let Ok(Object::Stream(s)) = doc.get_object_mut(only) {
+                s.set_content(r.content);
+                if r.deflated {
+                    s.dict.set("Filter", Object::Name(b"FlateDecode".to_vec()));
+                } else {
+                    s.dict.remove(b"Filter");
+                }
+                s.dict.remove(b"DecodeParms");
+                changed = true;
+            }
+        } else {
+            let mut dict = lopdf::Dictionary::new();
+            if r.deflated {
+                dict.set("Filter", Object::Name(b"FlateDecode".to_vec()));
+            }
+            let new_id = doc.add_object(Object::Stream(lopdf::Stream::new(dict, r.content)));
+            if let Ok(Object::Dictionary(page)) = doc.get_object_mut(r.page_id) {
+                page.set("Contents", Object::Reference(new_id));
+                changed = true;
+                // The replaced elements go orphan; prune_objects drops them.
+            }
+        }
+    }
+
+    // Form XObjects are self-contained content streams (their own /Resources,
+    // never split), so each is minified independently, in place — safe even if
+    // shared across pages, since the semantics are proven unchanged.
+    let form_ids: Vec<ObjectId> = doc
+        .objects
+        .iter()
+        .filter_map(|(&id, obj)| {
+            let Object::Stream(s) = obj else { return None };
+            matches!(s.dict.get(b"Subtype"), Ok(Object::Name(n)) if n == b"Form").then_some(id)
+        })
+        .collect();
+    for id in form_ids {
+        let Ok(stream) = doc.get_object(id).and_then(Object::as_stream) else {
+            continue;
+        };
+        let Some(plain) = content_stream_plain(doc, stream) else {
+            continue;
+        };
+        // Same counterfactual bar as the page pass: beat the redeflated
+        // original, not merely the (possibly weakly-deflated) stored bytes.
+        let has_filter = !matches!(stream.dict.get(b"Filter"), Err(_) | Ok(Object::Null));
+        let bar = match deflate_backend(&plain, backend) {
+            Some(d) => {
+                (d.len() + if has_filter { 0 } else { FILTER_DICT_COST }).min(stream.content.len())
+            }
+            None => stream.content.len(),
+        };
+        let Some((content, deflated)) =
+            replan_content(&plain, plain.len(), bar, !has_filter, backend)
+        else {
+            continue;
+        };
+        if let Ok(Object::Stream(s)) = doc.get_object_mut(id) {
+            s.set_content(content);
+            if deflated {
+                s.dict.set("Filter", Object::Name(b"FlateDecode".to_vec()));
+            } else {
+                s.dict.remove(b"Filter");
+            }
+            s.dict.remove(b"DecodeParms");
+            changed = true;
+        }
+    }
+    changed
+}
+
 /// Merge byte-identical **stream** objects — in practice repeated images: a logo
 /// or product shot re-embedded once per page. Returns true if anything merged.
 ///
@@ -2540,6 +3014,13 @@ fn try_optimize(input: &[u8], options: OptimizeOptions) -> Result<Option<Vec<u8>
     // pass can undo the other's merges, so both run and both count as work.
     let merged_decoded = dedup_decoded_streams(&mut doc);
 
+    // Minify page/Form content streams before anything parses them: the
+    // planners below then read the same (verified-equivalent) operations from
+    // smaller bytes. Counts as work — a file whose only win is a genuinely
+    // smaller content re-emit deserves the rewrite (guarded so that pure
+    // re-serialization does NOT count; see `replan_content`).
+    let minified = minify_content_streams(&mut doc, options.deflate_backend);
+
     // Plan every image in parallel: each is an independent decode -> resize ->
     // re-encode against an immutable &Document, so there is no shared mutable
     // state. Rayon propagates a worker panic to this thread, so the
@@ -2597,6 +3078,7 @@ fn try_optimize(input: &[u8], options: OptimizeOptions) -> Result<Option<Vec<u8>
         && !options.strip_accessibility
         && !merged_streams
         && !merged_decoded
+        && !minified
         && !gray_work
     {
         return Ok(None);
@@ -5691,6 +6173,155 @@ mod tests {
                 input
             );
         }
+    }
+
+    #[test]
+    fn minify_number_literal_is_decimal_exact() {
+        for (input, want) in [
+            ("+3", "3"),
+            ("007", "7"),
+            ("0.5000", ".5"),
+            ("-0.000", "0"),
+            ("-0", "0"),
+            ("10.", "10"),
+            ("0.0", "0"),
+            ("-.12", "-.12"),
+            ("1.25", "1.25"),
+            ("0.30000001", ".30000001"),
+        ] {
+            assert_eq!(minify_number_literal(input), want, "literal {input:?}");
+            // The transform's whole contract: identical f64.
+            assert_eq!(
+                input.parse::<f64>().unwrap(),
+                minify_number_literal(input).parse::<f64>().unwrap(),
+                "f64 drift on {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn replan_content_minifies_sloppy_streams() {
+        let sloppy = b"1.000  0.000 0.000   1.000 100.00 700.00 cm\n% a comment\nq   Q";
+        let (out, deflated) = replan_content(
+            sloppy,
+            sloppy.len(),
+            sloppy.len(),
+            false,
+            DeflateBackend::Zlib,
+        )
+        .expect("sloppy content must minify");
+        let stored = if deflated {
+            inflate_capped(&out, 1 << 16).unwrap()
+        } else {
+            out.clone()
+        };
+        assert!(out.len() < sloppy.len());
+        // Values a viewer parses are identical at f64.
+        assert_eq!(
+            content_number_values(sloppy).unwrap(),
+            content_number_values(&stored).unwrap()
+        );
+        // And the operations are semantically unchanged.
+        let a = Content::decode_strict(sloppy).unwrap();
+        let b = Content::decode_strict(&stored).unwrap();
+        assert!(operations_equivalent(&a.operations, &b.operations));
+    }
+
+    #[test]
+    fn replan_content_preserves_f64_of_long_literals() {
+        // 0.30000001 is NOT the shortest print of its f32 (that would be 0.3),
+        // so a naive f32 re-emit would move the f64 a viewer parses. The
+        // splice must keep the original decimal digits.
+        let sloppy = b"0.30000001  0.000 0.000 0.30000001   0.000 0.000 cm  q   Q";
+        let (out, deflated) = replan_content(
+            sloppy,
+            sloppy.len(),
+            sloppy.len(),
+            false,
+            DeflateBackend::Zlib,
+        )
+        .expect("must minify");
+        let stored = if deflated {
+            inflate_capped(&out, 1 << 16).unwrap()
+        } else {
+            out
+        };
+        let text = String::from_utf8(stored).unwrap();
+        assert!(
+            text.contains(".30000001"),
+            "original digits must survive: {text}"
+        );
+    }
+
+    #[test]
+    fn replan_content_declines_inline_images_and_garbage() {
+        // Inline image: lopdf drops the binary data of an unparseable BI and
+        // represents a parseable one as an operand it re-serializes in a
+        // DIFFERENT (dict + stream) form — either way, hands off.
+        let bi = b"BI /W 1 /H 1 /BPC 8 /CS /G ID x EI\nq Q";
+        assert!(replan_content(bi, bi.len(), bi.len(), false, DeflateBackend::Zlib).is_none());
+        // Truncated garbage must fail strict parsing, not silently truncate.
+        let garbage = b"1.000 0.000 zzz <malformed  ";
+        assert!(replan_content(
+            garbage,
+            garbage.len(),
+            garbage.len(),
+            false,
+            DeflateBackend::Zlib
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn replan_content_declines_already_minimal_streams() {
+        let minimal = b"1 0 0 1 5 5 cm";
+        assert!(replan_content(
+            minimal,
+            minimal.len(),
+            minimal.len(),
+            false,
+            DeflateBackend::Zlib
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn minify_merges_multi_stream_page_contents() {
+        // A /Contents ARRAY whose operator spans the element boundary: the
+        // page must be minified as one unit and re-emitted as a single stream.
+        let body: String = "0.100 0.200 0.300 0.400 0.500 0.600 cm\n".repeat(60);
+        let c1 = Stream::new(
+            dictionary! {},
+            format!("{body}1.000 0.000 0.000").into_bytes(),
+        );
+        let c2 = Stream::new(dictionary! {}, b" 1.000 5.000 7.000 cm\nq Q".to_vec());
+        let mut doc = Document::with_version("1.5");
+        let c1_id = doc.add_object(c1);
+        let c2_id = doc.add_object(c2);
+        let pages_id = doc.new_object_id();
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page", "Parent" => pages_id,
+            "Contents" => vec![c1_id.into(), c2_id.into()],
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        });
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages", "Kids" => vec![page_id.into()], "Count" => 1,
+            }),
+        );
+        let catalog_id = doc.add_object(dictionary! {
+            "Type" => "Catalog", "Pages" => pages_id,
+        });
+        doc.trailer.set("Root", catalog_id);
+        let before = doc.get_and_decode_page_content(page_id).unwrap();
+
+        let changed = minify_content_streams(&mut doc, DeflateBackend::Zlib);
+        assert!(changed, "sloppy multi-stream page must minify");
+        let ids = doc.get_page_contents(page_id);
+        assert_eq!(ids.len(), 1, "array must merge to a single stream");
+        let after = doc.get_and_decode_page_content(page_id).unwrap();
+        assert!(operations_equivalent(&before.operations, &after.operations));
     }
 
     #[test]
