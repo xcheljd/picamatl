@@ -148,6 +148,20 @@ pub struct OptimizeOptions {
     /// leaves the image untouched. Default: `false` (opt-in for at least one
     /// release cycle).
     pub recompress_bitonal_images: bool,
+
+    /// Allow LOSSY re-encoding of lossless (FlateDecode) raster images to
+    /// JPEG (`/DCTDecode`) — an encoding-class change, which the library
+    /// contract otherwise forbids, so this is strictly opt-in consent
+    /// (Phase 7 spike). Scope: unmasked 8-bit DeviceGray / DeviceRGB /
+    /// ICCBased(N=1/3) FlateDecode images only. Over-resolution images get a
+    /// JPEG candidate at the same target geometry as the format-preserving
+    /// downsample and the smaller candidate wins; images at/below the DPI
+    /// threshold are re-encoded at their own geometry, replaced only when the
+    /// JPEG saves at least 5% AND passes decode-back verification. Indexed,
+    /// CMYK, and non-8-bit images are never converted; images with `/SMask`
+    /// are excluded (coupled lossy conversion needs its own mask-alignment
+    /// analysis). Default: `false`.
+    pub allow_lossy_reencode: bool,
 }
 
 /// Written by hand, NOT derived: a derived `Default` would zero the numeric
@@ -165,6 +179,7 @@ impl Default for OptimizeOptions {
             downsample_flate_images: true,
             subset_fonts: false,
             recompress_bitonal_images: false,
+            allow_lossy_reencode: false,
         }
     }
 }
@@ -230,6 +245,14 @@ impl OptimizeOptions {
     #[must_use]
     pub fn with_recompress_bitonal_images(mut self, recompress: bool) -> Self {
         self.recompress_bitonal_images = recompress;
+        self
+    }
+
+    /// Enable/disable lossy Flate→JPEG re-encoding of lossless images
+    /// (off by default). See [`OptimizeOptions::allow_lossy_reencode`].
+    #[must_use]
+    pub fn with_allow_lossy_reencode(mut self, allow: bool) -> Self {
+        self.allow_lossy_reencode = allow;
         self
     }
 }
@@ -449,6 +472,15 @@ enum DictUpdate {
     Flate {
         decode_parms: Option<lopdf::Dictionary>,
     },
+    /// Phase 7 spike (consent-gated): a FlateDecode payload became a JPEG.
+    /// `/Filter` becomes the scalar `/DCTDecode` and any `/DecodeParms` (a
+    /// Flate-predictor artifact, meaningless for DCT) is dropped.
+    /// `/ColorSpace` and `/BitsPerComponent` are deliberately NOT rewritten:
+    /// the conversion is only planned for 8-bit DeviceGray / DeviceRGB /
+    /// ICCBased(N=1/3) sources and the JPEG preserves the channel count
+    /// (gray → 1-channel, RGB → 3-channel), so the existing entries still
+    /// describe the payload exactly.
+    FlateToJpeg,
 }
 
 /// A planned image replacement, computed read-only before mutating the doc.
@@ -761,14 +793,19 @@ fn plan_replacement(
     // RESIZED; under-threshold DCTDecode payloads instead take the same
     // dimension-preserving requantization D-M1 applies to masked bases
     // (Phase 6 P-M2) — quality normalization for scanner-quality JPEGs the
-    // resize pipeline never reaches. FlateDecode stays untouched (lossless
-    // contract — a JPEG re-encode would need the `allow_lossy_reencode`
-    // consent surface), and CCITT/bitonal never reaches this point.
+    // resize pipeline never reaches. FlateDecode stays untouched under the
+    // default lossless contract; with the `allow_lossy_reencode` consent flag
+    // (Phase 7 spike) it takes the dimension-preserving Flate→JPEG conversion
+    // instead, under the same 5% + decode-back guards as the requant.
+    // CCITT/bitonal never reaches this point.
     if !over_resolution {
-        if !matches!(class, FilterClass::DctOnly) {
-            return None;
+        if matches!(class, FilterClass::DctOnly) {
+            return plan_requant_replacement(stream, options, id, px_w, px_h);
         }
-        return plan_requant_replacement(stream, options, id, px_w, px_h);
+        if matches!(class, FilterClass::FlateOnly) && options.allow_lossy_reencode {
+            return plan_flate_lossy_requant_replacement(doc, stream, options, id, px_w, px_h);
+        }
+        return None;
     }
 
     let (out, dict_update) = match class {
@@ -778,10 +815,49 @@ fn plan_replacement(
         }
         FilterClass::FlateOnly => {
             if !options.downsample_flate_images {
+                // Geometry changes are declined (`downsample_flate_images`
+                // off), but with consent the ENCODING CLASS can still change
+                // in place: the same dimension-preserving Flate→JPEG
+                // conversion the under-threshold branch applies.
+                if options.allow_lossy_reencode {
+                    return plan_flate_lossy_requant_replacement(
+                        doc, stream, options, id, px_w, px_h,
+                    );
+                }
                 return None;
             }
-            let (out, decode_parms) = plan_flate(doc, stream, px_w, px_h, target_w, target_h)?;
-            (out, DictUpdate::Flate { decode_parms })
+            // Phase 7 spike: with consent, a JPEG candidate at the SAME
+            // target geometry competes with the format-preserving Flate
+            // downsample and the smaller payload wins (the shared
+            // never-larger guard below still decides against the original).
+            let lossless = plan_flate(doc, stream, px_w, px_h, target_w, target_h);
+            let lossy = if options.allow_lossy_reencode {
+                plan_flate_to_jpeg(doc, stream, options, px_w, px_h, target_w, target_h)
+            } else {
+                None
+            };
+            match (lossless, lossy) {
+                (Some((flate_out, parms)), Some(jpeg_out)) => {
+                    if jpeg_out.len() < flate_out.len() {
+                        (jpeg_out, DictUpdate::FlateToJpeg)
+                    } else {
+                        (
+                            flate_out,
+                            DictUpdate::Flate {
+                                decode_parms: parms,
+                            },
+                        )
+                    }
+                }
+                (Some((flate_out, parms)), None) => (
+                    flate_out,
+                    DictUpdate::Flate {
+                        decode_parms: parms,
+                    },
+                ),
+                (None, Some(jpeg_out)) => (jpeg_out, DictUpdate::FlateToJpeg),
+                (None, None) => return None,
+            }
         }
         FilterClass::CcittOnly | FilterClass::Other => return None,
     };
@@ -888,6 +964,22 @@ fn plan_dct_requant(
 
     let out = encode_jpeg(img, is_gray, quality)?;
 
+    // Exact idempotence guard (Phase 7 measurement): if the source's
+    // quantization tables are byte-identical to the candidate's, the payload
+    // is ALREADY at the configured quality and this "requantization" is pure
+    // generation-loss churn. The 5% rule alone does not converge here —
+    // mozjpeg's trellis quantization keeps shaving 5-10% per pass on
+    // graphics-heavy content it encoded itself (measured on the NASA corpus
+    // once Flate→JPEG conversions started producing our own q78 payloads).
+    // Table equality is the exact version of what the 5% rule approximates.
+    if let (Some(src_tables), Some(out_tables)) =
+        (jpeg_quant_tables(&stream.content), jpeg_quant_tables(&out))
+    {
+        if src_tables == out_tables {
+            return None;
+        }
+    }
+
     // Decode-back verification of the re-encoded base (hard rule): re-decoding
     // the candidate must reproduce the same geometry, channel count, and
     // nearby pixels before it is allowed to replace the original bytes.
@@ -902,6 +994,52 @@ fn plan_dct_requant(
         return None;
     }
     Some(out)
+}
+
+/// The concatenated payloads of a JPEG stream's DQT (quantization table)
+/// segments, in file order, up to the start-of-scan marker. Two JPEGs with
+/// identical output from this function were quantized with the same tables —
+/// i.e. they are at the same quality setting. Returns `None` on any parse
+/// doubt (callers must then not draw conclusions either way).
+fn jpeg_quant_tables(data: &[u8]) -> Option<Vec<u8>> {
+    if data.len() < 2 || data[0] != 0xFF || data[1] != 0xD8 {
+        return None;
+    }
+    let mut out = Vec::new();
+    let mut i = 2usize;
+    while i + 2 <= data.len() {
+        if data[i] != 0xFF {
+            return None;
+        }
+        let marker = data[i + 1];
+        match marker {
+            // Fill bytes before a marker.
+            0xFF => {
+                i += 1;
+                continue;
+            }
+            // Standalone markers (no length field).
+            0x01 | 0xD0..=0xD7 => {
+                i += 2;
+                continue;
+            }
+            // Start of scan: every table segment has been seen.
+            0xDA => return Some(out),
+            _ => {}
+        }
+        if i + 4 > data.len() {
+            return None;
+        }
+        let len = ((data[i + 2] as usize) << 8) | data[i + 3] as usize;
+        if len < 2 || i + 2 + len > data.len() {
+            return None;
+        }
+        if marker == 0xDB {
+            out.extend_from_slice(&data[i + 4..i + 2 + len]);
+        }
+        i += 2 + len;
+    }
+    None
 }
 
 /// The dimension-preserving requantization as a full `Replacement`, shared by
@@ -1219,6 +1357,45 @@ fn plan_flate(
     target_w: u32,
     target_h: u32,
 ) -> Option<(Vec<u8>, Option<lopdf::Dictionary>)> {
+    let (img, channels) = decode_flate_image(doc, stream, px_w, px_h)?;
+    let resized = img.resize_exact(target_w, target_h, image::imageops::FilterType::Lanczos3);
+    let raw = if channels == 3 {
+        resized.into_rgb8().into_raw()
+    } else {
+        resized.into_luma8().into_raw()
+    };
+
+    // Re-encode both variants and keep the smaller. The Up-predictor variant
+    // must also pay for the /DecodeParms dict it forces into the image
+    // dictionary (~70 serialized bytes), so the comparison includes that.
+    let plain = deflate_level9(&raw)?;
+    let up = deflate_level9(&png_up_filter(&raw, target_w, channels))?;
+    const PARMS_OVERHEAD: usize = 70;
+    if up.len() + PARMS_OVERHEAD < plain.len() {
+        let parms = dictionary! {
+            "Predictor" => 15_i64,
+            "Colors" => channels as i64,
+            "BitsPerComponent" => 8_i64,
+            "Columns" => target_w as i64,
+        };
+        Some((up, Some(parms)))
+    } else {
+        Some((plain, None))
+    }
+}
+
+/// The shared decode stage of every unmasked-Flate transform: all of
+/// `plan_flate`'s eligibility gates (8-bit only, no `/Decode`, handled color
+/// space, decodable predictor layout), the decompression-bomb cap, capped
+/// inflate + spec-correct PNG defiltering, and the exact decoded-length check.
+/// Returns the decoded pixels and the channel count (1 or 3), or `None` on
+/// any doubt (image untouched).
+fn decode_flate_image(
+    doc: &Document,
+    stream: &lopdf::Stream,
+    px_w: u32,
+    px_h: u32,
+) -> Option<(DynamicImage, usize)> {
     let dict = &stream.dict;
 
     // M1 scope: 8-bit only (Indexed/1/2/4/16-bit are skipped, never touched).
@@ -1269,30 +1446,81 @@ fn plan_flate(
     } else {
         DynamicImage::ImageLuma8(image::GrayImage::from_raw(px_w, px_h, decoded)?)
     };
-    let resized = img.resize_exact(target_w, target_h, image::imageops::FilterType::Lanczos3);
-    let raw = if channels == 3 {
-        resized.into_rgb8().into_raw()
-    } else {
-        resized.into_luma8().into_raw()
-    };
+    Some((img, channels))
+}
 
-    // Re-encode both variants and keep the smaller. The Up-predictor variant
-    // must also pay for the /DecodeParms dict it forces into the image
-    // dictionary (~70 serialized bytes), so the comparison includes that.
-    let plain = deflate_level9(&raw)?;
-    let up = deflate_level9(&png_up_filter(&raw, target_w, channels))?;
-    const PARMS_OVERHEAD: usize = 70;
-    if up.len() + PARMS_OVERHEAD < plain.len() {
-        let parms = dictionary! {
-            "Predictor" => 15_i64,
-            "Colors" => channels as i64,
-            "BitsPerComponent" => 8_i64,
-            "Columns" => target_w as i64,
-        };
-        Some((up, Some(parms)))
+/// Phase 7 spike: the consent-gated lossy Flate→JPEG candidate. Decodes the
+/// Flate pixels through the exact same gates as the format-preserving path
+/// (`decode_flate_image`), optionally resizes to the target geometry
+/// (Lanczos3 — the same kernel every resize path uses; a same-size target is
+/// a pure re-encode), JPEG-encodes at `OptimizeOptions::jpeg_quality`
+/// preserving the channel count, and decode-back-verifies the candidate
+/// against the exact pixels handed to the encoder (geometry + channel count +
+/// the D-M1 MAD ceiling). Returns the JPEG bytes, or `None` on any doubt.
+/// Only reached when `allow_lossy_reencode` is true; size guards are the
+/// caller's.
+fn plan_flate_to_jpeg(
+    doc: &Document,
+    stream: &lopdf::Stream,
+    options: OptimizeOptions,
+    px_w: u32,
+    px_h: u32,
+    target_w: u32,
+    target_h: u32,
+) -> Option<Vec<u8>> {
+    let quality = options.jpeg_quality.clamp(1, 100);
+    let (img, channels) = decode_flate_image(doc, stream, px_w, px_h)?;
+    let is_gray = channels == 1;
+    let img = if (target_w, target_h) == (px_w, px_h) {
+        img
     } else {
-        Some((plain, None))
+        img.resize_exact(target_w, target_h, image::imageops::FilterType::Lanczos3)
+    };
+    let reference = if is_gray {
+        img.to_luma8().into_raw()
+    } else {
+        img.to_rgb8().into_raw()
+    };
+    let out = encode_jpeg(img, is_gray, quality)?;
+    if !decode_back_matches(
+        &out,
+        &reference,
+        is_gray,
+        target_w,
+        target_h,
+        DECODE_BACK_MAX_MAD,
+    ) {
+        return None;
     }
+    Some(out)
+}
+
+/// The dimension-preserving lossy Flate→JPEG conversion as a full
+/// `Replacement` (Phase 7 spike): re-encode at the stream's own geometry,
+/// then apply the strict-smaller AND 5% minimum-savings guard — the same
+/// arithmetic as `plan_requant_replacement`, and for the same reason: once
+/// converted, the payload is a DCTDecode stream whose second-pass requant
+/// churn lands under 5% and is declined, keeping repeat passes byte-stable.
+fn plan_flate_lossy_requant_replacement(
+    doc: &Document,
+    stream: &lopdf::Stream,
+    options: OptimizeOptions,
+    id: ObjectId,
+    px_w: u32,
+    px_h: u32,
+) -> Option<Replacement> {
+    let out = plan_flate_to_jpeg(doc, stream, options, px_w, px_h, px_w, px_h)?;
+    if out.len() * 100 >= stream.content.len() * 95 {
+        return None;
+    }
+    Some(Replacement {
+        id,
+        content: out,
+        width: px_w as i64,
+        height: px_h as i64,
+        dict_update: DictUpdate::FlateToJpeg,
+        smask: None,
+    })
 }
 
 /// Resolve `/ColorSpace` to a component count the M1 Flate path handles:
@@ -1817,17 +2045,30 @@ fn try_optimize(input: &[u8], options: OptimizeOptions) -> Result<Option<Vec<u8>
             stream.set_content(r.content);
             stream.dict.set("Width", Object::Integer(r.width));
             stream.dict.set("Height", Object::Integer(r.height));
-            if let DictUpdate::Flate { decode_parms } = r.dict_update {
-                // Normalize /Filter to the scalar name (the array form was
-                // accepted on input) and write parms matching the new payload.
-                stream
-                    .dict
-                    .set("Filter", Object::Name(b"FlateDecode".to_vec()));
-                match decode_parms {
-                    Some(parms) => stream.dict.set("DecodeParms", Object::Dictionary(parms)),
-                    None => {
-                        stream.dict.remove(b"DecodeParms");
+            match r.dict_update {
+                DictUpdate::Dct => {}
+                DictUpdate::Flate { decode_parms } => {
+                    // Normalize /Filter to the scalar name (the array form was
+                    // accepted on input) and write parms matching the new payload.
+                    stream
+                        .dict
+                        .set("Filter", Object::Name(b"FlateDecode".to_vec()));
+                    match decode_parms {
+                        Some(parms) => stream.dict.set("DecodeParms", Object::Dictionary(parms)),
+                        None => {
+                            stream.dict.remove(b"DecodeParms");
+                        }
                     }
+                }
+                DictUpdate::FlateToJpeg => {
+                    // Phase 7 spike: the payload is now a raw JPEG. Any
+                    // /DecodeParms belonged to the old Flate encoding and
+                    // must go; /ColorSpace and /BitsPerComponent still match
+                    // (see the variant's doc — channel count is preserved).
+                    stream
+                        .dict
+                        .set("Filter", Object::Name(b"DCTDecode".to_vec()));
+                    stream.dict.remove(b"DecodeParms");
                 }
             }
             // D-M2: the paired /SMask is applied atomically with the base —
@@ -2640,6 +2881,356 @@ mod tests {
         assert_eq!(out, pdf, "flag off must leave Flate images untouched");
     }
 
+    // ---- Phase 7 spike: consent-gated lossy Flate→JPEG re-encode -----------
+
+    /// Smooth sinusoidal shading plus low-amplitude deterministic noise — a
+    /// stand-in for photographic content: the noise floor keeps deflate
+    /// mediocre (like a real photo's sensor grain) while JPEG's DCT
+    /// quantization absorbs it, so the lossy candidate genuinely wins. Line
+    /// art is the opposite shape (see the checkerboard fixture below).
+    fn photo_pixels(px_w: u32, px_h: u32, channels: usize) -> Vec<u8> {
+        let mut state = 0x2545_F491_u32;
+        let mut out = Vec::with_capacity(px_w as usize * px_h as usize * channels);
+        for y in 0..px_h {
+            for x in 0..px_w {
+                for c in 0..channels {
+                    state ^= state << 13;
+                    state ^= state >> 17;
+                    state ^= state << 5;
+                    let noise = (state >> 28) as i32 - 8; // [-8, 7]
+                    let phase = (x as f32 / 23.0) + (y as f32 / 17.0) + c as f32;
+                    let base = 128.0 + 96.0 * phase.sin();
+                    out.push((base as i32 + noise).clamp(0, 255) as u8);
+                }
+            }
+        }
+        out
+    }
+
+    /// Build a one-page PDF embedding the given raw pixels as a plain-deflate
+    /// FlateDecode image drawn into a `draw_pts` square.
+    fn build_pdf_flate_raw(raw: &[u8], px: u32, draw_pts: i64, channels: usize) -> Vec<u8> {
+        let payload = deflate_level9(raw).unwrap();
+        let mut doc = Document::with_version("1.5");
+        let img_id = doc.add_object(Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Image",
+                "Width" => px as i64,
+                "Height" => px as i64,
+                "ColorSpace" => if channels == 1 { "DeviceGray" } else { "DeviceRGB" },
+                "BitsPerComponent" => 8_i64,
+                "Filter" => "FlateDecode",
+            },
+            payload,
+        ));
+        wrap_image_pdf(&mut doc, img_id, draw_pts)
+    }
+
+    /// The (single) image stream's `/Filter` name (scalar or first array
+    /// element), plus whether the dict still carries `/DecodeParms`.
+    fn image_filter_info(pdf: &[u8]) -> (Vec<u8>, bool) {
+        let doc = Document::load_mem(pdf).unwrap();
+        for obj in doc.objects.values() {
+            if let Object::Stream(s) = obj {
+                if matches!(s.dict.get(b"Subtype"), Ok(Object::Name(n)) if n == b"Image") {
+                    let name = match s.dict.get(b"Filter").unwrap() {
+                        Object::Name(n) => n.clone(),
+                        Object::Array(items) => match &items[0] {
+                            Object::Name(n) => n.clone(),
+                            other => panic!("unexpected filter element {other:?}"),
+                        },
+                        other => panic!("unexpected filter {other:?}"),
+                    };
+                    return (name, s.dict.get(b"DecodeParms").is_ok());
+                }
+            }
+        }
+        panic!("no image stream");
+    }
+
+    /// A 200 px photographic Flate image drawn into 200 pt: 72 effective DPI,
+    /// safely under the 130×1.15 threshold — the under-resolution shape.
+    fn build_photo_flate_under_res() -> Vec<u8> {
+        build_pdf_flate_raw(&photo_pixels(200, 200, 3), 200, 200, 3)
+    }
+
+    #[test]
+    fn lossy_reencode_cannot_fire_without_consent() {
+        // The consent pin (Phase 7). Default options: an under-resolution
+        // photographic Flate image — exactly the shape the lossy path targets
+        // — must come back byte-identical...
+        let pdf = build_photo_flate_under_res();
+        let out = optimize(&pdf);
+        assert_eq!(
+            out, pdf,
+            "without allow_lossy_reencode the Flate payload must be untouched"
+        );
+
+        // ...and an over-resolution one must stay a FlateDecode stream (the
+        // lossless downsample may fire; the encoding class must not change).
+        let over = build_pdf_flate_raw(&photo_pixels(400, 400, 3), 400, 100, 3);
+        let out = optimize(&over);
+        let (filter, _) = image_filter_info(&out);
+        assert_eq!(
+            filter, b"FlateDecode",
+            "without consent the encoding class must never change"
+        );
+    }
+
+    #[test]
+    fn lossy_reencode_converts_photographic_flate() {
+        // Flag on, under-resolution photographic image: the payload converts
+        // to a strictly smaller DCTDecode stream at UNCHANGED geometry, the
+        // stale /DecodeParms is gone, the JPEG decodes back to nearby pixels,
+        // and a second optimize call is byte-stable (requant guards see a
+        // fresh q78 payload and decline the <5% churn).
+        let pdf = build_photo_flate_under_res();
+        let opts = OptimizeOptions::default().with_allow_lossy_reencode(true);
+        let out = optimize_with_options(&pdf, opts);
+        assert!(out.len() < pdf.len(), "conversion must shrink the file");
+
+        let (filter, has_parms) = image_filter_info(&out);
+        assert_eq!(filter, b"DCTDecode", "payload must now be a JPEG");
+        assert!(!has_parms, "Flate /DecodeParms must be dropped");
+        assert_eq!(image_dims(&out), (200, 200), "geometry must be unchanged");
+
+        let jpeg = image_stream_bytes(&out);
+        let decoded = image::load_from_memory_with_format(&jpeg, ImageFormat::Jpeg)
+            .expect("converted payload must decode as a JPEG");
+        assert_eq!((decoded.width(), decoded.height()), (200, 200));
+        let actual = decoded.to_rgb8().into_raw();
+        let reference = photo_pixels(200, 200, 3);
+        let sad: u64 = reference
+            .iter()
+            .zip(&actual)
+            .map(|(a, b)| u64::from(a.abs_diff(*b)))
+            .sum();
+        let mad = sad as f64 / reference.len() as f64;
+        assert!(
+            mad <= 24.0,
+            "decode-back must reproduce nearby pixels (MAD {mad:.1})"
+        );
+
+        let twice = optimize_with_options(&out, opts);
+        assert_eq!(twice, out, "second pass must be byte-stable");
+    }
+
+    #[test]
+    fn lossy_reencode_over_resolution_jpeg_candidate_competes() {
+        // Flag on, over-resolution photographic image (400 px into 100 pt ≈
+        // 288 DPI): the JPEG candidate at the SAME target geometry as the
+        // lossless downsample wins on noisy content, and beats the flag-off
+        // output.
+        let pdf = build_pdf_flate_raw(&photo_pixels(400, 400, 3), 400, 100, 3);
+        let flag_off = optimize(&pdf);
+        let opts = OptimizeOptions::default().with_allow_lossy_reencode(true);
+        let flag_on = optimize_with_options(&pdf, opts);
+
+        let (filter, has_parms) = image_filter_info(&flag_on);
+        assert_eq!(filter, b"DCTDecode", "JPEG candidate must win on a photo");
+        assert!(!has_parms);
+        let (w, h) = image_dims(&flag_on);
+        assert!(
+            (150..=210).contains(&w) && w == h,
+            "must land at the downsample's target geometry, got {w}x{h}"
+        );
+        assert!(
+            flag_on.len() < flag_off.len(),
+            "lossy candidate must beat the lossless downsample ({} !< {})",
+            flag_on.len(),
+            flag_off.len()
+        );
+    }
+
+    #[test]
+    fn lossy_reencode_line_art_never_larger() {
+        // Sharp-edged flat-color content: deflate is near-optimal, the JPEG
+        // candidate cannot save 5% — the guard declines and the file comes
+        // back byte-identical (never-larger holds trivially).
+        let pdf = build_pdf_flate_raw(&checkerboard_pixels(200, 8, 3), 200, 200, 3);
+        let opts = OptimizeOptions::default().with_allow_lossy_reencode(true);
+        let out = optimize_with_options(&pdf, opts);
+        assert!(out.len() <= pdf.len(), "never-larger must hold");
+        assert_eq!(
+            out, pdf,
+            "line art must decline conversion (5% guard / strict-smaller)"
+        );
+
+        // Over-resolution line art: whatever happens (lossless downsample or
+        // nothing), the encoding class must not flip to JPEG — the Flate
+        // candidate is smaller on this content.
+        let over = build_pdf_flate_raw(&checkerboard_pixels(400, 8, 3), 400, 100, 3);
+        let out = optimize_with_options(&over, opts);
+        let (filter, _) = image_filter_info(&out);
+        assert_eq!(
+            filter, b"FlateDecode",
+            "line art must keep its lossless encoding even with consent"
+        );
+    }
+
+    #[test]
+    fn lossy_reencode_skips_ineligible_color_shapes() {
+        // Indexed, 16-bit, and CMYK Flate images are outside the conversion's
+        // vetted scope: byte-identical output even with the flag on. All are
+        // under-resolution (120 px into 100 pt ≈ 86 DPI) so the lossy requant
+        // branch — not the downsample — is what gets exercised.
+        let indexed = build_pdf_flate_raw(&photo_pixels(120, 120, 3), 120, 100, 3);
+        let mut doc = Document::load_mem(&indexed).unwrap();
+        for obj in doc.objects.values_mut() {
+            if let Object::Stream(s) = obj {
+                if matches!(s.dict.get(b"Subtype"), Ok(Object::Name(n)) if n == b"Image") {
+                    s.dict.set(
+                        "ColorSpace",
+                        vec![
+                            Object::Name(b"Indexed".to_vec()),
+                            Object::Name(b"DeviceRGB".to_vec()),
+                            Object::Integer(255),
+                            Object::String(vec![0u8; 768], lopdf::StringFormat::Hexadecimal),
+                        ],
+                    );
+                }
+            }
+        }
+        let mut indexed_pdf: Vec<u8> = Vec::new();
+        doc.save_to(&mut indexed_pdf).unwrap();
+
+        let mut sixteen_doc = Document::load_mem(&indexed).unwrap();
+        for obj in sixteen_doc.objects.values_mut() {
+            if let Object::Stream(s) = obj {
+                if matches!(s.dict.get(b"Subtype"), Ok(Object::Name(n)) if n == b"Image") {
+                    s.dict.set("BitsPerComponent", 16_i64);
+                }
+            }
+        }
+        let mut sixteen_pdf: Vec<u8> = Vec::new();
+        sixteen_doc.save_to(&mut sixteen_pdf).unwrap();
+
+        let mut cmyk_doc = Document::load_mem(&indexed).unwrap();
+        for obj in cmyk_doc.objects.values_mut() {
+            if let Object::Stream(s) = obj {
+                if matches!(s.dict.get(b"Subtype"), Ok(Object::Name(n)) if n == b"Image") {
+                    s.dict
+                        .set("ColorSpace", Object::Name(b"DeviceCMYK".to_vec()));
+                }
+            }
+        }
+        let mut cmyk_pdf: Vec<u8> = Vec::new();
+        cmyk_doc.save_to(&mut cmyk_pdf).unwrap();
+
+        let opts = OptimizeOptions::default().with_allow_lossy_reencode(true);
+        for (label, pdf) in [
+            ("Indexed", indexed_pdf),
+            ("16-bit", sixteen_pdf),
+            ("DeviceCMYK", cmyk_pdf),
+        ] {
+            let out = optimize_with_options(&pdf, opts);
+            assert_eq!(out, pdf, "{label}: must never convert, even with consent");
+        }
+    }
+
+    #[test]
+    fn lossy_reencode_corrupt_flate_returns_exact_original_bytes() {
+        // Degradation contract with the flag ON: a truncated zlib payload
+        // must yield the EXACT original bytes, never a partial rewrite.
+        let pdf = build_photo_flate_under_res();
+        let mut doc = Document::load_mem(&pdf).unwrap();
+        for obj in doc.objects.values_mut() {
+            if let Object::Stream(s) = obj {
+                if matches!(s.dict.get(b"Subtype"), Ok(Object::Name(n)) if n == b"Image") {
+                    let half = s.content.len() / 2;
+                    let truncated = s.content[..half].to_vec();
+                    s.set_content(truncated);
+                }
+            }
+        }
+        let mut corrupt: Vec<u8> = Vec::new();
+        doc.save_to(&mut corrupt).unwrap();
+
+        let opts = OptimizeOptions::default().with_allow_lossy_reencode(true);
+        let out = optimize_with_options(&corrupt, opts);
+        assert_eq!(
+            out, corrupt,
+            "corrupt input must return exact original bytes"
+        );
+    }
+
+    #[test]
+    fn requant_declines_payload_already_at_target_quality() {
+        // Exact idempotence guard (Phase 7): a JPEG that mozjpeg itself
+        // encoded at the configured quality carries byte-identical
+        // quantization tables to the requant candidate — re-encoding it is
+        // pure generation-loss churn even when trellis could still shave ≥5%
+        // (graphics-heavy content, the NASA banner repro). Must be declined
+        // outright, leaving the file byte-identical.
+        let raw = checkerboard_pixels(300, 8, 3);
+        let img = DynamicImage::ImageRgb8(image::RgbImage::from_raw(300, 300, raw).unwrap());
+        let jpeg = encode_jpeg(img, false, 78).unwrap();
+        let mut doc = Document::with_version("1.5");
+        let img_id = doc.add_object(Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Image",
+                "Width" => 300_i64,
+                "Height" => 300_i64,
+                "ColorSpace" => "DeviceRGB",
+                "BitsPerComponent" => 8_i64,
+                "Filter" => "DCTDecode",
+            },
+            jpeg,
+        ));
+        // 300 px into 300 pt ⇒ 72 DPI, under-threshold: the P-M2 requant is
+        // the branch that would otherwise fire.
+        let pdf = wrap_image_pdf(&mut doc, img_id, 300);
+        let out = optimize(&pdf);
+        assert_eq!(
+            out, pdf,
+            "a payload already at the target quality must never be requantized"
+        );
+    }
+
+    #[test]
+    fn lossy_reencode_masked_flate_base_is_excluded() {
+        // Spike scope line: a Flate base carrying an /SMask is NOT converted
+        // (coupled lossy conversion needs its own mask-alignment analysis).
+        // Under-resolution masked pair + flag on ⇒ byte-identical output.
+        let px = 200u32;
+        let mut doc = Document::with_version("1.5");
+        let mask_id = doc.add_object(Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Image",
+                "Width" => px as i64,
+                "Height" => px as i64,
+                "ColorSpace" => "DeviceGray",
+                "BitsPerComponent" => 8_i64,
+                "Filter" => "FlateDecode",
+            },
+            deflate_level9(&photo_pixels(px, px, 1)).unwrap(),
+        ));
+        let img_id = doc.add_object(Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Image",
+                "Width" => px as i64,
+                "Height" => px as i64,
+                "ColorSpace" => "DeviceRGB",
+                "BitsPerComponent" => 8_i64,
+                "Filter" => "FlateDecode",
+                "SMask" => mask_id,
+            },
+            deflate_level9(&photo_pixels(px, px, 3)).unwrap(),
+        ));
+        let pdf = wrap_image_pdf(&mut doc, img_id, 200);
+
+        let opts = OptimizeOptions::default().with_allow_lossy_reencode(true);
+        let out = optimize_with_options(&pdf, opts);
+        assert_eq!(
+            out, pdf,
+            "masked Flate bases are out of the spike's scope — untouched"
+        );
+    }
+
     #[test]
     fn pack_object_streams_produces_loadable_output() {
         // With packing on, the output must still be a valid, loadable PDF whose
@@ -2923,6 +3514,10 @@ mod tests {
             !d.recompress_bitonal_images,
             "bitonal G4 recompression is opt-in (B-M1)"
         );
+        assert!(
+            !d.allow_lossy_reencode,
+            "lossy Flate→JPEG re-encode is consent-gated (Phase 7 spike)"
+        );
     }
 
     #[test]
@@ -2935,7 +3530,8 @@ mod tests {
             .with_pack_object_streams(true)
             .with_downsample_flate_images(false)
             .with_subset_fonts(true)
-            .with_recompress_bitonal_images(true);
+            .with_recompress_bitonal_images(true)
+            .with_allow_lossy_reencode(true);
         assert_eq!(o.target_dpi, 96.0);
         assert_eq!(o.jpeg_quality, 60);
         assert_eq!(o.dpi_margin, 1.5);
@@ -2944,6 +3540,7 @@ mod tests {
         assert!(!o.downsample_flate_images);
         assert!(o.subset_fonts);
         assert!(o.recompress_bitonal_images);
+        assert!(o.allow_lossy_reencode);
     }
 
     #[test]

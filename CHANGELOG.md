@@ -10,6 +10,24 @@ and this project adheres to
 
 ### Added
 
+- **Consent-gated lossy Flate→JPEG re-encode (Phase 7 spike) — SHIPPED BEHIND
+  A DEFAULT-OFF FLAG, pending human review of the visual side-by-sides**
+  (`target/spike/SUMMARY.md`). New `OptimizeOptions::allow_lossy_reencode`
+  (default `false`, builder `with_allow_lossy_reencode`; CLI `--allow-lossy` /
+  `--no-allow-lossy`): when — and only when — enabled, unmasked 8-bit
+  DeviceGray/DeviceRGB/ICCBased(N=1/3) FlateDecode images may change encoding
+  class to `/DCTDecode`. Over-resolution images get a JPEG candidate at the
+  same target geometry as the format-preserving downsample and the smaller
+  payload wins; at/below-threshold images are re-encoded at their own
+  geometry, replaced only on ≥5% savings plus decode-back verification (the
+  D-M1 MAD ceiling). Dict updates go through a new `DictUpdate::FlateToJpeg`
+  (scalar `/Filter /DCTDecode`, stale `/DecodeParms` dropped; `/ColorSpace`
+  and `/BitsPerComponent` already match — channel count is preserved).
+  Indexed/CMYK/non-8-bit images and `/SMask`-carrying bases are never
+  converted; corrupt payloads return exact original bytes. Measured (q78):
+  NASA 4,958,148 → 4,380,087 B (gap to Ghostscript 1.33× → 1.18×), fixture
+  sample 116,752 → 32,593 B; byte-stable on repeat passes.
+
 - **Requantization reach extensions (Phase 6).** Two classes of
   scanner-quality JPEG the Phase 5 pipeline never reached now take the
   dimension-preserving requantization: masked images whose `/SMask` is shared
@@ -21,6 +39,18 @@ and this project adheres to
   decode-back verification, untouched mask streams, byte-stable repeat passes.
   Reference corpus: 5.55 MB → 4.96 MB (70.5% reduction from the original
   16.8 MB).
+
+### Fixed
+
+- **Requantization is now exactly idempotent.** `plan_dct_requant` declines a
+  candidate whose JPEG quantization tables are byte-identical to the
+  source's: same tables mean the payload is already at the configured
+  quality, so a re-encode is pure generation-loss churn. The 5% rule alone
+  did not converge once the lossy spike started producing our own q78
+  payloads — mozjpeg's trellis re-shaves 5–10% per pass on graphics-heavy
+  content it encoded itself (NASA repro: second pass shrank 4,380,087 →
+  4,371,056 before the guard). Shipped D-M1/P-M2 corpus outputs are
+  unchanged.
 
 ### Changed
 

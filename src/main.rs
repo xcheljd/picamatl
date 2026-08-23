@@ -33,12 +33,13 @@ fn defaults_blurb() -> String {
         "Boolean defaults (from OptimizeOptions::default()):\n  \
          strip-accessibility {}, pack-object-streams {},\n  \
          downsample-flate-images {}, subset-fonts {},\n  \
-         recompress-bitonal-images {}",
+         recompress-bitonal-images {}, allow-lossy {}",
         on_off(d.strip_accessibility),
         on_off(d.pack_object_streams),
         on_off(d.downsample_flate_images),
         on_off(d.subset_fonts),
         on_off(d.recompress_bitonal_images),
+        on_off(d.allow_lossy_reencode),
     )
 }
 
@@ -114,6 +115,14 @@ struct Cli {
     /// Do not recompress bitonal images
     #[arg(long)]
     no_recompress_bitonal_images: bool,
+
+    /// Allow LOSSY re-encoding of lossless FlateDecode images to JPEG
+    /// (encoding-class change; strictly opt-in)
+    #[arg(long = "allow-lossy", overrides_with = "no_allow_lossy")]
+    allow_lossy: bool,
+    /// Never re-encode lossless images to JPEG
+    #[arg(long = "no-allow-lossy")]
+    no_allow_lossy: bool,
 }
 
 /// Fold a `--<flag>` / `--no-<flag>` pair down to one value. The pair
@@ -156,6 +165,11 @@ fn options_from(cli: &Cli) -> OptimizeOptions {
             cli.recompress_bitonal_images,
             cli.no_recompress_bitonal_images,
             d.recompress_bitonal_images,
+        ))
+        .with_allow_lossy_reencode(resolve(
+            cli.allow_lossy,
+            cli.no_allow_lossy,
+            d.allow_lossy_reencode,
         ))
 }
 

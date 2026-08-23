@@ -155,8 +155,11 @@ its conversion of lossless image payloads to JPEG — exactly the consent-gated
 ## Explicitly out of scope (unchanged commitments)
 
 - Symbol-mode JBIG2, perceptual quantization tricks: permanently out.
-- Default-on lossy re-encode of lossless images: separate future milestone,
-  requires its own consent surface (`allow_lossy_reencode`) and vetting spike.
+- **DEFAULT-ON** lossy re-encode of lossless images: still out. The
+  consent-gated (default-OFF) variant moved to Phase 7 below (2026-08-22
+  spike) — the "separate future milestone, requires its own consent surface
+  (`allow_lossy_reencode`) and vetting spike" reserved here is exactly what
+  Phase 7 implements; flipping any default remains out of scope.
 - PDF/A, encrypted docs: skipped as today.
 
 ## Phase 6 addendum — requantization reach extensions (2026-08-22)
@@ -185,6 +188,54 @@ Measured: amatl 5,547,684 B (D-M3) → 4,958,148 B on the reference corpus
 (70.5% of the 16,804,107 B original) vs Ghostscript's 3,722,562 B — gap now
 1.33×. Byte-stable on second pass; all 74 mask/base pairs dimensionally
 aligned; renders clean in Ghostscript.
+
+## Phase 7 — consent-gated lossy re-encode (SPIKE, 2026-08-22)
+
+Status: implemented behind a DEFAULT-OFF flag; **final ship decision pends
+human review of the visual side-by-sides** in `target/spike/SUMMARY.md`.
+Nothing converts without explicit consent.
+
+Design:
+
+- Consent surface: `OptimizeOptions::allow_lossy_reencode` (default `false`,
+  builder `with_allow_lossy_reencode`), CLI `--allow-lossy`/`--no-allow-lossy`.
+- Scope: UNMASKED FlateDecode images that pass the exact D-M3 decode gates
+  (`decode_flate_image`, factored out of `plan_flate`): 8 bpc only, no
+  `/Decode`, DeviceGray/DeviceRGB/ICCBased(N=1/3), decodable predictor
+  layout, bomb cap + exact-length check. Indexed, CMYK, and 16-bit never
+  convert. Masked (`/SMask`) Flate bases are EXCLUDED — coupled lossy
+  conversion needs its own mask-alignment analysis (future work; scope line
+  pinned by `lossy_reencode_masked_flate_base_is_excluded`).
+- Over-resolution: a JPEG candidate at the SAME target geometry competes with
+  the format-preserving Flate downsample; the smaller payload wins under the
+  existing never-larger guard (`plan_flate_to_jpeg`). With
+  `downsample_flate_images` off, geometry is off-limits but the encoding
+  class may still change in place (dimension-preserving re-encode).
+- Under-threshold: dimension-preserving Flate→JPEG at `jpeg_quality`,
+  replaced only on ≥5% savings AND a decode-back MAD verification (the D-M1
+  ceiling) — `plan_flate_lossy_requant_replacement`.
+- Dict update: new `DictUpdate::FlateToJpeg` (scalar `/Filter /DCTDecode`,
+  stale `/DecodeParms` dropped; `/ColorSpace`/`/BitsPerComponent` untouched —
+  channel count is preserved so they already describe the JPEG).
+- Idempotence finding: the assumed "5% rule ⇒ byte-stable pass 2" was FALSE —
+  mozjpeg trellis re-shaves 5-10%/pass on graphics-heavy JPEGs it encoded
+  itself. Fixed exactly: `plan_dct_requant` declines candidates whose DQT
+  quantization tables are byte-identical to the source's
+  (`jpeg_quant_tables`). Hardens shipped D-M1/P-M2 too; corpus outputs
+  unchanged.
+
+Measurements (q78 unless noted): NASA 16,804,107 → flag-off 4,958,148 →
+flag-on 4,380,087 B (gap to Ghostscript's 3,722,562 B narrows 1.33× → 1.18×);
+q85 4,772,830 B. Fixture sample 116,752 → 32,593 B. 19/122 NASA Flate streams
+converted (807 KB → 230 KB); byte-stable second passes; gs-clean rendering.
+Corpus gaps: the talaria sample and watch-repair one-pagers were unreachable
+from this session (sandbox), not skipped by choice.
+
+Review flags from the side-by-sides (candidate no-ships): thin line art
+(p12 profiles) picks up JPEG mottling; the p7 banner class compounds loss by
+enabling a downsample the lossless path had declined; p39/p40 PSD surfaces
+lose mesh detail at q78 (q85 markedly better). Photographic/CFD raster
+content converts cleanly.
 
 ## Gates (every milestone)
 

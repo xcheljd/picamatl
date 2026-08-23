@@ -51,3 +51,6 @@ path = "src/main.rs"
 # outline + advance equality between the original and subset font programs.
 # Never a runtime dependency.
 ttf-parser = "0.25.1"
+# PNG support for the Phase 7 spike tooling (examples/spike_*.rs) only; the
+# library itself keeps its jpeg-only image build.
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
