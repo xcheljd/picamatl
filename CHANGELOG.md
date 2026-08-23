@@ -6,7 +6,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.3.1] - 2026-08-22
 
 Three lossless serialization wins from the compression investigation. No pixel
 is resampled, no encoding class moves, and no consent flag is involved. On the

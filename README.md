@@ -164,40 +164,49 @@ settings — 130 DPI, 1.15 threshold, DCTEncode QFactor 0.4):
 
 On a public real-world document —
 [NASA TM-20210010291](https://ntrs.nasa.gov/citations/20210010291), a 16.8 MB
-58-page technical report — amatl 0.3.0 (strip, no packing) takes 16,804,107
-bytes to **4,958,148 bytes, a 70.5% reduction**, byte-stable under repeated
-optimization. Ghostscript 10.07.1 (`/ebook` with
-`-dDetectDuplicateImages=true`) takes the same file to 3,722,562 bytes —
-a gap amatl closes further with the opt-in `--allow-lossy` flag (below).
+58-page technical report — amatl 0.3.1 at defaults takes 16,804,107 bytes to
+**4,655,752 bytes, a 72.3% reduction**, byte-stable under repeated
+optimization. Ghostscript 10.07.1 at the same *matched-intent* settings
+(`/ebook`, which keeps lossless images lossless) produces 4,931,425 bytes —
+amatl is **5.6% smaller** and keeps the accessibility structure tree that GS
+silently strips. Only when Ghostscript is pushed to aggressive lossy settings
+(forced 130-DPI downsampling + `DCTEncode`) does it go smaller; amatl closes
+most of that gap with the opt-in `--allow-lossy` flag (below) without ever
+re-encoding without consent.
 
 ### NASA TM-20210010291 — flag comparison
 
 | Pipeline | Bytes | % of input | Notes |
 | --- | ---: | ---: | --- |
 | input | 16,804,107 | 100% | 58-page technical report |
-| Ghostscript `/ebook` | 3,722,562 | 22% | strips accessibility structure; AGPL |
-| **amatl defaults** (lossless-only) | **4,958,148** | **29.5%** | every image class handled; no encoding-class changes |
-| amatl `--allow-lossy` q78 | 4,457,789 | 26.5% | + explicit consent: Flate photos → JPEG, line art auto-declined |
+| Ghostscript `/ebook` (matched intent) | 4,931,425 | 29.3% | keeps lossless images lossless; strips accessibility; AGPL |
+| **amatl defaults** (lossless-only) | **4,655,752** | **27.7%** | every image class handled; no encoding-class changes |
+| amatl `--allow-lossy` q78 | 4,155,393 | 24.7% | + explicit consent: Flate photos → JPEG, line art auto-declined |
+| Ghostscript forced 130 DPI + DCT (aggressive) | 3,054,642 | 18.2% | re-encodes *all* imagery incl. line art; strips accessibility; AGPL |
 
 What each level buys:
 
 - **Defaults (no flags):** transparency-masked JPEG requantization and coupled
   downsampling (D-M1/D-M2), masked and unmasked Flate coupled downsampling
-  (D-M3), shared-mask and under-threshold requantization (Phase 6). Every
-  image keeps its encoding class; lossless images stay lossless; soft masks
-  are never resized when another image shares them.
+  (D-M3), shared-mask and under-threshold requantization (Phase 6), then a
+  serialization pass — object-stream packing (PDF 1.5), a final zlib-9
+  re-deflate of every Flate stream, and a compressed cross-reference stream.
+  Every image keeps its encoding class; lossless images stay lossless; soft
+  masks are never resized when another image shares them.
 - **`--allow-lossy`:** additionally re-encodes *unmasked photographic-looking*
   FlateDecode images as JPEG at the configured quality. A built-in content
   heuristic declines line-art-like images (thin lines pick up visible JPEG
   mottling for marginal savings) and the flag never changes geometry the
   lossless path declined to change — one consent covers re-encoding only.
-  Measured effect on this corpus: −10.1% over defaults, with converted streams
+  Measured effect on this corpus: −10.7% over defaults, with converted streams
   visually indistinguishable at review zoom.
 
-For calibration: the remaining distance to Ghostscript on this corpus is its
-aggressive conversion of *all* lossless imagery (including line art), font
-rewriting, and structural stripping of the accessibility tree — trades amatl
-declines by contract even under `--allow-lossy`.
+For calibration: at matched intent (lossless in, lossless out) amatl now
+*beats* Ghostscript on this corpus while preserving the accessibility tree.
+The remaining distance appears only at Ghostscript's most aggressive settings,
+which re-encode all lossless imagery (including line art), rewrite fonts, and
+strip the structure tree — trades amatl declines by contract even under
+`--allow-lossy`.
 
 On a real-world retail promotion flyer (1,376 KB, image-heavy, ~2,000
 structure-tree objects) — **from a private corpus, not redistributable**:
@@ -208,9 +217,10 @@ structure-tree objects) — **from a private corpus, not redistributable**:
 | amatl, strip + pack | 572 KB | 59% | clean | stripped |
 | Ghostscript 130 DPI / QFactor 0.4 | 530 KB | 62% | clean | stripped |
 
-Amatl deliberately ties Ghostscript on image payload (within ~0.01% — the
-images are the ~80% of bytes that matter) rather than chasing the last few
-points, which come from structural micro-optimizations like font rewriting.
+Amatl matches or beats Ghostscript on image payload at matched intent (on
+NASA defaults it is 5.6% smaller overall) rather than chasing the last few
+points of its most aggressive settings, which come from re-encoding *all*
+lossless imagery — including line art — and stripping the accessibility tree.
 The differentiators are the CTM-aware placement analysis, the fail-safe
 contract, and the license.
 
