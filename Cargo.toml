@@ -31,6 +31,13 @@ mozjpeg = "0.10"
 flate2 = { version = "1", features = ["zlib-rs"] }
 # Parallel image work. Pure Rust, MIT OR Apache-2.0, no native deps.
 rayon = "1"
+# Opt-in exhaustive deflate for the final re-deflate + xref passes
+# (--deflate-backend zopfli). Pure Rust, Apache-2.0, rust-version 1.73.
+# Measured on the NASA reference: −142 KB over zlib-rs level 9 at ~30× the
+# CPU (still a one-digit-seconds run); the strictly-smaller + inflate-back
+# guard applies unchanged, so the swap is risk-free. gzip feature off — only
+# the zlib container is ever emitted.
+zopfli = { version = "0.8", default-features = false, features = ["std", "zlib"] }
 # Font subsetting (typst org; MIT OR Apache-2.0, rust-version 1.85). With
 # default-features = false the entire transitive footprint is one crate
 # (rustc-hash); the `variable-fonts` feature (skrifa & co.) is deliberately

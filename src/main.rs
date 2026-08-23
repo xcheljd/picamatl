@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Instant;
 
-use amatl::OptimizeOptions;
+use amatl::{DeflateBackend, OptimizeOptions};
 use clap::Parser;
 
 /// How far into the file to look for `%PDF-`. The PDF spec's implementation
@@ -124,6 +124,28 @@ struct Cli {
     /// Never re-encode lossless images to JPEG
     #[arg(long = "no-allow-lossy")]
     no_allow_lossy: bool,
+
+    /// Deflate backend for the final re-deflate and xref-stream passes:
+    /// zopfli is ~30x the CPU for a few percent smaller output
+    #[arg(long, value_enum, value_name = "BACKEND")]
+    deflate_backend: Option<DeflateBackendArg>,
+}
+
+/// CLI mirror of [`amatl::DeflateBackend`] so the library type stays free of
+/// clap derives. `None` (flag absent) keeps the library default.
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum DeflateBackendArg {
+    Zlib,
+    Zopfli,
+}
+
+impl From<DeflateBackendArg> for DeflateBackend {
+    fn from(arg: DeflateBackendArg) -> Self {
+        match arg {
+            DeflateBackendArg::Zlib => DeflateBackend::Zlib,
+            DeflateBackendArg::Zopfli => DeflateBackend::Zopfli,
+        }
+    }
 }
 
 /// Fold a `--<flag>` / `--no-<flag>` pair down to one value. The pair
@@ -172,6 +194,11 @@ fn options_from(cli: &Cli) -> OptimizeOptions {
             cli.no_allow_lossy,
             d.allow_lossy_reencode,
         ))
+        .with_deflate_backend(
+            cli.deflate_backend
+                .map(DeflateBackend::from)
+                .unwrap_or(d.deflate_backend),
+        )
 }
 
 fn run(cli: &Cli) -> Result<(), String> {

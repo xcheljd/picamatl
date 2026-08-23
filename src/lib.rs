@@ -197,6 +197,30 @@ pub struct OptimizeOptions {
     /// misregistration, only the JPEG quantization this flag consents to).
     /// Default: `false`.
     pub allow_lossy_reencode: bool,
+
+    /// Deflate implementation for the final serialization passes: the
+    /// whole-document re-deflate (`redeflate_flate_streams`) and the
+    /// cross-reference stream. [`DeflateBackend::Zopfli`] spends ~30× the CPU
+    /// of zlib level 9 searching for a smaller deflate encoding of the SAME
+    /// bytes (measured −142 KB / 3.2% of output on the NASA reference); the
+    /// strictly-smaller + inflate-back guard applies to both backends, so the
+    /// choice affects size and speed only, never correctness. Earlier
+    /// planning passes (image re-deflate, font streams) stay on zlib either
+    /// way — the final pass revisits their output. Default:
+    /// [`DeflateBackend::Zlib`].
+    pub deflate_backend: DeflateBackend,
+}
+
+/// Which deflate implementation the final re-deflate and xref-stream passes
+/// use. See [`OptimizeOptions::deflate_backend`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DeflateBackend {
+    /// zlib level 9 via `flate2`'s zlib-rs backend — fast, the default.
+    #[default]
+    Zlib,
+    /// Exhaustive-search deflate (pure-Rust `zopfli` crate) — smallest
+    /// output, ~30× the CPU. Opt-in for callers who value bytes over speed.
+    Zopfli,
 }
 
 /// Written by hand, NOT derived: a derived `Default` would zero the numeric
@@ -215,6 +239,7 @@ impl Default for OptimizeOptions {
             subset_fonts: true,
             recompress_bitonal_images: false,
             allow_lossy_reencode: false,
+            deflate_backend: DeflateBackend::Zlib,
         }
     }
 }
@@ -288,6 +313,14 @@ impl OptimizeOptions {
     #[must_use]
     pub fn with_allow_lossy_reencode(mut self, allow: bool) -> Self {
         self.allow_lossy_reencode = allow;
+        self
+    }
+
+    /// Choose the deflate backend for the final re-deflate and xref-stream
+    /// passes (zlib by default). See [`OptimizeOptions::deflate_backend`].
+    #[must_use]
+    pub fn with_deflate_backend(mut self, backend: DeflateBackend) -> Self {
+        self.deflate_backend = backend;
         self
     }
 }
@@ -1961,6 +1994,31 @@ fn deflate_level9(data: &[u8]) -> Option<Vec<u8>> {
     enc.finish().ok()
 }
 
+/// Deflate with the exhaustive zopfli search (default 15 iterations). Same
+/// zlib container as [`deflate_level9`] — any inflate reads it — just a more
+/// expensive hunt for a smaller encoding.
+fn deflate_zopfli(data: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    zopfli::compress(
+        zopfli::Options::default(),
+        zopfli::Format::Zlib,
+        data,
+        &mut out,
+    )
+    .ok()?;
+    Some(out)
+}
+
+/// Dispatch to the configured deflate backend (final-pass call sites only —
+/// planning-time deflates always use [`deflate_level9`] for speed, and the
+/// final pass revisits their output anyway).
+fn deflate_backend(data: &[u8], backend: DeflateBackend) -> Option<Vec<u8>> {
+    match backend {
+        DeflateBackend::Zlib => deflate_level9(data),
+        DeflateBackend::Zopfli => deflate_zopfli(data),
+    }
+}
+
 /// Encode an image as JPEG using mozjpeg (optimized Huffman + trellis), which
 /// produces substantially smaller files than the basic encoder at equal
 /// quality. Channel count is preserved to match the unchanged PDF /ColorSpace.
@@ -2417,11 +2475,12 @@ fn try_optimize(input: &[u8], options: OptimizeOptions) -> Result<Option<Vec<u8>
     doc.prune_objects();
     doc.compress();
 
-    // Last planning-free pass: re-deflate every already-Flate stream at level 9.
+    // Last planning-free pass: re-deflate every already-Flate stream with the
+    // configured backend (zlib level 9, or zopfli when opted in).
     // Runs after EVERY other decision (images, fonts, bitonal, lossy, dedup,
     // prune, compress) so it is purely a serialization improvement and can
     // never influence, or be influenced by, what the planners chose.
-    redeflate_flate_streams(&mut doc);
+    redeflate_flate_streams(&mut doc, options.deflate_backend);
 
     // Renumber to a contiguous id space so the saved trailer /Size matches the
     // highest object number. Without this, lopdf 0.41's classic save emits a
@@ -2456,7 +2515,7 @@ const MAX_REDEFLATE_BYTES: usize = 128 * 1024 * 1024;
 /// Declined wholesale for encrypted documents (stream bytes are ciphertext),
 /// PDF/A-declared documents, and signed documents — a signature's byte range
 /// covers offsets this pass would move.
-fn redeflate_flate_streams(doc: &mut Document) {
+fn redeflate_flate_streams(doc: &mut Document, backend: DeflateBackend) {
     if doc.is_encrypted() || fonts::pdfa_blocked(doc) || signature_present(doc) {
         return;
     }
@@ -2487,7 +2546,7 @@ fn redeflate_flate_streams(doc: &mut Document) {
 
     let shrunk: Vec<(ObjectId, Vec<u8>)> = candidates
         .into_par_iter()
-        .filter_map(|(id, content)| replan_deflate(&content).map(|out| (id, out)))
+        .filter_map(|(id, content)| replan_deflate(&content, backend).map(|out| (id, out)))
         .collect();
 
     for (id, content) in shrunk {
@@ -2500,9 +2559,9 @@ fn redeflate_flate_streams(doc: &mut Document) {
 /// Inflate and re-deflate one Flate payload. `None` (leave the stream exactly
 /// as it is) unless the new payload is strictly smaller AND inflates back
 /// byte-identically — deflate is lossless, so that equality must be exact.
-fn replan_deflate(content: &[u8]) -> Option<Vec<u8>> {
+fn replan_deflate(content: &[u8], backend: DeflateBackend) -> Option<Vec<u8>> {
     let plain = inflate_capped(content, MAX_REDEFLATE_BYTES)?;
-    let out = deflate_level9(&plain)?;
+    let out = deflate_backend(&plain, backend)?;
     if out.len() >= content.len() {
         return None;
     }
@@ -2549,7 +2608,7 @@ fn save_document(doc: &mut Document, options: OptimizeOptions) -> Result<Vec<u8>
         out
     };
     // Both save paths emit an uncompressed cross-reference stream; deflate it.
-    Ok(compress_xref_stream(out))
+    Ok(compress_xref_stream(out, options.deflate_backend))
 }
 
 /// Deflate the cross-reference stream of a just-serialized document.
@@ -2573,14 +2632,14 @@ fn save_document(doc: &mut Document, options: OptimizeOptions) -> Result<Vec<u8>
 /// `endstream`, and a full inflate-back of the new payload). Any mismatch —
 /// including a classic cross-reference *table*, which has nothing to compress —
 /// returns the input unchanged.
-fn compress_xref_stream(out: Vec<u8>) -> Vec<u8> {
-    match try_compress_xref_stream(&out) {
+fn compress_xref_stream(out: Vec<u8>, backend: DeflateBackend) -> Vec<u8> {
+    match try_compress_xref_stream(&out, backend) {
         Some(patched) => patched,
         None => out,
     }
 }
 
-fn try_compress_xref_stream(out: &[u8]) -> Option<Vec<u8>> {
+fn try_compress_xref_stream(out: &[u8], backend: DeflateBackend) -> Option<Vec<u8>> {
     // `\nstartxref\n<offset>\n%%EOF` is the last thing the writer emits.
     let sx = out.windows(9).rposition(|w| w == b"startxref")?;
     let mut p = sx + 9;
@@ -2645,7 +2704,7 @@ fn try_compress_xref_stream(out: &[u8]) -> Option<Vec<u8>> {
         return None;
     }
 
-    let deflated = deflate_level9(content)?;
+    let deflated = deflate_backend(content, backend)?;
     if deflated.len() >= content.len() {
         return None; // never-larger, per the crate contract
     }
@@ -4221,7 +4280,7 @@ mod tests {
         let pdf = build_pdf_duplicate_images(6, 400);
         let out = optimize_with_options(&pdf, OptimizeOptions::default());
         assert_eq!(
-            compress_xref_stream(out.clone()),
+            compress_xref_stream(out.clone(), DeflateBackend::Zlib),
             out,
             "an already-deflated xref stream must be left alone"
         );
@@ -4232,7 +4291,7 @@ mod tests {
             out[..out.len() / 2].to_vec(),
         ] {
             assert_eq!(
-                compress_xref_stream(junk.clone()),
+                compress_xref_stream(junk.clone(), DeflateBackend::Zlib),
                 junk,
                 "malformed input must pass through untouched"
             );
@@ -4279,7 +4338,7 @@ mod tests {
         let before_len = image_stream_len(&pdf);
 
         let mut doc = Document::load_mem(&pdf).unwrap();
-        redeflate_flate_streams(&mut doc);
+        redeflate_flate_streams(&mut doc, DeflateBackend::Zlib);
         let mut out: Vec<u8> = Vec::new();
         doc.save_to(&mut out).unwrap();
 
@@ -4348,12 +4407,59 @@ mod tests {
                     continue;
                 }
                 assert!(
-                    replan_deflate(&s.content).is_none(),
+                    replan_deflate(&s.content, DeflateBackend::Zlib).is_none(),
                     "a shipped stream still had slack: {} bytes",
                     s.content.len()
                 );
             }
         }
+    }
+
+    /// The zopfli backend must honor the same contract as zlib: never larger
+    /// than what zlib ships, decoded samples byte-identical, and a second
+    /// zopfli pass byte-stable (zopfli is deterministic, so re-deflating its
+    /// own output fails the strictly-smaller test and changes nothing).
+    #[test]
+    fn zopfli_backend_is_smaller_lossless_and_idempotent() {
+        let pdf = build_pdf_weakly_deflated(120, 120);
+        let before_pixels = flate_image_pixels(&pdf);
+
+        let mut doc = Document::load_mem(&pdf).unwrap();
+        redeflate_flate_streams(&mut doc, DeflateBackend::Zlib);
+        let mut zlib_out: Vec<u8> = Vec::new();
+        doc.save_to(&mut zlib_out).unwrap();
+
+        let mut doc = Document::load_mem(&pdf).unwrap();
+        redeflate_flate_streams(&mut doc, DeflateBackend::Zopfli);
+        let mut zopfli_out: Vec<u8> = Vec::new();
+        doc.save_to(&mut zopfli_out).unwrap();
+
+        assert!(
+            image_stream_len(&zopfli_out) <= image_stream_len(&zlib_out),
+            "zopfli must never lose to zlib under the strictly-smaller guard: \
+             zlib {} vs zopfli {}",
+            image_stream_len(&zlib_out),
+            image_stream_len(&zopfli_out)
+        );
+        assert_eq!(
+            flate_image_pixels(&zopfli_out),
+            before_pixels,
+            "decoded samples must be byte-identical"
+        );
+
+        // Idempotence of the PASS itself: on reload, a second zopfli run must
+        // leave every stream untouched (deterministic zopfli re-produces the
+        // same bytes, which fails the strictly-smaller test). Baseline and
+        // second pass both go through the same load+save round trip so lopdf's
+        // re-serialization cannot masquerade as a pass effect.
+        let mut doc = Document::load_mem(&zopfli_out).unwrap();
+        let mut reloaded: Vec<u8> = Vec::new();
+        doc.save_to(&mut reloaded).unwrap();
+        let mut doc = Document::load_mem(&zopfli_out).unwrap();
+        redeflate_flate_streams(&mut doc, DeflateBackend::Zopfli);
+        let mut twice: Vec<u8> = Vec::new();
+        doc.save_to(&mut twice).unwrap();
+        assert_eq!(reloaded, twice, "a second zopfli pass must change nothing");
     }
 
     /// A PDF/A conformance claim disables the pass wholesale (same posture as
@@ -4383,9 +4489,12 @@ mod tests {
             let mut marked: Vec<u8> = Vec::new();
             doc.save_to(&mut marked).unwrap();
 
-            redeflate_flate_streams(&mut Document::load_mem(&marked).unwrap());
+            redeflate_flate_streams(
+                &mut Document::load_mem(&marked).unwrap(),
+                DeflateBackend::Zlib,
+            );
             let mut reloaded = Document::load_mem(&marked).unwrap();
-            redeflate_flate_streams(&mut reloaded);
+            redeflate_flate_streams(&mut reloaded, DeflateBackend::Zlib);
             let after = reloaded
                 .objects
                 .values()
@@ -4706,6 +4815,11 @@ mod tests {
         assert!(
             !d.allow_lossy_reencode,
             "lossy Flate→JPEG re-encode is consent-gated (Phase 7 spike)"
+        );
+        assert_eq!(
+            d.deflate_backend,
+            DeflateBackend::Zlib,
+            "zopfli is opt-in: ~30× the CPU belongs behind a flag"
         );
     }
 
