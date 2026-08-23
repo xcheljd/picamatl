@@ -2381,6 +2381,81 @@ fn dedup_objects(doc: &mut Document) -> bool {
     true
 }
 
+/// Merge `FlateDecode` streams that decode to **byte-identical** payloads,
+/// even when their on-disk (compressed) bytes differ. `dedup_streams` keys on
+/// the raw stream bytes + dict, so it catches only exact restatements; this
+/// second pass catches the more common case where a producer (pdfTeX, zlib)
+/// wrote the *same* embedded font program or bitmap through independent
+/// inflate calls — the stored zlib streams and their `/Length` differ, but the
+/// decoded bytes a viewer actually consumes are identical. Down the pipeline
+/// those N copies collapse to one object, removing every duplicate's bytes.
+///
+/// Why this is lossless: the only observable effect of an embedded font or
+/// image stream is its decoded bytes. Two streams with identical decoded
+/// payloads render identically and extract identically; merging merely changes
+/// which object a reference points at. The canonical stream keeps its own
+/// decoded payload (by construction equal) and its `/Length1/2/3`/color-space
+/// properties (equal, since they are properties of the same payload), so no
+/// descriptor or content ever reads contradictory metadata.
+///
+/// Fail-safe: only scalar `FlateDecode` with no `/DecodeParms` is considered
+/// (the shape whose decode is a pure byte-for-byte inflate, so decoded
+/// equality is exactly the equivalence a viewer renders); any inflate error,
+/// oversize output, or unsupported shape is skipped. The merge is
+/// keyed on the full decoded bytes (not a hash), so a collision cannot cause a
+/// false merge.
+fn dedup_decoded_streams(doc: &mut Document) -> bool {
+    // decoded-payload -> object ids carrying it.
+    let mut buckets: HashMap<Vec<u8>, Vec<ObjectId>> = HashMap::new();
+    for (&id, obj) in doc.objects.iter() {
+        if let Object::Stream(s) = obj {
+            // DecodeParms imply a non-trivial decode (PNG/tiff predictors)
+            // whose bytes are format-specific; decoded equality would not be a
+            // clean render equivalence for those shapes, so skip them.
+            if !matches!(s.dict.get(b"DecodeParms"), Err(_) | Ok(Object::Null)) {
+                continue;
+            }
+            let filter = match s.dict.get(b"Filter") {
+                Ok(f) => f,
+                Err(_) => continue,
+            };
+            if classify_filter(doc, filter) != FilterClass::FlateOnly {
+                continue;
+            }
+            if let Some(decoded) = inflate_capped(&s.content, MAX_REDEFLATE_BYTES) {
+                buckets.entry(decoded).or_default().push(id);
+            }
+        }
+    }
+
+    // Lowest object id wins as canonical; everything else redirects to it.
+    let mut remap: HashMap<ObjectId, ObjectId> = HashMap::new();
+    for ids in buckets.values() {
+        if ids.len() < 2 {
+            continue;
+        }
+        let mut ids = ids.clone();
+        ids.sort_unstable();
+        let canonical = ids[0];
+        for dup in &ids[1..] {
+            remap.insert(*dup, canonical);
+        }
+    }
+    if remap.is_empty() {
+        return false;
+    }
+    for obj in doc.objects.values_mut() {
+        remap_references(obj, &remap);
+    }
+    for (_, val) in doc.trailer.iter_mut() {
+        remap_references(val, &remap);
+    }
+    for id in remap.keys() {
+        doc.objects.remove(id);
+    }
+    true
+}
+
 /// Merge byte-identical **stream** objects — in practice repeated images: a logo
 /// or product shot re-embedded once per page. Returns true if anything merged.
 ///
@@ -2459,6 +2534,11 @@ fn try_optimize(input: &[u8], options: OptimizeOptions) -> Result<Option<Vec<u8>
     // collection, decode/resize/re-encode, and the final write) then sees one
     // object instead of N identical ones.
     let merged_streams = dedup_streams(&mut doc);
+    // A second, decoded-payload dedup collapses embedded font programs /
+    // bitmaps that were written with differing (but decoded-identical) zlib
+    // streams — the dominant duplication on text-heavy LaTeX exports. Neither
+    // pass can undo the other's merges, so both run and both count as work.
+    let merged_decoded = dedup_decoded_streams(&mut doc);
 
     // Plan every image in parallel: each is an independent decode -> resize ->
     // re-encode against an immutable &Document, so there is no shared mutable
@@ -2507,14 +2587,16 @@ fn try_optimize(input: &[u8], options: OptimizeOptions) -> Result<Option<Vec<u8>
     // that `flate_ineligible_images_are_untouched` and friends pin; they only
     // apply to files we were already going to rewrite. Pinned by
     // `serialization_wins_do_not_rewrite_an_otherwise_unchanged_file`.
-    // `merged_streams` counts as work: dedup_streams may have collapsed repeated
-    // images even when nothing needed downsampling, and discarding that would
-    // throw away a real size win.
+    // `merged_streams` and `merged_decoded` count as work: the dedup passes
+    // may have collapsed repeated images or identical embedded font programs
+    // even when nothing needed downsampling, and discarding that would throw
+    // away a real size win.
     if replacements.is_empty()
         && font_plans.is_empty()
         && bitonal_plans.is_empty()
         && !options.strip_accessibility
         && !merged_streams
+        && !merged_decoded
         && !gray_work
     {
         return Ok(None);
