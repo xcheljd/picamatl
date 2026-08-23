@@ -28,6 +28,35 @@ and this project adheres to
   NASA 4,958,148 → 4,380,087 B (gap to Ghostscript 1.33× → 1.18×), fixture
   sample 116,752 → 32,593 B; byte-stable on repeat passes.
 
+  Post-review hardening (both defects found in the visual side-by-sides):
+
+  - **Line-art content guard.** `looks_like_line_art` declines the lossy
+    conversion for thin-line vector-style images — dominant flat background
+    ≥ 75% of pixels, top-8 quantized colors ≥ 90%, sharp-edge density ≤ 8% —
+    measured in one pass over the decoded SOURCE samples (never resized ones,
+    where resampling has already blurred what the metrics key on). The
+    5%-savings rule is no protection here: a JPEG of line art beats a mediocre
+    deflate almost every time, which is exactly how the NASA p12 plug profiles
+    (objs 59–61) acquired background mottling, muddied dash-dot lines and
+    hairline color shift. Measured on the review corpus: p12 line art
+    bg 0.909–0.930 / palette 0.946–0.956 / edges 0.061–0.065 → DECLINED;
+    CFD velocity fields (36, 46) bg 0.201/0.413 → still convert; 3D PSD
+    surfaces (248–255) bg 0.522–0.538 → still convert; synthetic noise
+    stripes bg 0.001–0.008 → still convert. The guard removes only the JPEG
+    candidate, so over-resolution line art still takes the lossless
+    downsample and lands byte-identical to the flag-off output.
+  - **No compounding losses.** When the JPEG candidate competes against the
+    format-preserving downsample, a Flate candidate that the never-larger
+    guard would decline now disqualifies the JPEG candidate too. Consent to
+    re-encode is not consent to re-litigate a resampling decision the lossless
+    path rejected — previously the NASA p7 TKE banners (objs 22–29) took both
+    losses at once (resolution + DCT) because the JPEG win hid a downsample
+    that had grown the stream. Those streams now keep their original bytes.
+
+  Post-fix measurements (q78): NASA 16,804,107 → 4,457,789 B (was 4,380,087
+  before the guards; flag-off 4,958,148), fixture sample unchanged at
+  32,593 B; both still byte-stable on a second `--allow-lossy` pass.
+
 - **Requantization reach extensions (Phase 6).** Two classes of
   scanner-quality JPEG the Phase 5 pipeline never reached now take the
   dimension-preserving requantization: masked images whose `/SMask` is shared

@@ -830,8 +830,32 @@ fn plan_replacement(
             // target geometry competes with the format-preserving Flate
             // downsample and the smaller payload wins (the shared
             // never-larger guard below still decides against the original).
+            // The line-art content guard applies here too, evaluated on the
+            // SOURCE pixels (see `plan_flate_to_jpeg`): the p12 profiles that
+            // failed human review are over-resolution in the source PDF, so
+            // they reach this competition rather than the under-threshold
+            // branch. Declining the JPEG candidate leaves the lossless
+            // downsample to ship — line art then gets exactly the flag-off
+            // result instead of a DCT-mottled one.
+            //
+            // NO COMPOUNDING LOSSES (Phase 7 post-review fix): the geometry
+            // change is the LOSSLESS path's decision to make. If the Flate
+            // candidate at this target would itself be declined by the shared
+            // never-larger guard below — i.e. downsampling did not even pay
+            // for itself in the format that preserves every sample — then the
+            // resample is not worth doing, and a JPEG candidate must not
+            // resurrect it by hiding the resolution loss behind a DCT win.
+            // That is how the p7 TKE banners (objs 22-29) ended up carrying
+            // BOTH losses in the spike: the flate downsample grew the stream
+            // and was rejected, then the JPEG-of-downsampled-pixels shrank it
+            // and shipped. `--allow-lossy` is consent to re-encode, not
+            // consent to re-litigate a resampling decision the lossless path
+            // already declined.
             let lossless = plan_flate(doc, stream, px_w, px_h, target_w, target_h);
-            let lossy = if options.allow_lossy_reencode {
+            let lossless_declined = lossless
+                .as_ref()
+                .is_some_and(|(out, _)| out.len() >= stream.content.len());
+            let lossy = if options.allow_lossy_reencode && !lossless_declined {
                 plan_flate_to_jpeg(doc, stream, options, px_w, px_h, target_w, target_h)
             } else {
                 None
@@ -1449,6 +1473,107 @@ fn decode_flate_image(
     Some((img, channels))
 }
 
+/// Metrics behind the line-art guard, computed in a single pass over decoded
+/// 8-bit samples. See [`looks_like_line_art`] for the thresholds and the
+/// measured per-class values.
+struct LineArtMetrics {
+    /// Fraction of pixels sharing the single most common quantized color.
+    background: f64,
+    /// Fraction of pixels covered by the 8 most common quantized colors.
+    palette: f64,
+    /// Fraction of pixels whose right or lower neighbor differs by more than
+    /// `EDGE_STEP` in any channel.
+    edges: f64,
+}
+
+/// Channel step that counts as a sharp edge between neighboring samples.
+const EDGE_STEP: u8 = 48;
+
+/// Compute the [`LineArtMetrics`] of an interleaved 8-bit buffer (`channels`
+/// samples per pixel, `w * h * channels` bytes). Colors are quantized to 5 bits
+/// per channel before histogramming, so anti-aliasing fringes and mild noise do
+/// not shatter a flat region into thousands of distinct "colors".
+fn line_art_metrics(pixels: &[u8], channels: usize, w: u32, h: u32) -> LineArtMetrics {
+    let total = (w as usize) * (h as usize);
+    let mut histogram: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+    let quantized = |i: usize| -> u32 {
+        let px = &pixels[i * channels..i * channels + channels];
+        px.iter()
+            .fold(0u32, |acc, s| (acc << 5) | u32::from(s >> 3))
+    };
+    let mut edges = 0usize;
+    for y in 0..h as usize {
+        for x in 0..w as usize {
+            let i = y * w as usize + x;
+            *histogram.entry(quantized(i)).or_insert(0) += 1;
+            let here = &pixels[i * channels..i * channels + channels];
+            let step = |other: &[u8]| {
+                here.iter()
+                    .zip(other)
+                    .any(|(a, b)| a.abs_diff(*b) > EDGE_STEP)
+            };
+            let right = (x + 1 < w as usize)
+                .then(|| (i + 1) * channels)
+                .is_some_and(|j| step(&pixels[j..j + channels]));
+            let down = (y + 1 < h as usize)
+                .then(|| (i + w as usize) * channels)
+                .is_some_and(|j| step(&pixels[j..j + channels]));
+            if right || down {
+                edges += 1;
+            }
+        }
+    }
+    let mut counts: Vec<u32> = histogram.into_values().collect();
+    counts.sort_unstable_by(|a, b| b.cmp(a));
+    let sum_top = |n: usize| -> u64 { counts.iter().take(n).map(|c| u64::from(*c)).sum() };
+    let total_f = total.max(1) as f64;
+    LineArtMetrics {
+        background: sum_top(1) as f64 / total_f,
+        palette: sum_top(8) as f64 / total_f,
+        edges: edges as f64 / total_f,
+    }
+}
+
+/// Phase 7 (post-spike human review): decline the lossy Flate→JPEG conversion
+/// for line-art-like content — thin curves/dashes on a flat background, few
+/// distinct colors, sharp edges. On this class DCT produces exactly the defects
+/// the side-by-side review flagged (background mottling, muddied dash-dot
+/// lines, hairline color shift), and the 5%-savings guard is no protection: a
+/// JPEG of line art beats a mediocre deflate almost every time, so savings
+/// alone always says "convert".
+///
+/// The signature is "mostly one flat background color, a handful of ink colors
+/// on top, and only a thin scattering of sharp transitions": a dominant
+/// background covering ≥ 75% of the image, the top 8 quantized colors covering
+/// ≥ 90%, and fewer than 10% of pixels sitting on a sharp edge. Rasterized
+/// plots/photographs fail the first two by a wide margin — their color mass is
+/// spread across gradients — and dense high-contrast raster content fails the
+/// third.
+///
+/// Measured values on the Phase 7 review corpus (`target/spike/nasa.off.pdf`
+/// and `sample.off.pdf`, the flag-OFF outputs the census diffed):
+///
+/// | class | objs | background | palette(8) | edges | verdict |
+/// | --- | --- | ---: | ---: | ---: | --- |
+/// | line-art plug profiles (p12) | 59–61 | 0.909–0.930 | 0.946–0.956 | 0.061–0.065 | DECLINE |
+/// | CFD velocity fields (p8/p10) | 36, 46 | 0.201, 0.413 | 0.425, 0.568 | 0.092, 0.138 | convert |
+/// | 3D PSD surface plots (p39/40) | 248–255 | 0.522–0.538 | 0.747–0.778 | 0.152–0.183 | convert |
+/// | synthetic noise stripes | sample 4–5 | 0.001–0.008 | 0.007–0.057 | 0.104–0.363 | convert |
+///
+/// The background metric alone separates the classes by a factor of two; the
+/// palette and edge conditions are belt-and-braces so a near-flat *photograph*
+/// (say a product shot on white) with real tonal content is still converted.
+fn looks_like_line_art(pixels: &[u8], channels: usize, w: u32, h: u32) -> bool {
+    let m = line_art_metrics(pixels, channels, w, h);
+    m.background >= LINE_ART_MIN_BACKGROUND
+        && m.palette >= LINE_ART_MIN_PALETTE
+        && m.edges <= LINE_ART_MAX_EDGES
+}
+
+const LINE_ART_MIN_BACKGROUND: f64 = 0.75;
+const LINE_ART_MIN_PALETTE: f64 = 0.90;
+const LINE_ART_MAX_EDGES: f64 = 0.08;
+
 /// Phase 7 spike: the consent-gated lossy Flate→JPEG candidate. Decodes the
 /// Flate pixels through the exact same gates as the format-preserving path
 /// (`decode_flate_image`), optionally resizes to the target geometry
@@ -1459,6 +1584,13 @@ fn decode_flate_image(
 /// the D-M1 MAD ceiling). Returns the JPEG bytes, or `None` on any doubt.
 /// Only reached when `allow_lossy_reencode` is true; size guards are the
 /// caller's.
+///
+/// The [`looks_like_line_art`] content check runs on every candidate, always
+/// against the DECODED SOURCE pixels — never resized ones, where the resampler
+/// has already blurred the sharp edges and flat backgrounds the metrics key on.
+/// Declining here removes only the JPEG candidate; on the over-resolution path
+/// the format-preserving Flate downsample still competes and ships, so line art
+/// keeps exactly the flag-off result.
 fn plan_flate_to_jpeg(
     doc: &Document,
     stream: &lopdf::Stream,
@@ -1471,6 +1603,14 @@ fn plan_flate_to_jpeg(
     let quality = options.jpeg_quality.clamp(1, 100);
     let (img, channels) = decode_flate_image(doc, stream, px_w, px_h)?;
     let is_gray = channels == 1;
+    let source = if is_gray {
+        img.to_luma8().into_raw()
+    } else {
+        img.to_rgb8().into_raw()
+    };
+    if looks_like_line_art(&source, channels, px_w, px_h) {
+        return None;
+    }
     let img = if (target_w, target_h) == (px_w, px_h) {
         img
     } else {
@@ -1501,6 +1641,12 @@ fn plan_flate_to_jpeg(
 /// arithmetic as `plan_requant_replacement`, and for the same reason: once
 /// converted, the payload is a DCTDecode stream whose second-pass requant
 /// churn lands under 5% and is declined, keeping repeat passes byte-stable.
+///
+/// The [`looks_like_line_art`] content guard matters most here: a
+/// dimension-preserving conversion competes against nothing, so without a
+/// content check the 5% rule converts line art unconditionally (a q78 JPEG of
+/// thin curves on white beats a mediocre deflate by ~50%) — and line art is
+/// precisely the class DCT is worst at.
 fn plan_flate_lossy_requant_replacement(
     doc: &Document,
     stream: &lopdf::Stream,
@@ -3229,6 +3375,211 @@ mod tests {
             out, pdf,
             "masked Flate bases are out of the spike's scope — untouched"
         );
+    }
+
+    /// Line-art pixels: sharp 1 px black lines on a white background — the p12
+    /// class the Phase 7 human review rejected (dashes muddy, background
+    /// mottles, hairlines shift color under DCT).
+    fn line_art_pixels(w: u32, h: u32) -> Vec<u8> {
+        let mut buf = vec![255u8; (w * h * 3) as usize];
+        let palette = [
+            [20u8, 40, 190],
+            [10, 10, 10],
+            [180, 30, 40],
+            [20, 120, 60],
+            [90, 30, 150],
+        ];
+        // Anti-aliased dash-dot curves at irregular (non-periodic) positions:
+        // sparse ink, sharp black/white transitions, a handful of colors — and
+        // deliberately NOT deflate-friendly, so the size guard alone would
+        // convert it.
+        for (k, color) in palette.iter().enumerate() {
+            for x in 0..w {
+                if (x as usize / (5 + k)) % 3 == 2 {
+                    continue; // dash gaps
+                }
+                let f = x as f32 * (0.013 + k as f32 * 0.0037) + k as f32 * 0.7;
+                let y = h as f32 / 2.0 + (h as f32 / 2.6) * f.sin();
+                let yi = y.floor();
+                if yi < 0.0 || yi as u32 + 1 >= h {
+                    continue;
+                }
+                let frac = y - yi;
+                for (row, cover) in [(yi as u32, 1.0 - frac), (yi as u32 + 1, frac)] {
+                    let i = ((row * w + x) * 3) as usize;
+                    for c in 0..3 {
+                        let bg = buf[i + c] as f32;
+                        buf[i + c] = (bg + (color[c] as f32 - bg) * cover).round() as u8;
+                    }
+                }
+            }
+        }
+        // Plot frame: one-pixel black rules.
+        for x in 0..w {
+            for row in [0u32, h - 1] {
+                let i = ((row * w + x) * 3) as usize;
+                buf[i..i + 3].copy_from_slice(&[0, 0, 0]);
+            }
+        }
+        for y in 0..h {
+            for col in [0u32, w - 1] {
+                let i = ((y * w + col) * 3) as usize;
+                buf[i..i + 3].copy_from_slice(&[0, 0, 0]);
+            }
+        }
+        buf
+    }
+
+    #[test]
+    fn lossy_reencode_declines_line_art() {
+        // FIX 1 (Phase 7 post-review): the under-threshold lossy path must
+        // decline line-art content even though the size guard would happily
+        // convert it. 200 px into 200 pt ⇒ 72 DPI, the dimension-preserving
+        // shape.
+        let raw = line_art_pixels(200, 200);
+        let m = line_art_metrics(&raw, 3, 200, 200);
+        assert!(
+            looks_like_line_art(&raw, 3, 200, 200),
+            "fixture must trip the content guard (bg {:.3} pal {:.3} edge {:.4})",
+            m.background,
+            m.palette,
+            m.edges
+        );
+        assert!(
+            !looks_like_line_art(&photo_pixels(200, 200, 3), 3, 200, 200),
+            "photographic content must NOT trip the guard"
+        );
+
+        let pdf = build_pdf_flate_raw(&raw, 200, 200, 3);
+        let opts = OptimizeOptions::default().with_allow_lossy_reencode(true);
+        let out = optimize_with_options(&pdf, opts);
+        assert_eq!(
+            out, pdf,
+            "line art must not be converted even with --allow-lossy"
+        );
+
+        // And prove the guard is what declined it: without the content check
+        // the JPEG candidate clears the 5% savings bar by a wide margin.
+        let doc = Document::load_mem(&pdf).unwrap();
+        let stream = doc
+            .objects
+            .values()
+            .find_map(|o| match o {
+                Object::Stream(s)
+                    if matches!(s.dict.get(b"Subtype"), Ok(Object::Name(n)) if n == b"Image") =>
+                {
+                    Some(s)
+                }
+                _ => None,
+            })
+            .unwrap();
+        let (img, _) = decode_flate_image(&doc, stream, 200, 200).unwrap();
+        let unguarded = encode_jpeg(img, false, opts.jpeg_quality).unwrap();
+        assert!(
+            unguarded.len() * 100 < stream.content.len() * 95,
+            "without the guard this fixture would convert ({} -> {})",
+            stream.content.len(),
+            unguarded.len()
+        );
+    }
+
+    #[test]
+    fn lossy_reencode_declines_over_resolution_line_art() {
+        // The p12 shape as it actually occurs: the line-art profiles are
+        // OVER-RESOLUTION in the source PDF, so they reach the JPEG-vs-Flate
+        // competition, not the dimension-preserving branch. The content guard
+        // (evaluated on the source pixels) removes the JPEG candidate, leaving
+        // the lossless downsample to ship — so the flag-on output is exactly
+        // the flag-off output.
+        let pdf = build_pdf_flate_raw(&line_art_pixels(400, 400), 400, 100, 3);
+        let flag_off = optimize(&pdf);
+        let opts = OptimizeOptions::default().with_allow_lossy_reencode(true);
+        let flag_on = optimize_with_options(&pdf, opts);
+        assert_eq!(
+            flag_on, flag_off,
+            "line art must never convert, whatever its resolution"
+        );
+        let (filter, _) = image_filter_info(&flag_on);
+        assert_eq!(filter, b"FlateDecode", "encoding class must not change");
+    }
+
+    /// Periodic banner content: a stepped color ramp under a fine 1 px grid.
+    /// Deflate exploits the exact periodicity at full resolution; resampling
+    /// destroys it, so the LOSSLESS downsample of this image is *larger* than
+    /// the original stream while a JPEG of the same target geometry is much
+    /// smaller — the compounding-loss trap FIX 2 closes.
+    fn periodic_banner_pixels(px: u32) -> Vec<u8> {
+        let mut out = Vec::with_capacity((px * px * 3) as usize);
+        for y in 0..px {
+            for x in 0..px {
+                let base = [
+                    (60 + (x / 3) % 190) as u8,
+                    (200 - (y / 4) % 150) as u8,
+                    (120 + ((x + y) / 5) % 120) as u8,
+                ];
+                if x % 7 == 0 || y % 11 == 0 {
+                    out.extend_from_slice(&[25, 25, 25]);
+                } else {
+                    out.extend_from_slice(&base);
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn lossy_reencode_never_compounds_a_declined_downsample() {
+        // FIX 2 (Phase 7 post-review): 400 px drawn into 140 pt ⇒ ~206 DPI,
+        // over-resolution, target ≈ 253 px. On this content the lossless Flate
+        // downsample GROWS the stream (periodicity destroyed by resampling) and
+        // is declined by the never-larger guard; a JPEG at the same target
+        // geometry would be far smaller. Consent to re-encode must not
+        // resurrect the resample the lossless path rejected: the image keeps
+        // its ORIGINAL bytes.
+        let raw = periodic_banner_pixels(400);
+        let pdf = build_pdf_flate_raw(&raw, 400, 140, 3);
+
+        // Pin the premise: at the target geometry the Flate candidate is not
+        // smaller than the original, while the JPEG candidate is.
+        let doc = Document::load_mem(&pdf).unwrap();
+        let stream = doc
+            .objects
+            .values()
+            .find_map(|o| match o {
+                Object::Stream(s)
+                    if matches!(s.dict.get(b"Subtype"), Ok(Object::Name(n)) if n == b"Image") =>
+                {
+                    Some(s)
+                }
+                _ => None,
+            })
+            .unwrap();
+        let opts = OptimizeOptions::default().with_allow_lossy_reencode(true);
+        let (target_w, target_h) = (253u32, 253u32);
+        let (flate_out, _) = plan_flate(&doc, stream, 400, 400, target_w, target_h).unwrap();
+        assert!(
+            flate_out.len() >= stream.content.len(),
+            "premise: the lossless downsample must grow ({} -> {})",
+            stream.content.len(),
+            flate_out.len()
+        );
+        let jpeg_out =
+            plan_flate_to_jpeg(&doc, stream, opts, 400, 400, target_w, target_h).unwrap();
+        assert!(
+            jpeg_out.len() < stream.content.len(),
+            "premise: the JPEG-at-target candidate must shrink ({} -> {})",
+            stream.content.len(),
+            jpeg_out.len()
+        );
+
+        let out = optimize_with_options(&pdf, opts);
+        assert_eq!(
+            out, pdf,
+            "a resample the lossless path declined must not return via the lossy path"
+        );
+        let (filter, _) = image_filter_info(&out);
+        assert_eq!(filter, b"FlateDecode", "encoding class must be unchanged");
+        assert_eq!(image_dims(&out), (400, 400), "geometry must be unchanged");
     }
 
     #[test]

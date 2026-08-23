@@ -237,6 +237,33 @@ enabling a downsample the lossless path had declined; p39/p40 PSD surfaces
 lose mesh detail at q78 (q85 markedly better). Photographic/CFD raster
 content converts cleanly.
 
+### Human-review outcome (2026-08-22) — both flagged defects closed
+
+Xchel's review of the composites confirmed two must-fix classes; both are now
+fixed in code, tuned and re-measured against the same corpus:
+
+- **Line-art class declined by a content guard.** `looks_like_line_art`
+  (background ≥ 0.75, top-8 palette ≥ 0.90, sharp-edge density ≤ 0.08,
+  computed in one pass over the decoded SOURCE pixels) removes the JPEG
+  candidate for thin-line vector-style content. Measured: p12 profiles
+  0.909–0.930 / 0.946–0.956 / 0.061–0.065 → declined; CFD fields (36, 46)
+  and PSD surfaces (248–255) and the sample noise stripes all fall far below
+  the background threshold and still convert. Because only the JPEG candidate
+  is removed, over-resolution line art still takes the lossless downsample:
+  the flag-on output for that class equals the flag-off output.
+- **Compounding-loss trap closed.** In the over-resolution competition, a
+  Flate candidate the never-larger guard would decline now disqualifies the
+  JPEG candidate as well. `--allow-lossy` is consent to re-encode, not to
+  re-open a resampling decision the lossless path rejected. The p7 TKE
+  banners (objs 22–29) consequently keep their original bytes.
+
+Post-fix: NASA flag-on 4,457,789 B (from 4,380,087 B), fixture sample
+unchanged at 32,593 B, both byte-stable on a second `--allow-lossy` pass.
+Converted NASA streams: 8 (36, 46, 248–251, 254, 255) instead of 19.
+Still open (NOT a defect, a default-quality question): the p39/p40 PSD mesh
+softening at q78 — `--jpeg-quality 85` retains it and is the better companion
+default if that class matters.
+
 ## Gates (every milestone)
 
 cargo build && cargo test && cargo test --doc && cargo clippy --all-targets
