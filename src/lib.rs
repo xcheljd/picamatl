@@ -600,17 +600,32 @@ struct MaskReplacement {
 /// The single-filter classes the re-encode paths know how to handle.
 /// `plan_replacement` (downsampling) consumes Dct/Flate; the lossless bitonal
 /// pass (`bitonal::plan_bitonal_recompressions`) consumes Ccitt/Flate.
+#[derive(Debug, PartialEq, Eq)]
 enum FilterClass {
     DctOnly,
     FlateOnly,
     CcittOnly,
+    /// `/JPXDecode`: JPEG2000, a JP2 container or bare codestream. The image
+    /// crate build amatl links is JPEG-only (its `jpeg2000` feature would drag
+    /// a native `openjpeg` in), so there is no decodable pipeline and the
+    /// stream must never be mistaken for DCT/Flate. Recognized so a future
+    /// pure-Rust JPEG2000 path slots in; today it is always left untouched
+    /// (fail-safe decline — `JP2→JPEG` lossy and `JP2→Flate` lossless
+    /// conversions both require a decoder that is not linked).
+    JpxOnly,
+    /// `/JBIG2Decode`: lossless JBIG2 bilevel compression, seen in scanned
+    /// office / fax archives. No JBIG2 decoder is linked. Recognized so it is
+    /// never treated as DCT/Flate/CCITT; always left untouched.
+    Jbig2Only,
     Other,
 }
 
 /// Classify a stream's `/Filter`: exactly DCTDecode (raw JPEG payload),
 /// exactly FlateDecode (deflated raster data), exactly CCITTFaxDecode (raw
-/// CCITT bitstream), or anything else (untouched). Both the scalar-name and
-/// one-element-array forms are recognized.
+/// CCITT bitstream), `/JPXDecode` (JPEG2000) and `/JBIG2Decode` (JBIG2) or
+/// anything else. The exotic classes are recognized-and-declined: they are
+/// never handed to a re-encode path (which has no decoder for them). Both the
+/// scalar-name and one-element-array forms are recognized.
 fn classify_filter(doc: &Document, filter: &Object) -> FilterClass {
     let name = match resolve(doc, filter) {
         Object::Name(n) => n.as_slice(),
@@ -624,6 +639,8 @@ fn classify_filter(doc: &Document, filter: &Object) -> FilterClass {
         b"DCTDecode" => FilterClass::DctOnly,
         b"FlateDecode" => FilterClass::FlateOnly,
         b"CCITTFaxDecode" => FilterClass::CcittOnly,
+        b"JPXDecode" => FilterClass::JpxOnly,
+        b"JBIG2Decode" => FilterClass::Jbig2Only,
         _ => FilterClass::Other,
     }
 }
@@ -777,7 +794,14 @@ fn plan_replacement(
     let class = classify_filter(doc, filter);
     // CCITT streams are bitonal: never resampled here (quality trap — plan §B).
     // Their lossless G4 recompression lives in the dedicated bitonal pass.
-    if matches!(class, FilterClass::Other | FilterClass::CcittOnly) {
+    // JPX (JPEG2000) and JBIG2 streams are recognized-and-declined here: no
+    // decoder is linked, so any re-encode path would corrupt them. The masks
+    // of such a base are likewise out of scope (an eligible_smask check never
+    // runs — the whole object stays untouched).
+    if matches!(
+        class,
+        FilterClass::Other | FilterClass::CcittOnly | FilterClass::JpxOnly | FilterClass::Jbig2Only
+    ) {
         return None;
     }
 
@@ -998,7 +1022,10 @@ fn plan_replacement(
                 (None, None) => return None,
             }
         }
-        FilterClass::CcittOnly | FilterClass::Other => return None,
+        FilterClass::CcittOnly
+        | FilterClass::Other
+        | FilterClass::JpxOnly
+        | FilterClass::Jbig2Only => return None,
     };
 
     if out.len() >= stream.content.len() {
@@ -1342,7 +1369,10 @@ fn plan_mask_resample(
             }
             DynamicImage::ImageLuma8(image::GrayImage::from_raw(px_w, px_h, decoded)?)
         }
-        FilterClass::CcittOnly | FilterClass::Other => return None,
+        FilterClass::CcittOnly
+        | FilterClass::Other
+        | FilterClass::JpxOnly
+        | FilterClass::Jbig2Only => return None,
     };
 
     // Bilinear on gray (plan §D-M2), to the base's exact target geometry.
@@ -3692,6 +3722,116 @@ mod tests {
         mutate(&mut doc, &mut dict);
         let img_id = doc.add_object(Stream::new(dict, payload));
         wrap_image_pdf(&mut doc, img_id, 100)
+    }
+
+    /// Build a one-page PDF embedding an image whose `/Filter` is one of the
+    /// exotic, undeclared-decoder classes (`/JPXDecode`, `/JBIG2Decode`), with
+    /// `payload` left as opaque bytes (no decoder is linked, so the exact
+    /// bytes must never be parsed or touched). `as_array` exercises the
+    /// one-element `/Filter [<name>]` form, which `classify_filter` must also
+    /// recognize.
+    fn build_exotic_pdf(filter: &[u8], payload: &[u8], as_array: bool) -> Vec<u8> {
+        let mut dict = dictionary! {
+            "Type" => "XObject",
+            "Subtype" => "Image",
+            "Width" => 400_i64,
+            "Height" => 400_i64,
+            "ColorSpace" => "DeviceRGB",
+            "BitsPerComponent" => 8_i64,
+        };
+        if as_array {
+            dict.set("Filter", vec![Object::Name(filter.to_vec())]);
+        } else {
+            dict.set("Filter", Object::Name(filter.to_vec()));
+        }
+        let mut doc = Document::with_version("1.5");
+        let img_id = doc.add_object(Stream::new(dict, payload.to_vec()));
+        wrap_image_pdf(&mut doc, img_id, 100)
+    }
+
+    #[test]
+    fn classify_recognizes_exotic_filter_names() {
+        // The leading-line seam for the exotic conversions: /JPXDecode and
+        // /JBIG2Decode must classify distinctly (never fall into DctOnly /
+        // FlateOnly, which is what would let a re-encode path corrupt them).
+        let doc = Document::with_version("1.5");
+        let cases: [(String, Vec<u8>, FilterClass); 2] = [
+            (
+                "JPXDecode".to_owned(),
+                b"JPXDecode".to_vec(),
+                FilterClass::JpxOnly,
+            ),
+            (
+                "JBIG2Decode".to_owned(),
+                b"JBIG2Decode".to_vec(),
+                FilterClass::Jbig2Only,
+            ),
+        ];
+        for (label, name, want) in cases {
+            let scalar = Object::Name(name.to_vec());
+            assert_eq!(
+                classify_filter(&doc, &scalar),
+                want,
+                "{label}: scalar-name form must classify as {want:?}"
+            );
+            // The one-element-array form is the other spelling the PDF spec
+            // permits for a single filter.
+            let array = Object::Array(vec![Object::Name(name.to_vec())]);
+            assert_eq!(
+                classify_filter(&doc, &array),
+                want,
+                "{label}: one-element-array form must classify as {want:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn exotic_filter_images_are_left_byte_identical() {
+        // No JP2 or JBIG2 decoder is linked (the image crate build is
+        // JPEG-only), so any re-encode of these would corrupt them. The
+        // fail-safe contract therefore demands the ORIGINAL bytes come back —
+        // whole-file equality — for both filter names and both spellings.
+        let payload = vec![0x1Au8; 96];
+        let cases: Vec<(String, &[u8], bool)> = vec![
+            ("JPXDecode scalar".to_owned(), b"JPXDecode", false),
+            ("JPXDecode array".to_owned(), b"JPXDecode", true),
+            ("JBIG2Decode scalar".to_owned(), b"JBIG2Decode", false),
+            ("JBIG2Decode array".to_owned(), b"JBIG2Decode", true),
+        ];
+        for (label, name, as_array) in cases {
+            let pdf = build_exotic_pdf(name, &payload, as_array);
+            let out = optimize(&pdf);
+            assert_eq!(
+                out, pdf,
+                "{label}: exotic-filter image must be left byte-identical"
+            );
+            // The filter name must survive verbatim (never relabeled DCT/Flate).
+            let reloaded = Document::load_mem(&out).unwrap();
+            let mut has_exotic = false;
+            for obj in reloaded.objects.values() {
+                let exotic = match obj {
+                    Object::Stream(s) => {
+                        let is_image = matches!(
+                            s.dict.get(b"Subtype"),
+                            Ok(Object::Name(n)) if n == b"Image"
+                        );
+                        is_image
+                            && match s.dict.get(b"Filter") {
+                                // Both the scalar /Name and the PDF-spec
+                                // one-element-array spelling count.
+                                Ok(Object::Name(n)) => n == name,
+                                Ok(Object::Array(items)) if items.len() == 1 => {
+                                    matches!(&items[0], Object::Name(n) if n == name)
+                                }
+                                _ => false,
+                            }
+                    }
+                    _ => false,
+                };
+                has_exotic |= exotic;
+            }
+            assert!(has_exotic, "{label}: filter name must be preserved");
+        }
     }
 
     #[test]
