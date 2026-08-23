@@ -80,15 +80,22 @@ use amatl::OptimizeOptions;
 let opts = OptimizeOptions::default()
     .with_target_dpi(110.0)
     .with_jpeg_quality(70)
-    .with_strip_accessibility(true)   // opt-in, off by default
-    .with_pack_object_streams(true);  // PDF 1.5 ObjStm packing, off by default
+    .with_strip_accessibility(true)     // opt-in, off by default
+    .with_pack_object_streams(false);   // PDF 1.5 ObjStm packing, ON by default
 let optimized = amatl::optimize_with_options(&input_bytes, opts);
 ```
 
 Beyond downsampling, amatl also merges byte-identical duplicate objects and
 image streams (a logo re-embedded once per page is stored — and re-encoded —
-once), and can optionally strip the accessibility structure tree and pack
-objects into PDF 1.5 object streams.
+once), re-deflates every FlateDecode stream at zlib level 9, packs objects into
+PDF 1.5 object streams, and compresses the cross-reference stream — and can
+optionally strip the accessibility structure tree.
+
+**Object-stream packing is on by default** (it was off through 0.3.0). It is lossless — same
+objects, different serialization — but puts a **PDF 1.5 floor** on the output:
+readers older than Acrobat 6 (2003) cannot open an `ObjStm` file at all. Pass
+`--no-pack-object-streams` (library: `.with_pack_object_streams(false)`) if
+your audience may include one.
 
 **Accessibility-preserving by default.** Ghostscript's `/ebook` and `/screen`
 presets silently remove the PDF structure tree that screen readers navigate.
@@ -120,7 +127,10 @@ amatl report.pdf -o report.small.pdf
 
 # Overwrite in place, tune the pipeline
 amatl scan.pdf --force --target-dpi 150 --jpeg-quality 70 \
-  --recompress-bitonal-images --subset-fonts --pack-object-streams
+  --recompress-bitonal-images --subset-fonts
+
+# Keep the output readable by pre-PDF-1.5 viewers (no ObjStm packing)
+amatl report.pdf --no-pack-object-streams
 ```
 
 Every flag maps 1:1 to an `OptimizeOptions` builder method, and all defaults —

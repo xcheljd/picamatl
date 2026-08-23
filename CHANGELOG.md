@@ -8,7 +8,65 @@ and this project adheres to
 
 ## [Unreleased]
 
-[Unreleased]: nothing yet.
+Three lossless serialization wins from the compression investigation. No pixel
+is resampled, no encoding class moves, and no consent flag is involved. On the
+58-page NASA reference (16,804,107 B) at otherwise-default settings, combined:
+**4,958,148 → 4,655,752 B (−302,396 B, −6.10%)**, byte-identical on a second
+pass, all 58 pages render clean under Ghostscript 10.07.1.
+
+### Changed
+
+- **BREAKING (default flip, 0.x minor):** `OptimizeOptions::pack_object_streams`
+  now defaults to `true` (it was `false` through 0.3.0). Output is packed into PDF 1.5 `ObjStm` streams unless
+  you opt out with `--no-pack-object-streams` (library:
+  `.with_pack_object_streams(false)`). Lossless — same objects, same semantics,
+  different serialization — and measured at **−163,394 B (3.29%)** on NASA,
+  where the structure tree is intact and 2,180 of 2,497 objects are packable.
+  **The cost is a PDF 1.5 floor:** a reader older than Acrobat 6 (2003) cannot
+  open an `ObjStm` file *at all* — a hard failure, not a degradation. The
+  previous struct doc claimed packing "buys only a couple of percentage points";
+  that caveat described the post-`strip_accessibility` case (few objects left to
+  pack) and is now stated as such.
+
+### Added
+
+- **Final re-deflate pass (on by default).** Every stream whose `/Filter` is
+  exactly `FlateDecode` is inflated and re-deflated at zlib level 9, keeping the
+  result only when it is strictly smaller AND inflates back byte-identically.
+  `/Filter` and `/DecodeParms` are untouched, so predictors still apply to the
+  same post-inflate bytes and every reader decodes exactly what it decoded
+  before. This reaches streams that arrived with a producer's weaker deflate
+  output — which `doc.compress()` never touched, by its own "only streams
+  without a `/Filter`" rule — and gets a second look at amatl's own output.
+  Measured **−128,645 B (2.59%)** on NASA. Declined wholesale for encrypted,
+  PDF/A-declaring (`fonts::pdfa_blocked`), and signed (`/ByteRange`, `/Type
+  /Sig`, AcroForm `/SigFlags`) documents. Runs after ALL planning, purely at
+  serialization time. Zopfli remains out of scope (~50× compression time for
+  roughly 233 KB more; a separate future flag).
+
+- **Compressed cross-reference stream.** lopdf hardcodes
+  `XRefStreamFilter::None` in `writer.rs::write_cross_reference_stream`, and the
+  object never exists in `Document::objects` (the writer synthesizes it during
+  save), so no `SaveOptions` knob and no document-level pass could reach it:
+  amatl shipped a raw 7-bytes-per-entry xref stream. It is now deflated in both
+  save paths — NASA packed **17,486 → 5,804 B**, unpacked **17,479 → 7,122 B**.
+  Patching the serialized bytes is sound because the xref stream is the last
+  object in the file and `startxref` (plus its own xref entry) records its
+  *start* offset, which does not move. Every structural assumption is verified
+  against the bytes actually present, and any mismatch — including a classic
+  cross-reference table — passes the file through untouched. `/W [1 4 2]` is
+  left as lopdf emits it; narrowing it was explicitly out of scope.
+
+### Note
+
+The serialization-time passes (packing, re-deflate, xref compression) are not
+counted as "work" by `try_optimize`'s early return, unchanged from how packing
+has always behaved: a document where nothing semantic was planned still comes
+back byte-for-byte identical, preserving the "declined everything ⇒ your exact
+bytes" property. Pinned by
+`serialization_wins_do_not_rewrite_an_otherwise_unchanged_file`.
+
+[Unreleased]: compare from 0.3.0.
 
 ## [0.3.0] - 2026-08-22
 

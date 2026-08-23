@@ -73,10 +73,18 @@ const DPI_MARGIN: f32 = 1.15;
 ///
 /// `pack_object_streams` controls whether eligible non-stream objects are
 /// packed into PDF 1.5 `ObjStm` streams with a binary xref stream. Default
-/// `false`. On image-dominated documents with few non-stream objects (e.g.
-/// after a strip), this buys only a couple of percentage points because there
-/// are few objects left to pack; for larger/denser documents it can buy
-/// substantially more. Implemented in pure Rust (no native deps) to avoid
+/// `true` (it was `false` through 0.3.0). The saving scales with
+/// the *object* count, not the file size: on the 58-page NASA reference at
+/// otherwise-default settings — object-heavy, structure tree intact, 2,497
+/// objects — packing measured **−162,069 B (3.27%)**, replacing ~168 KB of
+/// plaintext object bodies and their `N G obj … endobj` framing with a single
+/// 41 KB `ObjStm`. Documents with few non-stream objects left to pack (e.g.
+/// after `strip_accessibility`) gain proportionally less.
+///
+/// The cost is a **PDF 1.5 floor**: a reader older than Acrobat 6 (2003)
+/// cannot open an `ObjStm` file *at all* — a hard failure, not a degradation.
+/// Set this to `false` (CLI: `--no-pack-object-streams`) when the audience may
+/// include such readers. Implemented in pure Rust (no native deps) to avoid
 /// bundling an external tool such as qpdf.
 ///
 /// # Example
@@ -117,8 +125,10 @@ pub struct OptimizeOptions {
 
     /// If true, pack eligible non-stream objects into PDF 1.5 `ObjStm` streams
     /// with a binary cross-reference stream (additional structural
-    /// compression). Default: `false`. See struct doc for the cost/benefit
-    /// trade-off on different input shapes.
+    /// compression). Default: `true` (was `false` through 0.3.0). Lossless —
+    /// same objects, same semantics, different serialization — but it imposes
+    /// a PDF 1.5 floor on the output. See struct doc for the measured benefit
+    /// and the escape hatch.
     pub pack_object_streams: bool,
 
     /// Downsample over-resolution FlateDecode raster images in place (format
@@ -175,7 +185,7 @@ impl Default for OptimizeOptions {
             jpeg_quality: JPEG_QUALITY,
             dpi_margin: DPI_MARGIN,
             strip_accessibility: false,
-            pack_object_streams: false,
+            pack_object_streams: true,
             downsample_flate_images: true,
             subset_fonts: false,
             recompress_bitonal_images: false,
@@ -2171,9 +2181,13 @@ fn try_optimize(input: &[u8], options: OptimizeOptions) -> Result<Option<Vec<u8>
     };
 
     // If we have no work to do at all, hand back the original bytes.
-    // Note: pack_object_streams alone is not sufficient reason to write a new
-    // file — packing only helps when there are objects to pack, and the
-    // dispatcher handles it cheaply inside the save step regardless.
+    // Note: the serialization-time passes — pack_object_streams, the final
+    // re-deflate, and the xref-stream compression — are deliberately NOT
+    // counted as work here. Rewriting a file we otherwise decided not to touch
+    // would break the "declined everything ⇒ your exact bytes back" property
+    // that `flate_ineligible_images_are_untouched` and friends pin; they only
+    // apply to files we were already going to rewrite. Pinned by
+    // `serialization_wins_do_not_rewrite_an_otherwise_unchanged_file`.
     // `merged_streams` counts as work: dedup_streams may have collapsed repeated
     // images even when nothing needed downsampling, and discarding that would
     // throw away a real size win.
@@ -2301,6 +2315,12 @@ fn try_optimize(input: &[u8], options: OptimizeOptions) -> Result<Option<Vec<u8>
     doc.prune_objects();
     doc.compress();
 
+    // Last planning-free pass: re-deflate every already-Flate stream at level 9.
+    // Runs after EVERY other decision (images, fonts, bitonal, lossy, dedup,
+    // prune, compress) so it is purely a serialization improvement and can
+    // never influence, or be influenced by, what the planners chose.
+    redeflate_flate_streams(&mut doc);
+
     // Renumber to a contiguous id space so the saved trailer /Size matches the
     // highest object number. Without this, lopdf 0.41's classic save emits a
     // /Size that's slightly too high, which `qpdf --check` flags (benign, but
@@ -2310,18 +2330,248 @@ fn try_optimize(input: &[u8], options: OptimizeOptions) -> Result<Option<Vec<u8>
     save_document(&mut doc, options).map(Some)
 }
 
+/// Inflation ceiling for the final re-deflate pass. A stream that expands past
+/// this is left exactly as it arrived — the same decompression-bomb posture
+/// `inflate_capped` enforces everywhere else in the crate.
+const MAX_REDEFLATE_BYTES: usize = 128 * 1024 * 1024;
+
+/// Final lossless re-deflate pass: every stream whose `/Filter` is exactly
+/// `FlateDecode` is inflated and re-deflated at zlib level 9, keeping the
+/// result only when it is STRICTLY smaller and verified to inflate back to the
+/// original bytes.
+///
+/// This is a serialization change and nothing else. `/Filter` and
+/// `/DecodeParms` are untouched, so any PNG/TIFF predictor still applies to
+/// exactly the same post-inflate bytes: every reader decodes what it decoded
+/// before, byte for byte. No pixel is resampled and no encoding class moves,
+/// which is why it needs no consent flag — it is the same class of work
+/// `doc.compress()` already does by default, extended to streams that arrived
+/// with a producer's (often weaker) deflate output.
+///
+/// Idempotent: a second pass re-deflates already-level-9 output to the same
+/// size, which fails the strictly-smaller test and changes nothing.
+///
+/// Declined wholesale for encrypted documents (stream bytes are ciphertext),
+/// PDF/A-declared documents, and signed documents — a signature's byte range
+/// covers offsets this pass would move.
+fn redeflate_flate_streams(doc: &mut Document) {
+    if doc.is_encrypted() || fonts::pdfa_blocked(doc) || signature_present(doc) {
+        return;
+    }
+
+    // Collect first: classification resolves references against the immutable
+    // document, while the deflate work itself happens off the document
+    // entirely, in parallel.
+    let candidates: Vec<(ObjectId, Vec<u8>)> = doc
+        .objects
+        .iter()
+        .filter_map(|(&id, obj)| {
+            let Object::Stream(stream) = obj else {
+                return None;
+            };
+            // Object and cross-reference streams are the writer's business:
+            // lopdf rebuilds both from scratch at save time (and the xref
+            // stream is deflated by `compress_xref_stream` afterwards).
+            if matches!(stream.dict.get(b"Type"),
+                Ok(Object::Name(n)) if n == b"ObjStm" || n == b"XRef")
+            {
+                return None;
+            }
+            let filter = stream.dict.get(b"Filter").ok()?;
+            matches!(classify_filter(doc, filter), FilterClass::FlateOnly)
+                .then(|| (id, stream.content.clone()))
+        })
+        .collect();
+
+    let shrunk: Vec<(ObjectId, Vec<u8>)> = candidates
+        .into_par_iter()
+        .filter_map(|(id, content)| replan_deflate(&content).map(|out| (id, out)))
+        .collect();
+
+    for (id, content) in shrunk {
+        if let Ok(Object::Stream(stream)) = doc.get_object_mut(id) {
+            stream.set_content(content); // keeps /Length in sync
+        }
+    }
+}
+
+/// Inflate and re-deflate one Flate payload. `None` (leave the stream exactly
+/// as it is) unless the new payload is strictly smaller AND inflates back
+/// byte-identically — deflate is lossless, so that equality must be exact.
+fn replan_deflate(content: &[u8]) -> Option<Vec<u8>> {
+    let plain = inflate_capped(content, MAX_REDEFLATE_BYTES)?;
+    let out = deflate_level9(&plain)?;
+    if out.len() >= content.len() {
+        return None;
+    }
+    (inflate_capped(&out, plain.len())? == plain).then_some(out)
+}
+
+/// True when the document carries a digital signature. A signature dictionary
+/// pins a `/ByteRange` over the file's bytes; AcroForm `/SigFlags` declares one
+/// exists. Rather than reason about which bytes a range covers, the re-deflate
+/// pass declines such documents entirely.
+fn signature_present(doc: &Document) -> bool {
+    if let Ok(catalog) = doc.catalog() {
+        if let Ok(acroform) = catalog.get(b"AcroForm") {
+            if let Object::Dictionary(d) = resolve(doc, acroform) {
+                if d.get(b"SigFlags").is_ok() {
+                    return true;
+                }
+            }
+        }
+    }
+    doc.objects.values().any(|obj| match obj {
+        Object::Dictionary(d) => is_signature_dict(d),
+        Object::Stream(s) => is_signature_dict(&s.dict),
+        _ => false,
+    })
+}
+
+fn is_signature_dict(dict: &lopdf::Dictionary) -> bool {
+    dict.get(b"ByteRange").is_ok()
+        || matches!(dict.get(b"Type"),
+            Ok(Object::Name(n)) if n == b"Sig" || n == b"DocTimeStamp")
+}
+
 /// Serialize the document, optionally using PDF 1.5 object-stream packing when
 /// `options.pack_object_streams` is true. The packed path produces smaller
 /// output for object-heavy documents but is more complex; the classic path is
 /// the always-available fallback and matches what lopdf ships.
 fn save_document(doc: &mut Document, options: OptimizeOptions) -> Result<Vec<u8>, lopdf::Error> {
-    if options.pack_object_streams {
-        pack_and_save(doc)
+    let out = if options.pack_object_streams {
+        pack_and_save(doc)?
     } else {
         let mut out: Vec<u8> = Vec::new();
         doc.save_to(&mut out)?;
-        Ok(out)
+        out
+    };
+    // Both save paths emit an uncompressed cross-reference stream; deflate it.
+    Ok(compress_xref_stream(out))
+}
+
+/// Deflate the cross-reference stream of a just-serialized document.
+///
+/// lopdf hardcodes `XRefStreamFilter::None` in
+/// `writer.rs::write_cross_reference_stream` — there is no `SaveOptions` knob
+/// for it, and `doc.compress()` cannot reach the object because it does not
+/// exist in `Document::objects`: the writer synthesizes it during save, after
+/// every document-level pass has run. So amatl's output shipped a raw
+/// 7-bytes-per-entry xref stream (17,479 B on the 2,497-object NASA reference,
+/// where Ghostscript spends 5,375 B).
+///
+/// Patching the saved bytes is sound *because it is the last object in the
+/// file*: `startxref` points at its start offset, and its own xref entry
+/// records that same start offset, so rewriting only its dictionary and
+/// payload moves no offset that anything records. Nothing before `xref_start`
+/// is touched.
+///
+/// Fail-safe: every structural assumption is checked against the bytes actually
+/// present (object header, `>>stream`, the declared `/Length`, the closing
+/// `endstream`, and a full inflate-back of the new payload). Any mismatch —
+/// including a classic cross-reference *table*, which has nothing to compress —
+/// returns the input unchanged.
+fn compress_xref_stream(out: Vec<u8>) -> Vec<u8> {
+    match try_compress_xref_stream(&out) {
+        Some(patched) => patched,
+        None => out,
     }
+}
+
+fn try_compress_xref_stream(out: &[u8]) -> Option<Vec<u8>> {
+    // `\nstartxref\n<offset>\n%%EOF` is the last thing the writer emits.
+    let sx = out.windows(9).rposition(|w| w == b"startxref")?;
+    let mut p = sx + 9;
+    while out.get(p).is_some_and(|b| b.is_ascii_whitespace()) {
+        p += 1;
+    }
+    let digits = p;
+    while out.get(p).is_some_and(|b| b.is_ascii_digit()) {
+        p += 1;
+    }
+    let xref_start: usize = std::str::from_utf8(out.get(digits..p)?).ok()?.parse().ok()?;
+    if xref_start >= sx {
+        return None;
+    }
+
+    // "<id> <gen> obj\n<<" — exactly what Writer::write_indirect_object emits
+    // ahead of a stream object. Anything else (notably a `xref` table keyword)
+    // means there is no xref stream here.
+    let mut q = skip_ascii_digits(out, xref_start)?;
+    if out.get(q) != Some(&b' ') {
+        return None;
+    }
+    q = skip_ascii_digits(out, q + 1)?;
+    if out.get(q..q + 5)? != b" obj\n" {
+        return None;
+    }
+    let dict_start = q + 5;
+    if out.get(dict_start..dict_start + 2)? != b"<<" {
+        return None;
+    }
+
+    // Writer::write_stream emits the dictionary and then `stream\n` with no
+    // separator, so the dictionary ends at the first `>>stream\n`.
+    let dict_end = find_sub(out, b">>stream\n", dict_start)? + 2;
+    let content_start = dict_end + b"stream\n".len();
+    let dict = out.get(dict_start..dict_end)?;
+    if find_sub(dict, b"/Type/XRef", 0).is_none() || find_sub(dict, b"/Filter", 0).is_some() {
+        return None;
+    }
+
+    // `/Length <n>`: names are written unescaped and integer values get exactly
+    // one leading space, so the trailing space also rules out `/Length1`.
+    let len_key = find_sub(dict, b"/Length ", 0)?;
+    let val_start = len_key + b"/Length ".len();
+    let val_end = skip_ascii_digits(dict, val_start)?;
+    let content_len: usize = std::str::from_utf8(dict.get(val_start..val_end)?)
+        .ok()?
+        .parse()
+        .ok()?;
+
+    // Cross-check the declared length against the real framing before touching
+    // anything: if `endstream` is not exactly there, this is not the object we
+    // think it is.
+    let content = out.get(content_start..content_start.checked_add(content_len)?)?;
+    if !out.get(content_start + content_len..)?.starts_with(b"\nendstream") {
+        return None;
+    }
+
+    let deflated = deflate_level9(content)?;
+    if deflated.len() >= content.len() {
+        return None; // never-larger, per the crate contract
+    }
+    if inflate_capped(&deflated, content.len())?.as_slice() != content {
+        return None;
+    }
+
+    let mut patched = Vec::with_capacity(out.len());
+    patched.extend_from_slice(&out[..dict_start + len_key]);
+    patched.extend_from_slice(b"/Filter/FlateDecode/Length ");
+    patched.extend_from_slice(deflated.len().to_string().as_bytes());
+    patched.extend_from_slice(&out[dict_start + val_end..content_start]);
+    patched.extend_from_slice(&deflated);
+    patched.extend_from_slice(&out[content_start + content_len..]);
+    Some(patched)
+}
+
+/// Index just past the digit run starting at `from`, or `None` if there is no
+/// digit there.
+fn skip_ascii_digits(data: &[u8], from: usize) -> Option<usize> {
+    let mut i = from;
+    while data.get(i).is_some_and(|b| b.is_ascii_digit()) {
+        i += 1;
+    }
+    (i > from).then_some(i)
+}
+
+/// First index of `needle` in `haystack` at or after `from`.
+fn find_sub(haystack: &[u8], needle: &[u8], from: usize) -> Option<usize> {
+    haystack
+        .get(from..)?
+        .windows(needle.len())
+        .position(|w| w == needle)
+        .map(|i| i + from)
 }
 
 /// Serialize the document with PDF 1.5 object-stream packing: eligible
@@ -3600,6 +3850,270 @@ mod tests {
         assert!(has_image, "image must survive packing");
     }
 
+    /// The bytes of the cross-reference object a saved file's `startxref`
+    /// points at, up to (and excluding) the payload. Panics if the file does
+    /// not end in the shape lopdf's writer produces.
+    fn xref_object_header(pdf: &[u8]) -> Vec<u8> {
+        let sx = pdf.windows(9).rposition(|w| w == b"startxref").unwrap();
+        let digits: Vec<u8> = pdf[sx + 9..]
+            .iter()
+            .copied()
+            .skip_while(u8::is_ascii_whitespace)
+            .take_while(u8::is_ascii_digit)
+            .collect();
+        let start: usize = String::from_utf8(digits).unwrap().parse().unwrap();
+        let end = find_sub(pdf, b">>stream\n", start).unwrap();
+        pdf[start..end].to_vec()
+    }
+
+    /// Task 1: lopdf writes the cross-reference stream with no `/Filter` (see
+    /// `compress_xref_stream`). Both save paths must ship it deflated, and the
+    /// patched file must still load.
+    #[test]
+    fn xref_stream_is_flate_compressed_in_both_save_paths() {
+        // Enough objects that the xref payload is worth deflating at all.
+        let pdf = build_pdf_duplicate_images(6, 400);
+        for pack in [true, false] {
+            let opts = OptimizeOptions::default().with_pack_object_streams(pack);
+            let out = optimize_with_options(&pdf, opts);
+            let header = xref_object_header(&out);
+            let shown = String::from_utf8_lossy(&header).to_string();
+            assert!(
+                find_sub(&header, b"/Type/XRef", 0).is_some(),
+                "pack={pack}: expected an xref stream, got {shown}"
+            );
+            assert!(
+                find_sub(&header, b"/Filter/FlateDecode", 0).is_some(),
+                "pack={pack}: xref stream must be deflated, got {shown}"
+            );
+            let doc = Document::load_mem(&out)
+                .unwrap_or_else(|e| panic!("pack={pack}: patched output must load: {e}"));
+            assert!(
+                !doc.get_pages().is_empty(),
+                "pack={pack}: pages must survive"
+            );
+        }
+    }
+
+    /// The patch must decline anything that is not exactly the object shape it
+    /// expects — including a file it has already compressed (no `/Filter`
+    /// twice) and truncated garbage.
+    #[test]
+    fn xref_compression_declines_unrecognized_tails() {
+        let pdf = build_pdf_duplicate_images(6, 400);
+        let out = optimize_with_options(&pdf, OptimizeOptions::default());
+        assert_eq!(
+            compress_xref_stream(out.clone()),
+            out,
+            "an already-deflated xref stream must be left alone"
+        );
+        for junk in [
+            b"".to_vec(),
+            b"%PDF-1.5\nstartxref\n999999\n%%EOF".to_vec(),
+            b"%PDF-1.5\nstartxref\nnotanumber\n%%EOF".to_vec(),
+            out[..out.len() / 2].to_vec(),
+        ] {
+            assert_eq!(
+                compress_xref_stream(junk.clone()),
+                junk,
+                "malformed input must pass through untouched"
+            );
+        }
+    }
+
+    /// Build a one-page PDF whose image stream is FlateDecode at level 1 —
+    /// i.e. what a careless producer ships, which is exactly what the final
+    /// re-deflate pass exists to improve on.
+    fn build_pdf_weakly_deflated(px: u32, draw_pts: i64) -> Vec<u8> {
+        use std::io::Write;
+        let raw = flate_pixels(px, px, 3);
+        let mut enc =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::new(1));
+        enc.write_all(&raw).unwrap();
+        let payload = enc.finish().unwrap();
+
+        let mut doc = Document::with_version("1.5");
+        let img_id = doc.add_object(Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Image",
+                "Width" => px as i64,
+                "Height" => px as i64,
+                "ColorSpace" => "DeviceRGB",
+                "BitsPerComponent" => 8_i64,
+                "Filter" => "FlateDecode",
+            },
+            payload,
+        ));
+        wrap_image_pdf(&mut doc, img_id, draw_pts)
+    }
+
+    /// Task 2: the pass must shrink a weakly-deflated stream while decoding to
+    /// byte-identical pixels. Exercised directly on the document, because the
+    /// pass deliberately runs at serialization time — see
+    /// `serialization_wins_do_not_rewrite_an_otherwise_unchanged_file` for the
+    /// end-to-end consequence of that placement.
+    #[test]
+    fn redeflate_shrinks_weakly_compressed_streams_losslessly() {
+        // Drawn at its own size, so nothing else in the pipeline would touch
+        // this stream even if it ran.
+        let pdf = build_pdf_weakly_deflated(120, 120);
+        let before_pixels = flate_image_pixels(&pdf);
+        let before_len = image_stream_len(&pdf);
+
+        let mut doc = Document::load_mem(&pdf).unwrap();
+        redeflate_flate_streams(&mut doc);
+        let mut out: Vec<u8> = Vec::new();
+        doc.save_to(&mut out).unwrap();
+
+        assert!(
+            image_stream_len(&out) < before_len,
+            "level-9 must beat level-1: {before_len} -> {}",
+            image_stream_len(&out)
+        );
+        assert_eq!(
+            flate_image_pixels(&out),
+            before_pixels,
+            "decoded samples must be byte-identical"
+        );
+    }
+
+    /// Pins the placement decision: the re-deflate pass and ObjStm packing are
+    /// serialization-time work, so a document where NOTHING semantic was
+    /// planned still comes back byte-identical. That is the crate's existing
+    /// "declined everything ⇒ your exact bytes" contract (see the early return
+    /// in `try_optimize`), and it bounds when the re-deflate win is realized.
+    #[test]
+    fn serialization_wins_do_not_rewrite_an_otherwise_unchanged_file() {
+        let pdf = build_pdf_weakly_deflated(120, 120);
+        assert_eq!(
+            optimize_with_options(&pdf, OptimizeOptions::default()),
+            pdf,
+            "no planned work ⇒ input returned unchanged"
+        );
+    }
+
+    /// The payload byte length of the (single) image stream.
+    fn image_stream_len(pdf: &[u8]) -> usize {
+        let doc = Document::load_mem(pdf).unwrap();
+        doc.objects
+            .values()
+            .find_map(|o| match o {
+                Object::Stream(s)
+                    if matches!(s.dict.get(b"Subtype"), Ok(Object::Name(n)) if n == b"Image") =>
+                {
+                    Some(s.content.len())
+                }
+                _ => None,
+            })
+            .expect("no image stream")
+    }
+
+    /// Task 2 gates: never-larger per stream, and idempotent across passes —
+    /// checked on every stream of a document that exercises several classes.
+    #[test]
+    fn redeflate_is_never_larger_and_idempotent() {
+        for pdf in [
+            build_pdf_flate(400, 100, Some(2)),
+            build_pdf_flate(400, 100, None),
+            build_pdf_duplicate_images(4, 400),
+        ] {
+            let once = optimize_with_options(&pdf, OptimizeOptions::default());
+            let twice = optimize_with_options(&once, OptimizeOptions::default());
+            assert_eq!(once, twice, "a second pass must be byte-identical");
+
+            // Never-larger, per stream: every Flate stream in the output is at
+            // most the size of its decoded content's level-9 re-deflate.
+            let doc = Document::load_mem(&once).unwrap();
+            for obj in doc.objects.values() {
+                let Object::Stream(s) = obj else { continue };
+                if !matches!(s.dict.get(b"Filter"), Ok(Object::Name(n)) if n == b"FlateDecode") {
+                    continue;
+                }
+                assert!(
+                    replan_deflate(&s.content).is_none(),
+                    "a shipped stream still had slack: {} bytes",
+                    s.content.len()
+                );
+            }
+        }
+    }
+
+    /// A PDF/A conformance claim disables the pass wholesale (same posture as
+    /// font subsetting), so a weakly-deflated stream ships untouched.
+    #[test]
+    fn redeflate_declines_pdfa_and_signed_documents() {
+        for marker in ["pdfa", "signed"] {
+            let pdf = build_pdf_weakly_deflated(120, 120);
+            let mut doc = Document::load_mem(&pdf).unwrap();
+            let before = image_stream_len(&pdf);
+            match marker {
+                "pdfa" => {
+                    let meta = doc.add_object(Stream::new(
+                        dictionary! { "Type" => "Metadata", "Subtype" => "XML" },
+                        b"<x:xmpmeta><pdfaid:part>2</pdfaid:part></x:xmpmeta>".to_vec(),
+                    ));
+                    doc.catalog_mut().unwrap().set("Metadata", meta);
+                }
+                _ => {
+                    let sig = doc.add_object(dictionary! {
+                        "Type" => "Sig",
+                        "ByteRange" => vec![0.into(), 0.into(), 0.into(), 0.into()],
+                    });
+                    doc.catalog_mut().unwrap().set("Perms", sig);
+                }
+            }
+            let mut marked: Vec<u8> = Vec::new();
+            doc.save_to(&mut marked).unwrap();
+
+            redeflate_flate_streams(&mut Document::load_mem(&marked).unwrap());
+            let mut reloaded = Document::load_mem(&marked).unwrap();
+            redeflate_flate_streams(&mut reloaded);
+            let after = reloaded
+                .objects
+                .values()
+                .find_map(|o| match o {
+                    Object::Stream(s)
+                        if matches!(s.dict.get(b"Subtype"), Ok(Object::Name(n)) if n == b"Image") =>
+                    {
+                        Some(s.content.len())
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(after, before, "{marker}: stream must be untouched");
+        }
+    }
+
+    /// Task 3: the flipped default really produces ObjStm-packed output, and
+    /// the escape hatch really produces the old flat layout.
+    #[test]
+    fn default_packs_object_streams_and_opt_out_does_not() {
+        let pdf = build_pdf_duplicate_images(6, 400);
+        let packed = optimize_with_options(&pdf, OptimizeOptions::default());
+        let flat = optimize_with_options(
+            &pdf,
+            OptimizeOptions::default().with_pack_object_streams(false),
+        );
+
+        assert!(
+            find_sub(&packed, b"/Type/ObjStm", 0).is_some(),
+            "default output must be ObjStm-packed"
+        );
+        assert!(
+            find_sub(&flat, b"/Type/ObjStm", 0).is_none(),
+            "--no-pack-object-streams must produce the flat layout"
+        );
+        assert!(
+            packed.len() < flat.len(),
+            "packing must win on an object-heavy document: {} vs {}",
+            packed.len(),
+            flat.len()
+        );
+        assert!(Document::load_mem(&packed).is_ok());
+        assert!(Document::load_mem(&flat).is_ok());
+    }
+
     #[test]
     fn downsamples_over_resolution_image() {
         // 400px drawn into 100pt box => ~288 DPI, well above the 130 target.
@@ -3855,7 +4369,10 @@ mod tests {
         assert_eq!(d.jpeg_quality, 78);
         assert_eq!(d.dpi_margin, 1.15);
         assert!(!d.strip_accessibility);
-        assert!(!d.pack_object_streams);
+        assert!(
+            d.pack_object_streams,
+            "ObjStm packing is default-ON (measured −162,069 B / 3.27% on NASA)"
+        );
         assert!(
             d.downsample_flate_images,
             "Flate downsampling is default-ON (0.2.0)"
@@ -3878,7 +4395,7 @@ mod tests {
             .with_jpeg_quality(60)
             .with_dpi_margin(1.5)
             .with_strip_accessibility(true)
-            .with_pack_object_streams(true)
+            .with_pack_object_streams(false)
             .with_downsample_flate_images(false)
             .with_subset_fonts(true)
             .with_recompress_bitonal_images(true)
@@ -3887,7 +4404,7 @@ mod tests {
         assert_eq!(o.jpeg_quality, 60);
         assert_eq!(o.dpi_margin, 1.5);
         assert!(o.strip_accessibility);
-        assert!(o.pack_object_streams);
+        assert!(!o.pack_object_streams);
         assert!(!o.downsample_flate_images);
         assert!(o.subset_fonts);
         assert!(o.recompress_bitonal_images);

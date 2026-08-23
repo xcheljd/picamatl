@@ -187,8 +187,11 @@ fn resolve_ref<'a>(doc: &'a Document, mut obj: &'a Object) -> (Option<ObjectId>,
 /// True when the document declares PDF/A conformance in its XMP metadata (or
 /// when the metadata exists but cannot be read strictly — treated as "cannot
 /// rule PDF/A out"). Subsetting would invalidate `/CIDSet`-style conformance
-/// artifacts, so such documents are skipped wholesale in C-M1.
-fn pdfa_blocked(doc: &Document) -> bool {
+/// artifacts, so such documents are skipped wholesale in C-M1. Also consumed by
+/// the final re-deflate pass in `lib.rs`, which declines conformance-claiming
+/// documents for the same "do not touch a document that asserts its own byte
+/// shape" reason.
+pub(crate) fn pdfa_blocked(doc: &Document) -> bool {
     let Ok(catalog) = doc.catalog() else {
         return true;
     };
