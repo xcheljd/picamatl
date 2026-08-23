@@ -1640,7 +1640,9 @@ fn plan_gray_collapses(doc: &Document) -> Vec<GrayCollapse> {
             }
             let rgb = img.into_rgb8().into_raw();
             if rgb
-                .chunks_exact(3)
+                .as_chunks::<3>()
+                .0
+                .iter()
                 .any(|px| px[0] != px[1] || px[1] != px[2])
             {
                 return None;
