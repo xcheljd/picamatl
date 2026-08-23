@@ -198,6 +198,19 @@ pub struct OptimizeOptions {
     /// Default: `false`.
     pub allow_lossy_reencode: bool,
 
+    /// Collapse channel-identical `/DeviceRGB` FlateDecode images to
+    /// `/DeviceGray`: when EVERY pixel has R == G == B exactly, store the
+    /// single channel instead of three. Sample-preserving — the decoded
+    /// value of each pixel is unchanged, and the PDF color model defines
+    /// DeviceGray g as DeviceRGB (g, g, g) — but it does rewrite
+    /// `/ColorSpace`, so like the bitonal G4 recompression it stays opt-in
+    /// for at least one release cycle. Scope: unmasked-or-SMasked 8-bit
+    /// plain-`/DeviceRGB` images only (ICCBased color is never collapsed —
+    /// dropping a profile is not sample-preserving in color meaning; a
+    /// color-key `/Mask` is RGB-range-based and disqualifies). Replaced only
+    /// when the gray stream is strictly smaller. Default: `false`.
+    pub collapse_gray_images: bool,
+
     /// Deflate implementation for the final serialization passes: the
     /// whole-document re-deflate (`redeflate_flate_streams`) and the
     /// cross-reference stream. [`DeflateBackend::Zopfli`] spends ~30× the CPU
@@ -239,6 +252,7 @@ impl Default for OptimizeOptions {
             subset_fonts: true,
             recompress_bitonal_images: false,
             allow_lossy_reencode: false,
+            collapse_gray_images: false,
             deflate_backend: DeflateBackend::Zlib,
         }
     }
@@ -313,6 +327,15 @@ impl OptimizeOptions {
     #[must_use]
     pub fn with_allow_lossy_reencode(mut self, allow: bool) -> Self {
         self.allow_lossy_reencode = allow;
+        self
+    }
+
+    /// Enable/disable collapsing channel-identical DeviceRGB Flate images to
+    /// DeviceGray (off by default). See
+    /// [`OptimizeOptions::collapse_gray_images`].
+    #[must_use]
+    pub fn with_collapse_gray_images(mut self, collapse: bool) -> Self {
+        self.collapse_gray_images = collapse;
         self
     }
 
@@ -1553,6 +1576,102 @@ fn plan_flate(
     }
 }
 
+/// One planned RGB→Gray collapse: the gray payload plus the predictor parms
+/// it was encoded under (`None` = plain rows). Applied by `try_optimize`
+/// together with the `/ColorSpace /DeviceGray` rewrite.
+struct GrayCollapse {
+    id: ObjectId,
+    content: Vec<u8>,
+    decode_parms: Option<lopdf::Dictionary>,
+}
+
+/// Plan every eligible RGB→Gray collapse in parallel (read-only against the
+/// document). See [`OptimizeOptions::collapse_gray_images`] for scope; every
+/// gate declines on doubt, and a candidate is kept only when the gray stream
+/// is strictly smaller than the RGB one it replaces.
+fn plan_gray_collapses(doc: &Document) -> Vec<GrayCollapse> {
+    let candidates: Vec<(ObjectId, &lopdf::Stream)> = doc
+        .objects
+        .iter()
+        .filter_map(|(&id, obj)| {
+            let Object::Stream(stream) = obj else {
+                return None;
+            };
+            let dict = &stream.dict;
+            if !matches!(dict.get(b"Subtype"), Ok(Object::Name(n)) if n == b"Image") {
+                return None;
+            }
+            // A color-key /Mask is a range over the CURRENT color space's
+            // components — collapsing under one would change what it masks.
+            if dict.get(b"Mask").is_ok() {
+                return None;
+            }
+            // Plain /DeviceRGB only: ICCBased color carries a profile that a
+            // /DeviceGray rewrite would silently drop.
+            if !matches!(
+                dict.get(b"ColorSpace").map(|o| resolve(doc, o)),
+                Ok(Object::Name(n)) if n == b"DeviceRGB"
+            ) {
+                return None;
+            }
+            let filter = dict.get(b"Filter").ok()?;
+            matches!(classify_filter(doc, filter), FilterClass::FlateOnly).then_some((id, stream))
+        })
+        .collect();
+
+    candidates
+        .into_par_iter()
+        .filter_map(|(id, stream)| {
+            let px_w = u32::try_from(
+                resolve(doc, stream.dict.get(b"Width").ok()?)
+                    .as_i64()
+                    .ok()?,
+            )
+            .ok()?;
+            let px_h = u32::try_from(
+                resolve(doc, stream.dict.get(b"Height").ok()?)
+                    .as_i64()
+                    .ok()?,
+            )
+            .ok()?;
+            let (img, channels) = decode_flate_image(doc, stream, px_w, px_h)?;
+            if channels != 3 {
+                return None;
+            }
+            let rgb = img.into_rgb8().into_raw();
+            if rgb
+                .chunks_exact(3)
+                .any(|px| px[0] != px[1] || px[1] != px[2])
+            {
+                return None;
+            }
+            let gray: Vec<u8> = rgb.iter().step_by(3).copied().collect();
+
+            // Same encoder choice as `plan_flate`: plain vs Up-filtered rows,
+            // the predictor variant paying for the /DecodeParms it forces in.
+            let plain = deflate_level9(&gray)?;
+            let up = deflate_level9(&png_up_filter(&gray, px_w, 1))?;
+            const PARMS_OVERHEAD: usize = 70;
+            let (content, decode_parms) = if up.len() + PARMS_OVERHEAD < plain.len() {
+                let parms = dictionary! {
+                    "Predictor" => 15_i64,
+                    "Colors" => 1_i64,
+                    "BitsPerComponent" => 8_i64,
+                    "Columns" => px_w as i64,
+                };
+                (up, Some(parms))
+            } else {
+                (plain, None)
+            };
+            (content.len() < stream.content.len()).then_some(GrayCollapse {
+                id,
+                content,
+                decode_parms,
+            })
+        })
+        .collect()
+}
+
 /// The shared decode stage of every unmasked-Flate transform: all of
 /// `plan_flate`'s eligibility gates (8-bit only, no `/Decode`, handled color
 /// space, decodable predictor layout), the decompression-bomb cap, capped
@@ -2340,6 +2459,14 @@ fn try_optimize(input: &[u8], options: OptimizeOptions) -> Result<Option<Vec<u8>
         Vec::new()
     };
 
+    // Gray-collapse work detection runs on the ORIGINAL document (the real
+    // plan runs later, against post-replacement pixels, because a downsampled
+    // candidate must be collapsed at its new geometry — and a downsample of a
+    // channel-identical image is itself channel-identical). Only the yes/no
+    // matters here: it decides whether a file with no other work still gets
+    // rewritten.
+    let gray_work = options.collapse_gray_images && !plan_gray_collapses(&doc).is_empty();
+
     // If we have no work to do at all, hand back the original bytes.
     // Note: the serialization-time passes — pack_object_streams, the final
     // re-deflate, and the xref-stream compression — are deliberately NOT
@@ -2356,6 +2483,7 @@ fn try_optimize(input: &[u8], options: OptimizeOptions) -> Result<Option<Vec<u8>
         && bitonal_plans.is_empty()
         && !options.strip_accessibility
         && !merged_streams
+        && !gray_work
     {
         return Ok(None);
     }
@@ -2429,6 +2557,30 @@ fn try_optimize(input: &[u8], options: OptimizeOptions) -> Result<Option<Vec<u8>
                     "BlackIs1" => false,
                 }),
             );
+        }
+    }
+
+    // Collapse channel-identical DeviceRGB Flate images to DeviceGray.
+    // Planned HERE — after the image replacements above are applied — so a
+    // just-downsampled candidate is collapsed at its final geometry rather
+    // than racing the downsample for the same stream.
+    if options.collapse_gray_images {
+        for g in plan_gray_collapses(&doc) {
+            if let Ok(Object::Stream(stream)) = doc.get_object_mut(g.id) {
+                stream.set_content(g.content);
+                stream
+                    .dict
+                    .set("ColorSpace", Object::Name(b"DeviceGray".to_vec()));
+                stream
+                    .dict
+                    .set("Filter", Object::Name(b"FlateDecode".to_vec()));
+                match g.decode_parms {
+                    Some(parms) => stream.dict.set("DecodeParms", Object::Dictionary(parms)),
+                    None => {
+                        stream.dict.remove(b"DecodeParms");
+                    }
+                }
+            }
         }
     }
 
@@ -4651,6 +4803,92 @@ mod tests {
         }
     }
 
+    /// Build a one-page PDF with a channel-identical RGB Flate image (every
+    /// pixel R==G==B), drawn at its own size so downsampling never fires.
+    fn build_pdf_gray_in_rgb(px: u32) -> Vec<u8> {
+        let gray = flate_pixels(px, px, 1);
+        let rgb: Vec<u8> = gray.iter().flat_map(|&g| [g, g, g]).collect();
+        let payload = deflate_level9(&rgb).unwrap();
+        let mut doc = Document::with_version("1.5");
+        let img_id = doc.add_object(Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Image",
+                "Width" => px as i64,
+                "Height" => px as i64,
+                "ColorSpace" => "DeviceRGB",
+                "BitsPerComponent" => 8_i64,
+                "Filter" => "FlateDecode",
+            },
+            payload,
+        ));
+        wrap_image_pdf(&mut doc, img_id, px as i64)
+    }
+
+    /// The collapse must rewrite /ColorSpace to DeviceGray, keep the decoded
+    /// samples byte-identical to the shared channel, and be idempotent.
+    #[test]
+    fn gray_collapse_rewrites_channel_identical_rgb() {
+        let px = 64;
+        let pdf = build_pdf_gray_in_rgb(px);
+        let opts = OptimizeOptions::default().with_collapse_gray_images(true);
+        let out = optimize_with_options(&pdf, opts);
+        assert!(out.len() < pdf.len(), "the gray stream must be smaller");
+
+        let doc = Document::load_mem(&out).unwrap();
+        let stream = doc
+            .objects
+            .values()
+            .find_map(|o| match o {
+                Object::Stream(s)
+                    if matches!(s.dict.get(b"Subtype"), Ok(Object::Name(n)) if n == b"Image") =>
+                {
+                    Some(s)
+                }
+                _ => None,
+            })
+            .expect("no image stream");
+        assert!(
+            matches!(stream.dict.get(b"ColorSpace"), Ok(Object::Name(n)) if n == b"DeviceGray"),
+            "/ColorSpace must be DeviceGray after the collapse"
+        );
+        let (img, channels) = decode_flate_image(&doc, stream, px, px).unwrap();
+        assert_eq!(channels, 1);
+        assert_eq!(
+            img.into_luma8().into_raw(),
+            flate_pixels(px, px, 1),
+            "decoded samples must equal the shared channel exactly"
+        );
+
+        assert_eq!(
+            optimize_with_options(&out, opts),
+            out,
+            "a second pass must be byte-identical"
+        );
+    }
+
+    /// Off by default (the /ColorSpace rewrite is consent-gated), and a true
+    /// color image must never be touched even with the flag on.
+    #[test]
+    fn gray_collapse_is_opt_in_and_declines_true_color() {
+        let pdf = build_pdf_gray_in_rgb(64);
+        assert_eq!(
+            optimize_with_options(&pdf, OptimizeOptions::default()),
+            pdf,
+            "collapse must be opt-in"
+        );
+
+        let color = build_pdf_flate(64, 64, None);
+        assert_eq!(
+            optimize_with_options(
+                &color,
+                OptimizeOptions::default().with_collapse_gray_images(true)
+            ),
+            color,
+            "distinct channels must pass through untouched"
+        );
+    }
+
     /// The ObjStm zopfli patch: on a packed save it must produce output that
     /// is never larger, re-parses, and decodes to the same objects; on
     /// anything that is not exactly a packed lopdf tail it must decline.
@@ -5095,6 +5333,11 @@ mod tests {
             d.deflate_backend,
             DeflateBackend::Zlib,
             "zopfli is opt-in: ~30× the CPU belongs behind a flag"
+        );
+        assert!(
+            !d.collapse_gray_images,
+            "RGB→Gray collapse rewrites /ColorSpace, so it is opt-in \
+             (same posture as bitonal G4)"
         );
     }
 

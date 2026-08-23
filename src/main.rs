@@ -33,13 +33,15 @@ fn defaults_blurb() -> String {
         "Boolean defaults (from OptimizeOptions::default()):\n  \
          strip-accessibility {}, pack-object-streams {},\n  \
          downsample-flate-images {}, subset-fonts {},\n  \
-         recompress-bitonal-images {}, allow-lossy {}",
+         recompress-bitonal-images {}, allow-lossy {},\n  \
+         collapse-gray-images {}",
         on_off(d.strip_accessibility),
         on_off(d.pack_object_streams),
         on_off(d.downsample_flate_images),
         on_off(d.subset_fonts),
         on_off(d.recompress_bitonal_images),
         on_off(d.allow_lossy_reencode),
+        on_off(d.collapse_gray_images),
     )
 }
 
@@ -125,6 +127,14 @@ struct Cli {
     #[arg(long = "no-allow-lossy")]
     no_allow_lossy: bool,
 
+    /// Losslessly collapse channel-identical DeviceRGB Flate images to
+    /// DeviceGray (rewrites /ColorSpace; strictly opt-in)
+    #[arg(long, overrides_with = "no_collapse_gray_images")]
+    collapse_gray_images: bool,
+    /// Do not collapse channel-identical RGB images to grayscale
+    #[arg(long)]
+    no_collapse_gray_images: bool,
+
     /// Deflate backend for the final re-deflate and xref-stream passes:
     /// zopfli is ~30x the CPU for a few percent smaller output
     #[arg(long, value_enum, value_name = "BACKEND")]
@@ -193,6 +203,11 @@ fn options_from(cli: &Cli) -> OptimizeOptions {
             cli.allow_lossy,
             cli.no_allow_lossy,
             d.allow_lossy_reencode,
+        ))
+        .with_collapse_gray_images(resolve(
+            cli.collapse_gray_images,
+            cli.no_collapse_gray_images,
+            d.collapse_gray_images,
         ))
         .with_deflate_backend(
             cli.deflate_backend
