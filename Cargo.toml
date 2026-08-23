@@ -1,6 +1,6 @@
 [package]
 name = "amatl"
-version = "0.2.2"
+version = "0.3.0"
 description = "Pure-Rust PDF size optimizer: CTM-aware effective-DPI downsampling of embedded JPEG and Flate images, opt-in Type0 font subsetting, with a hard fail-safe contract"
 authors = ["Xchel Dominguez <xjdom2@gmail.com>"]
 license = "MIT OR Apache-2.0"

@@ -8,6 +8,10 @@ and this project adheres to
 
 ## [Unreleased]
 
+[Unreleased]: nothing yet.
+
+## [0.3.0] - 2026-08-22
+
 ### Added
 
 - **Consent-gated lossy Flate→JPEG re-encode (Phase 7 spike) — SHIPPED BEHIND
@@ -86,7 +90,7 @@ and this project adheres to
 - **`SmaskUse` eligibility split.** `eligible_smask` now takes a usage intent;
   the shared-mask refcount guard applies to resize-intent lookups only.
 
-[Unreleased]: nothing yet.
+[0.3.0]: nothing yet.
 
 ## [0.2.2] - 2026-08-22
 
