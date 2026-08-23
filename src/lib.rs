@@ -32,6 +32,17 @@
 //!   with no `/Matte`. `/Mask` (stencil/color-key) images and any ineligible
 //!   `/SMask` stay untouched.
 //!
+//!   Soft-masked FlateDecode bases (D-M3) take the coupled downsample when
+//!   over-resolution; otherwise they are untouched by default, and with the
+//!   `allow_lossy_reencode` consent flag they take the dimension-preserving
+//!   Flate→JPEG conversion. That conversion rewrites the base stream only —
+//!   the `/SMask` object keeps its bytes and its dimensions, so alignment is
+//!   preserved by construction (and shared masks stay safe for the same
+//!   reason the D-M1 requant is safe for them). Under the same flag the
+//!   over-resolution coupled downsample also runs a JPEG competitor at its
+//!   TARGET geometry, against the losslessly resampled mask, so a masked pair
+//!   reaches its final encoding in one pass instead of two.
+//!
 //! Optionally (opt-in via [`OptimizeOptions::subset_fonts`]), embedded
 //! Type0/CIDFontType2 (Identity-H/V) fonts are subset to the glyphs actually
 //! shown, using a `/CIDToGIDMap`-stream technique that never rewrites
@@ -168,9 +179,16 @@ pub struct OptimizeOptions {
     /// downsample and the smaller candidate wins; images at/below the DPI
     /// threshold are re-encoded at their own geometry, replaced only when the
     /// JPEG saves at least 5% AND passes decode-back verification. Indexed,
-    /// CMYK, and non-8-bit images are never converted; images with `/SMask`
-    /// are excluded (coupled lossy conversion needs its own mask-alignment
-    /// analysis). Default: `false`.
+    /// CMYK, and non-8-bit images are never converted. Images with an eligible
+    /// `/SMask` convert too: on the dimension-preserving path the mask
+    /// stream's bytes and geometry are never modified, so base/mask alignment
+    /// is preserved by construction, and on the over-resolution coupled
+    /// downsample the JPEG candidate is computed at the SAME target geometry
+    /// the mask is losslessly resampled to, so the two land on identical pixel
+    /// grids (both validated by the mask-alignment compositing experiment — a
+    /// hard-edged or antialiased mask over a q78 4:2:0 base shows no
+    /// misregistration, only the JPEG quantization this flag consents to).
+    /// Default: `false`.
     pub allow_lossy_reencode: bool,
 }
 
@@ -730,10 +748,14 @@ fn plan_replacement(
     //     the configured quality, and the `/SMask` stream is never modified.
     //   - FlateDecode bases (D-M3): OVER-RESOLUTION pairs take the same
     //     atomic coupled downsample, with the base going through the
-    //     format-preserving Flate→Flate path; pairs at/below the target are
-    //     left untouched — there is no requantization analogue for lossless
-    //     payloads (that would be a lossy re-encode, which has no consent
-    //     surface yet).
+    //     format-preserving Flate→Flate path — or, under
+    //     `allow_lossy_reencode`, through whichever of that path and a JPEG
+    //     candidate at the same target geometry is smaller. Pairs that do not take that
+    //     downsample are left untouched by default — the lossless requant
+    //     analogue does not exist for a lossless payload — but with the
+    //     `allow_lossy_reencode` consent flag they take the
+    //     dimension-preserving Flate→JPEG conversion, which rewrites the base
+    //     only and never the `/SMask` stream.
     //
     // Idempotence guard (D-M1, % ported to the D-M2 pair below): requantization
     // is lossy, so re-running it on an already-requantized payload keeps
@@ -752,15 +774,35 @@ fn plan_replacement(
             smask_raw.is_some_and(|value| eligible_smask(doc, value, SmaskUse::Resize).is_some())
         };
         if matches!(class, FilterClass::FlateOnly) {
-            // D-M3: the masked-Flate pair. Only the over-resolution coupled
-            // downsample exists on this branch, gated by the same consent
-            // flag as the unmasked Flate path. A shared mask is never
-            // resized, and a lossless base has no requant analogue — skip.
+            // D-M3: the masked-Flate pair. Two transforms live here — the
+            // over-resolution coupled downsample (gated by the same consent
+            // flag as the unmasked Flate path; a shared mask is never
+            // resized), which under `allow_lossy_reencode` also runs a JPEG
+            // competitor at its target geometry, and, when that downsample is
+            // NOT taken, the dimension-preserving Flate→JPEG conversion under
+            // the same flag. The dimension-preserving conversion never touches
+            // the mask stream (`Replacement::smask` is `None`), so it is safe
+            // for shared masks by exactly the P-M1 argument; the competitor
+            // inside the downsample resizes the mask either way, so it stays
+            // behind the `resize_eligible()` gate and changes nothing about
+            // shared-mask exposure.
             if !over_resolution || !options.downsample_flate_images || !resize_eligible() {
+                if options.allow_lossy_reencode {
+                    return plan_flate_lossy_requant_replacement(
+                        doc, stream, options, id, px_w, px_h,
+                    );
+                }
                 return None;
             }
+            // The coupled downsample was ATTEMPTED. With consent it carries its
+            // own JPEG competitor at the target geometry (Option B), so the
+            // full harvest lands in ONE pass; if the pair declines (decode-back
+            // mismatch, or it does not save the 5% minimum) it stays untouched.
+            // There is still no lossy fallback AFTER a decline — that would
+            // re-litigate a resampling decision the lossless path already made,
+            // the same no-compounding-losses rule the unmasked path applies.
             return plan_flate_smask_pair_downsample(
-                doc, id, mask_id, stream, px_w, px_h, target_w, target_h,
+                doc, id, mask_id, stream, px_w, px_h, target_w, target_h, options,
             );
         }
         if over_resolution {
@@ -1317,6 +1359,31 @@ fn plan_smask_pair_downsample(
 /// single returned `Replacement` so the apply pass replaces them together.
 /// Any doubt on either side, or a COMBINED size that fails the never-larger /
 /// 5% minimum-savings guard, returns `None` and the whole pair stays untouched.
+///
+/// Phase 7 (Option B): under `allow_lossy_reencode` the base additionally gets
+/// a JPEG competitor at the SAME target geometry, mirroring the unmasked
+/// over-resolution competition in `plan_replacement`. The mask half is
+/// unchanged either way — it is still the losslessly resampled
+/// `plan_mask_resample` raster at the base's target geometry — so base and
+/// mask land on identical pixel grids whichever base candidate wins.
+///
+/// SHARED-MASK REASONING (P-M1 line): a target-geometry JPEG competitor sits
+/// squarely on the RESIZE side of the requant-safe / resize-blocked split. It
+/// does not widen the pair's mask exposure by one byte — the mask is resampled
+/// here regardless of which base candidate wins, so this whole function is
+/// already gated on `SmaskUse::Resize` eligibility in `plan_replacement` and a
+/// shared mask never reaches it at all. The competitor changes only the base
+/// stream's ENCODING, and every base that reaches it was already going to be
+/// resampled losslessly. Nothing about the shared-mask refcount guard moves.
+///
+/// This is also what restores one-pass idempotence for masked Flate pairs:
+/// before the competitor existed, pass 1 downsampled the pair to Flate-at-
+/// target and pass 2 then saw an at-target masked *Flate* base and converted it
+/// through `plan_flate_lossy_requant_replacement`, splitting one harvest across
+/// two passes. With the competitor, the conversion happens in pass 1 and the
+/// pass-2 base is DCTDecode at target geometry — not over-resolution, so it
+/// takes only the D-M1 requant, which its own 5% guard declines. Pinned by
+/// `smask_flate_lossy_pair_is_idempotent_in_one_pass`.
 #[allow(clippy::too_many_arguments)] // mirrors plan_smask_pair_downsample's flat signature
 fn plan_flate_smask_pair_downsample(
     doc: &Document,
@@ -1327,6 +1394,7 @@ fn plan_flate_smask_pair_downsample(
     px_h: u32,
     target_w: u32,
     target_h: u32,
+    options: OptimizeOptions,
 ) -> Option<Replacement> {
     // Base: the exact eligibility gates and re-encode variants of the unmasked
     // Flate route (8bpc only, no /Decode, capped inflate + exact length check,
@@ -1344,17 +1412,44 @@ fn plan_flate_smask_pair_downsample(
     // candidate, including the mask's dict-token overhead, must beat the
     // pair's original size by the full 5% to replace both streams.
     let combined_original = base_stream.content.len() + mask_stream.content.len();
-    let combined_candidate = base_out.len() + mask_out.len() + MASK_DICT_OVERHEAD;
+    let combined_lossless = base_out.len() + mask_out.len() + MASK_DICT_OVERHEAD;
+
+    // NO COMPOUNDING LOSSES, the pair's form of the unmasked rule: the geometry
+    // change is the LOSSLESS path's decision. If the fully lossless pair
+    // candidate would itself be declined by the combined guard below — the
+    // resample did not pay for itself in the format that preserves every sample
+    // — then a JPEG base must not resurrect it by hiding the resolution loss
+    // behind a DCT win. The predicate is the exact guard the pair is judged by,
+    // so "declined" means the same thing on both sides.
+    let lossless_declined = combined_lossless * 100 >= combined_original * 95;
+    let lossy = if options.allow_lossy_reencode && !lossless_declined {
+        // The line-art content guard lives inside `plan_flate_to_jpeg` and is
+        // evaluated on the decoded SOURCE pixels; declining there just leaves
+        // the lossless downsample to ship, i.e. exactly the flag-off pair.
+        plan_flate_to_jpeg(doc, base_stream, options, px_w, px_h, target_w, target_h)
+    } else {
+        None
+    };
+
+    // Smaller base wins. The mask half is byte-for-byte the same either way, so
+    // comparing the base candidates alone is the same comparison as comparing
+    // the two combined pairs.
+    let (content, dict_update) = match lossy {
+        Some(jpeg_out) if jpeg_out.len() < base_out.len() => (jpeg_out, DictUpdate::FlateToJpeg),
+        _ => (base_out, DictUpdate::Flate { decode_parms }),
+    };
+
+    let combined_candidate = content.len() + mask_out.len() + MASK_DICT_OVERHEAD;
     if combined_candidate * 100 >= combined_original * 95 {
         return None;
     }
 
     Some(Replacement {
         id,
-        content: base_out,
+        content,
         width: target_w as i64,
         height: target_h as i64,
-        dict_update: DictUpdate::Flate { decode_parms },
+        dict_update,
         smask: Some(MaskReplacement {
             mask_id,
             content: mask_out,
@@ -3585,12 +3680,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn lossy_reencode_masked_flate_base_is_excluded() {
-        // Spike scope line: a Flate base carrying an /SMask is NOT converted
-        // (coupled lossy conversion needs its own mask-alignment analysis).
-        // Under-resolution masked pair + flag on ⇒ byte-identical output.
-        let px = 200u32;
+    /// A one-page PDF holding a `px`-square FlateDecode RGB base with an
+    /// eligible plain 8-bit DeviceGray `/SMask`, drawn into `draw_pts`.
+    /// `base` supplies the base pixels so callers can vary the content class.
+    fn build_pdf_masked_flate(base: &[u8], px: u32, draw_pts: i64) -> Vec<u8> {
         let mut doc = Document::with_version("1.5");
         let mask_id = doc.add_object(Stream::new(
             dictionary! {
@@ -3615,15 +3708,213 @@ mod tests {
                 "Filter" => "FlateDecode",
                 "SMask" => mask_id,
             },
-            deflate_level9(&photo_pixels(px, px, 3)).unwrap(),
+            deflate_level9(base).unwrap(),
         ));
-        let pdf = wrap_image_pdf(&mut doc, img_id, 200);
+        wrap_image_pdf(&mut doc, img_id, draw_pts)
+    }
+
+    /// Every masked image stream as `(filter name, /SMask target, w, h)`.
+    fn masked_bases(pdf: &[u8]) -> Vec<(Vec<u8>, ObjectId, i64, i64)> {
+        let doc = Document::load_mem(pdf).unwrap();
+        let mut out: Vec<_> = doc
+            .objects
+            .iter()
+            .filter_map(|(id, obj)| match obj {
+                Object::Stream(s)
+                    if matches!(s.dict.get(b"Subtype"), Ok(Object::Name(n)) if n == b"Image")
+                        && s.dict.get(b"SMask").is_ok() =>
+                {
+                    let filter = match s.dict.get(b"Filter").unwrap() {
+                        Object::Name(n) => n.clone(),
+                        Object::Array(items) => match &items[0] {
+                            Object::Name(n) => n.clone(),
+                            other => panic!("unexpected filter element {other:?}"),
+                        },
+                        other => panic!("unexpected filter {other:?}"),
+                    };
+                    let mask = match s.dict.get(b"SMask").unwrap() {
+                        Object::Reference(r) => *r,
+                        other => panic!("fixture uses indirect masks, got {other:?}"),
+                    };
+                    let w = s.dict.get(b"Width").unwrap().as_i64().unwrap();
+                    let h = s.dict.get(b"Height").unwrap().as_i64().unwrap();
+                    Some((*id, (filter, mask, w, h)))
+                }
+                _ => None,
+            })
+            .collect();
+        out.sort_by_key(|(id, _)| *id);
+        out.into_iter().map(|(_, v)| v).collect()
+    }
+
+    /// A mask stream's `(bytes, width, height)`.
+    fn mask_shape(pdf: &[u8], mask_id: ObjectId) -> (Vec<u8>, i64, i64) {
+        let doc = Document::load_mem(pdf).unwrap();
+        let s = doc.get_object(mask_id).unwrap().as_stream().unwrap();
+        (
+            s.content.clone(),
+            s.dict.get(b"Width").unwrap().as_i64().unwrap(),
+            s.dict.get(b"Height").unwrap().as_i64().unwrap(),
+        )
+    }
+
+    #[test]
+    fn lossy_reencode_converts_masked_flate_base_keeps_mask() {
+        // A Flate base carrying an eligible /SMask, under-resolution (200 px
+        // into 200 pt ⇒ 72 DPI, so the D-M3 coupled downsample does not
+        // apply). With consent it takes the DIMENSION-PRESERVING Flate→JPEG
+        // conversion: the base becomes DCTDecode at the same geometry and the
+        // mask stream is not touched at all — same bytes, same /Width//Height
+        // — which is what keeps base and mask aligned (mask-alignment
+        // experiment: hard-edged and antialiased masks alike show no
+        // misregistration over a q78 4:2:0 base).
+        let px = 200u32;
+        let pdf = build_pdf_masked_flate(&photo_pixels(px, px, 3), px, 200);
+        let before = masked_bases(&pdf);
+        assert_eq!(before.len(), 1, "fixture holds one masked base");
+        let mask_id = before[0].1;
+        let mask_before = mask_shape(&pdf, mask_id);
 
         let opts = OptimizeOptions::default().with_allow_lossy_reencode(true);
         let out = optimize_with_options(&pdf, opts);
+        assert!(out.len() < pdf.len(), "the conversion must shrink the file");
+
+        let after = masked_bases(&out);
+        assert_eq!(after.len(), 1, "the masked base must survive");
+        let (filter, mask_after_id, w, h) = &after[0];
+        assert_eq!(filter.as_slice(), b"DCTDecode", "base converted to JPEG");
         assert_eq!(
-            out, pdf,
-            "masked Flate bases are out of the spike's scope — untouched"
+            (*w, *h),
+            (px as i64, px as i64),
+            "the conversion is dimension-preserving"
+        );
+        assert_eq!(*mask_after_id, mask_id, "the /SMask reference is intact");
+        assert_eq!(
+            mask_shape(&out, mask_id),
+            mask_before,
+            "the mask stream must be byte-identical, same dimensions"
+        );
+        assert!(Document::load_mem(&out).is_ok(), "output must load back");
+
+        // Flag off, same fixture: nothing at all happens (the pre-consent
+        // behavior of this branch is unchanged).
+        assert_eq!(
+            optimize(&pdf),
+            pdf,
+            "without consent the masked Flate pair stays untouched"
+        );
+    }
+
+    #[test]
+    fn lossy_reencode_shared_mask_bases_convert_mask_untouched() {
+        // Two under-resolution Flate bases sharing ONE /SMask object. The
+        // conversion never modifies a mask stream, so a shared mask does not
+        // block it (exactly the P-M1 argument that lets shared-mask DCT pairs
+        // requantize): both bases convert, the single mask stays byte-identical
+        // at the same dimensions, and both /SMask refs still point at it.
+        let px = 200u32;
+        let mut doc = Document::with_version("1.5");
+        let mask_id = doc.add_object(Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Image",
+                "Width" => px as i64,
+                "Height" => px as i64,
+                "ColorSpace" => "DeviceGray",
+                "BitsPerComponent" => 8_i64,
+                "Filter" => "FlateDecode",
+            },
+            deflate_level9(&photo_pixels(px, px, 1)).unwrap(),
+        ));
+        let pixels_a = photo_pixels(px, px, 3);
+        // Inverted pixels: still photographic, but different bytes, so
+        // `dedup_streams` cannot merge the two BASES into one object.
+        let pixels_b: Vec<u8> = pixels_a.iter().map(|b| 255 - b).collect();
+        let base_dict = |mask: ObjectId| {
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Image",
+                "Width" => px as i64,
+                "Height" => px as i64,
+                "ColorSpace" => "DeviceRGB",
+                "BitsPerComponent" => 8_i64,
+                "Filter" => "FlateDecode",
+                "SMask" => mask,
+            }
+        };
+        let img_a = doc.add_object(Stream::new(
+            base_dict(mask_id),
+            deflate_level9(&pixels_a).unwrap(),
+        ));
+        let img_b = doc.add_object(Stream::new(
+            base_dict(mask_id),
+            deflate_level9(&pixels_b).unwrap(),
+        ));
+        let content_id = doc.add_object(Stream::new(
+            dictionary! {},
+            b"q 200 0 0 200 0 0 cm /Im0 Do Q q 200 0 0 200 250 0 cm /Im1 Do Q".to_vec(),
+        ));
+        let pages_id = doc.new_object_id();
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "Contents" => content_id,
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Resources" => dictionary! {
+                "XObject" => dictionary! {
+                    "Im0" => Object::Reference(img_a),
+                    "Im1" => Object::Reference(img_b),
+                },
+            },
+        });
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => vec![page_id.into()],
+                "Count" => 1,
+            }),
+        );
+        let catalog_id = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+        doc.trailer.set("Root", catalog_id);
+        let mut pdf: Vec<u8> = Vec::new();
+        doc.save_to(&mut pdf).unwrap();
+
+        let before = masked_bases(&pdf);
+        assert_eq!(before.len(), 2, "fixture holds two masked bases");
+        assert_eq!(before[0].1, before[1].1, "both share one mask object");
+        let mask_before = mask_shape(&pdf, before[0].1);
+
+        let opts = OptimizeOptions::default().with_allow_lossy_reencode(true);
+        let out = optimize_with_options(&pdf, opts);
+
+        let after = masked_bases(&out);
+        assert_eq!(after.len(), 2, "both masked bases must survive");
+        for (filter, mask, w, h) in &after {
+            assert_eq!(filter.as_slice(), b"DCTDecode", "both bases convert");
+            assert_eq!((*w, *h), (px as i64, px as i64), "geometry preserved");
+            assert_eq!(*mask, before[0].1, "/SMask still points at the shared mask");
+        }
+        assert_eq!(
+            mask_shape(&out, before[0].1),
+            mask_before,
+            "the shared mask must be byte-identical, same dimensions"
+        );
+        assert!(Document::load_mem(&out).is_ok(), "output must load back");
+    }
+
+    #[test]
+    fn lossy_reencode_masked_line_art_is_declined() {
+        // The line-art content guard runs on the SOURCE pixels inside
+        // `plan_flate_to_jpeg`, so it protects the masked branch too: a masked
+        // line-art base is left completely untouched even with consent.
+        let px = 200u32;
+        let pdf = build_pdf_masked_flate(&line_art_pixels(px, px), px, 200);
+        let opts = OptimizeOptions::default().with_allow_lossy_reencode(true);
+        assert_eq!(
+            optimize_with_options(&pdf, opts),
+            pdf,
+            "masked line art must not be converted even with --allow-lossy"
         );
     }
 
@@ -4872,6 +5163,25 @@ mod tests {
         panic!("no smask-carrying image stream found");
     }
 
+    /// The `/Filter` name of the single `/SMask`-carrying image stream in `pdf`
+    /// — which encoding the masked base ended up in.
+    fn smask_base_filter(pdf: &[u8]) -> Vec<u8> {
+        let doc = Document::load_mem(pdf).unwrap();
+        for obj in doc.objects.values() {
+            if let Object::Stream(s) = obj {
+                if matches!(s.dict.get(b"Subtype"), Ok(Object::Name(n)) if n == b"Image")
+                    && s.dict.get(b"SMask").is_ok()
+                {
+                    return match s.dict.get(b"Filter").unwrap() {
+                        Object::Name(n) => n.clone(),
+                        other => panic!("fixture uses scalar filters, got {other:?}"),
+                    };
+                }
+            }
+        }
+        panic!("no smask-carrying image stream found");
+    }
+
     fn smask_stream_bytes(pdf: &[u8], smask_id: ObjectId) -> Vec<u8> {
         let doc = Document::load_mem(pdf).unwrap();
         match doc.get_object(smask_id) {
@@ -5511,6 +5821,157 @@ mod tests {
         assert!(once.len() < pdf.len(), "first pass must shrink");
         let twice = optimize(&once);
         assert_eq!(twice, once, "second pass must be byte-stable");
+    }
+
+    // ---- D-M3 + Phase 7 Option B: the coupled downsample's JPEG competitor ---
+
+    /// The over-resolution masked-Flate shape the competitor targets: a 400px
+    /// photographic RGB base with a plain 8-bit DeviceGray Flate `/SMask`,
+    /// drawn at 100 pt (≈288 DPI ⇒ over-resolution, 181 px at the default 130
+    /// DPI target). Photographic content, so the JPEG candidate is genuinely
+    /// smaller than the format-preserving deflate at that geometry.
+    fn build_pdf_smask_flate_photo() -> Vec<u8> {
+        let base = photo_pixels(400, 400, 3);
+        let mask = photo_pixels(400, 400, 1);
+        build_pdf_smask_flate_ext(400, 100, &base, &mask, |_| {}, |_| {})
+    }
+
+    #[test]
+    fn smask_flate_lossy_pair_is_idempotent_in_one_pass() {
+        // The whole point of Option B. Without the competitor, pass 1 produced
+        // an at-target masked FLATE pair and pass 2 then converted it through
+        // the dimension-preserving fall-through — one harvest split across two
+        // passes, breaking optimize(optimize(x)) == optimize(x). With the
+        // competitor the base lands as DCTDecode at the target geometry in
+        // pass 1, so pass 2 sees an at-target masked JPEG whose only remaining
+        // transform is the D-M1 requant — declined by its own 5% guard.
+        let pdf = build_pdf_smask_flate_photo();
+        let opts = OptimizeOptions::default().with_allow_lossy_reencode(true);
+
+        let once = optimize_with_options(&pdf, opts);
+        assert!(once.len() < pdf.len(), "first pass must shrink");
+        let (_, w, h, mask_id) = smask_base_info(&once);
+        assert_eq!(
+            smask_base_filter(&once).as_slice(),
+            b"DCTDecode",
+            "the JPEG competitor must win on photographic content"
+        );
+        assert_eq!((w, h), (181, 181), "base at the 130-DPI target geometry");
+        let doc = Document::load_mem(&once).unwrap();
+        let mask_dict = &doc.get_object(mask_id).unwrap().as_stream().unwrap().dict;
+        assert_eq!(
+            (
+                mask_dict.get(b"Width").unwrap().as_i64().unwrap(),
+                mask_dict.get(b"Height").unwrap().as_i64().unwrap(),
+            ),
+            (w, h),
+            "the mask must be resampled to the base's geometry (the unit rule)"
+        );
+
+        let twice = optimize_with_options(&once, opts);
+        assert_eq!(twice, once, "second pass must be BYTE-IDENTICAL");
+    }
+
+    /// A smooth diagonal ramp: no sharp edges and no flat background, so the
+    /// line-art guard passes it (it is "photographic" by the metrics), but it
+    /// is far more deflate-friendly than any JPEG at any quality — the
+    /// competitor must lose on it.
+    fn smooth_ramp_pixels(px: u32, channels: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(px as usize * px as usize * channels);
+        for y in 0..px {
+            for x in 0..px {
+                let v = ((x + y) as f32 / (2.0 * px as f32) * 255.0) as u8;
+                out.extend(std::iter::repeat_n(v, channels));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn smask_flate_lossy_competitor_wins_only_when_smaller() {
+        // Competitor selection is a pure size comparison of the two base
+        // candidates at ONE fixed target geometry — the mask half is identical
+        // either way, so comparing the bases IS comparing the pairs. A smooth
+        // ramp puts the two candidates within a factor of two of each other at
+        // the 181-px target (measured: deflate 1,780 B; JPEG 1,027 B at q78,
+        // 4,028 B at q100), so `jpeg_quality` flips the winner with the content
+        // held fixed. Losing must leave exactly the flag-off pair, byte for
+        // byte — not a "close enough" re-encode.
+        let ramp = build_pdf_smask_flate_ext(
+            400,
+            100,
+            &smooth_ramp_pixels(400, 3),
+            &photo_pixels(400, 400, 1),
+            |_| {},
+            |_| {},
+        );
+        let flag_off = optimize(&ramp);
+
+        let opts = OptimizeOptions::default().with_allow_lossy_reencode(true);
+        let jpeg_wins = optimize_with_options(&ramp, opts);
+        assert_eq!(
+            smask_base_filter(&jpeg_wins).as_slice(),
+            b"DCTDecode",
+            "q78: the smaller JPEG candidate must win"
+        );
+        assert!(
+            jpeg_wins.len() < flag_off.len(),
+            "and it must actually beat the flag-off pair on size"
+        );
+
+        let lossless_wins = optimize_with_options(&ramp, opts.with_jpeg_quality(100));
+        assert_eq!(
+            smask_base_filter(&lossless_wins).as_slice(),
+            b"FlateDecode",
+            "q100: the larger JPEG candidate must lose to the deflate"
+        );
+        assert_eq!(
+            lossless_wins, flag_off,
+            "losing the competition must leave exactly the flag-off pair"
+        );
+    }
+
+    #[test]
+    fn smask_flate_lossy_competitor_declines_line_art() {
+        // The line-art content guard runs inside `plan_flate_to_jpeg` on the
+        // decoded SOURCE pixels, so it protects the coupled path too: an
+        // over-resolution masked line-art pair still downsamples losslessly and
+        // must come out byte-identical to the flag-off result — never
+        // DCT-mottled.
+        let base = line_art_pixels(400, 400);
+        let mask = photo_pixels(400, 400, 1);
+        let pdf = build_pdf_smask_flate_ext(400, 100, &base, &mask, |_| {}, |_| {});
+        let opts = OptimizeOptions::default().with_allow_lossy_reencode(true);
+        let out = optimize_with_options(&pdf, opts);
+        assert_eq!(
+            smask_base_filter(&out).as_slice(),
+            b"FlateDecode",
+            "masked line art must keep the format-preserving downsample"
+        );
+        assert_eq!(
+            out,
+            optimize(&pdf),
+            "masked line art must get exactly the flag-off result"
+        );
+    }
+
+    #[test]
+    fn smask_flate_lossy_competitor_never_compounds_a_declined_downsample() {
+        // No compounding losses, the pair's form: a checkerboard base whose
+        // Lanczos-downsampled deflate GROWS past the combined 5% guard. The
+        // lossless path therefore declines the resample, and a JPEG candidate
+        // must not resurrect it by hiding the resolution loss behind a DCT win
+        // — the pair comes back byte-for-byte even with consent.
+        let base = checkerboard_pixels(400, 4, 3);
+        let mask = checkerboard_pixels(400, 4, 1);
+        let pdf = build_pdf_smask_flate_ext(400, 100, &base, &mask, |_| {}, |_| {});
+        assert_eq!(optimize(&pdf), pdf, "the lossless pair must decline first");
+        let opts = OptimizeOptions::default().with_allow_lossy_reencode(true);
+        assert_eq!(
+            optimize_with_options(&pdf, opts),
+            pdf,
+            "a declined resample must not be resurrected by a JPEG candidate"
+        );
     }
 
     #[test]

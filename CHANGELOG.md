@@ -6,6 +6,55 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Soft-masked FlateDecode bases reach JPEG under `--allow-lossy`.** A
+  FlateDecode image carrying an eligible 8-bit DeviceGray `/SMask` is no longer
+  excluded from the consent-gated Flate→JPEG conversion. It reaches it two ways,
+  and every masked pair now settles in a SINGLE pass:
+
+  - **At its own geometry** (the pair is not over-resolution, or the coupled
+    downsample is unavailable): the conversion is **dimension-preserving** and
+    rewrites the base stream only. The `/SMask` object keeps its bytes and its
+    `/Width`/`/Height`, so base and mask stay aligned by construction, and a
+    **shared** mask is safe for exactly the reason the P-M1 requant is safe for
+    one — nothing about the mask changes.
+  - **At the target geometry** (the pair is over-resolution and takes the D-M3
+    coupled downsample): the downsample now carries a JPEG competitor computed
+    at the SAME target pixels the mask is losslessly resampled to, and the
+    smaller base candidate wins. This sits on the resize side of the P-M1 line
+    and widens nothing: the mask is resampled either way, so the path stays
+    behind the existing shared-mask refcount guard.
+
+  All existing guards apply unchanged — the line-art content check on the
+  decoded source pixels, decode-back MAD verification, the 5% minimum-savings
+  rule (combined over the pair on the coupled path), and atomic base+mask
+  replacement. So does no-compounding-losses: if the fully lossless pair
+  candidate would itself be declined, no JPEG candidate is computed, and after
+  a decline nothing lossy is retried. `--allow-lossy` is consent to re-encode,
+  not consent to re-litigate a resampling decision the lossless path made.
+
+  **One-pass idempotence.** Because the competitor lands the conversion inside
+  the downsample, pass 2 sees a DCTDecode base at the target geometry rather
+  than an at-target masked *Flate* base, so `optimize(optimize(x))` is
+  byte-identical to `optimize(x)` under the flag. Without it the same total
+  harvest arrived split across two passes.
+
+  Alignment was re-validated for the resampling path (the prior compositing
+  experiment only covered dimension-preserving conversion under an unmodified
+  mask): on the NASA output all 74 masked pairs report base dims == mask dims,
+  the mask streams are byte-identical to what the flag-off downsample produces,
+  and on the three affected pages (23, 34, 43) the flag-off↔flag-on render
+  error at edges (5.5 / 3.3 / 1.8 MAD) stays well under the resample error
+  flag-off already accepts (14.5 / 11.1 / 3.6), i.e. the residual is JPEG
+  quantization — which this flag consents to — and not misregistration.
+
+  Measured on NASA at `--allow-lossy`, otherwise default, ONE pass:
+  **4,155,393 → 3,506,379 B (−649,014 B)**, byte-stable on a second pass.
+  Flag-off output is unchanged (4,655,752 B, byte-identical to 0.3.1).
+
 ## [0.3.1] - 2026-08-22
 
 Three lossless serialization wins from the compression investigation. No pixel

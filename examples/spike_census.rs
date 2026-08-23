@@ -4,6 +4,7 @@
 //! Usage:
 //!   cargo run --release --example spike_census -- census a.pdf [b.pdf ...]
 //!   cargo run --release --example spike_census -- diff a.pdf b.pdf
+//!   cargo run --release --example spike_census -- align a.pdf [b.pdf ...]
 
 use lopdf::{Document, Object};
 
@@ -111,6 +112,74 @@ fn diff(a: &str, b: &str) {
     }
 }
 
+/// Mask-alignment probe (Phase 7 Option B pre-flight): for every base carrying
+/// an `/SMask`, print the base's filter and geometry next to the MASK object's
+/// geometry and report whether the two rasters sit on the same pixel grid.
+/// The coupled downsample resamples the mask, so unlike the dimension-
+/// preserving conversion this cannot be argued from "the mask never changes" —
+/// it has to be measured on the output.
+fn align(path: &str) {
+    let doc = Document::load(path).expect("load");
+    println!("== mask alignment of {path}");
+    let mut checked = 0usize;
+    let mut mismatched = 0usize;
+    for (id, obj) in {
+        let mut v: Vec<_> = doc.objects.iter().collect();
+        v.sort_by_key(|(id, _)| **id);
+        v
+    } {
+        let Object::Stream(s) = obj else { continue };
+        if !matches!(s.dict.get(b"Subtype"), Ok(Object::Name(n)) if n == b"Image") {
+            continue;
+        }
+        let Ok(smask) = s.dict.get(b"SMask") else {
+            continue;
+        };
+        let dims = |d: &lopdf::Dictionary| {
+            (
+                d.get(b"Width")
+                    .ok()
+                    .and_then(|o| o.as_i64().ok())
+                    .unwrap_or(-1),
+                d.get(b"Height")
+                    .ok()
+                    .and_then(|o| o.as_i64().ok())
+                    .unwrap_or(-1),
+            )
+        };
+        let filter = match s.dict.get(b"Filter") {
+            Ok(Object::Name(n)) => String::from_utf8_lossy(n).into_owned(),
+            Ok(other) => format!("{other:?}"),
+            _ => "-".into(),
+        };
+        let (bw, bh) = dims(&s.dict);
+        let mask = match smask {
+            Object::Reference(mid) => doc.get_object(*mid).ok().and_then(|o| o.as_stream().ok()),
+            _ => None,
+        };
+        let Some(mask) = mask else {
+            println!(
+                "  obj {:>4} {filter:<10} {bw}x{bh} -> UNRESOLVABLE /SMask",
+                id.0
+            );
+            mismatched += 1;
+            continue;
+        };
+        let (mw, mh) = dims(&mask.dict);
+        let ok = (bw, bh) == (mw, mh);
+        checked += 1;
+        if !ok {
+            mismatched += 1;
+        }
+        println!(
+            "  obj {:>4} {filter:<10} base {bw}x{bh}  mask {mw}x{mh}  {}",
+            id.0,
+            if ok { "ALIGNED" } else { "MISALIGNED" }
+        );
+    }
+    println!("  -- {checked} pairs checked, {mismatched} misaligned");
+}
+
 fn pages(path: &str) {
     let doc = Document::load(path).expect("load");
     println!("== pages of {path} (page -> image object ids)");
@@ -156,6 +225,7 @@ fn main() {
         Some("census") => args[1..].iter().for_each(|p| census(p)),
         Some("diff") => diff(&args[1], &args[2]),
         Some("pages") => args[1..].iter().for_each(|p| pages(p)),
-        _ => eprintln!("usage: spike_census census|pages <pdf...> | diff <a.pdf> <b.pdf>"),
+        Some("align") => args[1..].iter().for_each(|p| align(p)),
+        _ => eprintln!("usage: spike_census census|pages|align <pdf...> | diff <a.pdf> <b.pdf>"),
     }
 }
