@@ -1,13 +1,26 @@
 //! Font subsetting (Phase 3, C-M1): Type0 / CIDFontType2 / Identity-H|V
-//! fonts only, integrated via `subsetter` 0.2.6 (`default-features = false`).
+//! fonts, plus nonsymbolic simple TrueType fonts (WinAnsi / MacRoman base
+//! encodings, with `/Differences`), integrated via `subsetter` 0.2.6
+//! (`default-features = false`).
 //!
-//! The design exploits the `/CIDToGIDMap` **stream** form so that
+//! The Type0 design exploits the `/CIDToGIDMap` **stream** form so that
 //! content-stream text bytes are **never rewritten**: the subset font gets new
 //! (remapped) glyph IDs, and a freshly written old-CID -> new-GID map stream
 //! absorbs the remapping. `/W`, `/DW`, and `/ToUnicode` are keyed by CID,
 //! which never changes, so they stay untouched and text extraction is
 //! bit-identical pre/post. The entire "rewrote the text wrong" bug class is
 //! structurally impossible here.
+//!
+//! The simple-TrueType path keeps the same invariant a different way: codes,
+//! `/Encoding`, `/Widths`, and `/ToUnicode` never change; the subset font
+//! gets a freshly written `cmap` replicating the original's subtables
+//! (restricted to retained glyphs, ids remapped), so every viewer lookup
+//! path of ISO 32000-1 9.6.6.4 — (3,1) via glyph name -> Unicode, (1,0) via
+//! glyph name -> Mac OS Roman code, plus any (3,0) the font carries —
+//! resolves each used code to the same outline as before. Any used code the
+//! cmap paths cannot resolve, an unknown glyph name, a symbolic flag, an
+//! absent `/Encoding`/`/Widths`, or a cmap format outside {0, 4, 6, 12}
+//! disqualifies that font (untouched, fail-safe).
 //!
 //! Fail-safe posture (eligibility, not effort — see docs/PHASE3-PLAN.md §C):
 //!
@@ -29,13 +42,13 @@
 //! appearance streams from `/DA` strings we do not parse; ExtGState `/Font`
 //! entries) are disqualified rather than guessed at.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use lopdf::content::Content;
 use lopdf::{dictionary, Dictionary, Document, Object, ObjectId, Stream};
 use subsetter::GlyphRemapper;
 
-use crate::{deflate_level9, inflate_capped, resolve, FilterClass};
+use crate::{deflate_level9, encodings, inflate_capped, resolve, truetype, FilterClass};
 
 /// Recursion bound for the form/pattern/Type3 walk (depth of nested streams).
 const MAX_WALK_DEPTH: usize = 16;
@@ -43,10 +56,26 @@ const MAX_WALK_DEPTH: usize = 16;
 const MAX_STREAM_BYTES: usize = 64 * 1024 * 1024;
 
 /// A planned, fully validated font subset, computed read-only against the
-/// document. Applying it replaces the `/FontFile2` stream in place, points
-/// `/CIDToGIDMap` at a new map stream, and re-tags the font names — nothing
-/// else changes.
-pub(crate) struct FontPlan {
+/// document.
+pub(crate) enum FontPlan {
+    Cid(CidFontPlan),
+    Simple(SimpleFontPlan),
+}
+
+impl FontPlan {
+    /// The font dictionary object the plan anchors to (sort key).
+    fn font_id(&self) -> ObjectId {
+        match self {
+            FontPlan::Cid(p) => p.type0_id,
+            FontPlan::Simple(p) => p.font_id,
+        }
+    }
+}
+
+/// A planned Type0/CIDFontType2 subset. Applying it replaces the
+/// `/FontFile2` stream in place, points `/CIDToGIDMap` at a new map stream,
+/// and re-tags the font names — nothing else changes.
+pub(crate) struct CidFontPlan {
     type0_id: ObjectId,
     descendant_id: ObjectId,
     descriptor_id: ObjectId,
@@ -58,6 +87,21 @@ pub(crate) struct FontPlan {
     /// Flate-compressed old-CID -> new-GID map stream payload.
     deflated_map: Vec<u8>,
     /// `TAG+BaseFont` name applied to `/BaseFont` (both dicts) and `/FontName`.
+    tagged_name: Vec<u8>,
+}
+
+/// A planned simple-TrueType subset. Applying it replaces the `/FontFile2`
+/// stream in place and re-tags the font names — codes, `/Encoding`,
+/// `/Widths`, and `/ToUnicode` never change.
+pub(crate) struct SimpleFontPlan {
+    font_id: ObjectId,
+    descriptor_id: ObjectId,
+    font_file_id: ObjectId,
+    /// Flate-compressed subset font program (with rebuilt `cmap`).
+    deflated_font: Vec<u8>,
+    /// Uncompressed length of the subset font (`/Length1`).
+    font_len: i64,
+    /// `TAG+BaseFont` name applied to `/BaseFont` and `/FontName`.
     tagged_name: Vec<u8>,
 }
 
@@ -97,45 +141,91 @@ pub(crate) fn plan_font_subsets(doc: &Document) -> Vec<FontPlan> {
         .used
         .iter()
         .filter(|(id, cids)| !walker.ineligible.contains(id) && !cids.is_empty())
-        .filter_map(|(&id, cids)| plan_one_font(doc, id, cids, &refcounts))
+        .filter_map(|(&id, cids)| plan_one(doc, id, cids, &refcounts))
         .collect();
     // HashMap iteration order is arbitrary; sort so output is reproducible.
-    plans.sort_by_key(|p| p.type0_id);
+    plans.sort_by_key(FontPlan::font_id);
     plans
+}
+
+/// Dispatch a used font to the planner matching its subtype.
+fn plan_one(
+    doc: &Document,
+    id: ObjectId,
+    codes: &BTreeSet<u16>,
+    refcounts: &HashMap<ObjectId, usize>,
+) -> Option<FontPlan> {
+    let dict = doc.get_object(id).ok()?.as_dict().ok()?;
+    match dict.get(b"Subtype").map(|s| resolve(doc, s)) {
+        Ok(Object::Name(n)) if n == b"Type0" => {
+            plan_one_font(doc, id, codes, refcounts).map(FontPlan::Cid)
+        }
+        Ok(Object::Name(n)) if n == b"TrueType" => {
+            plan_one_simple_font(doc, id, codes, refcounts).map(FontPlan::Simple)
+        }
+        _ => None,
+    }
 }
 
 /// Apply planned subsets. Each plan is independent; the set may be empty.
 pub(crate) fn apply_font_subsets(doc: &mut Document, plans: Vec<FontPlan>) {
     for plan in plans {
-        let map_stream = Stream::new(dictionary! { "Filter" => "FlateDecode" }, plan.deflated_map)
-            .with_compression(false);
-        let map_id = doc.add_object(map_stream);
+        match plan {
+            FontPlan::Cid(plan) => apply_cid_plan(doc, plan),
+            FontPlan::Simple(plan) => apply_simple_plan(doc, plan),
+        }
+    }
+}
 
-        let font_stream = Stream::new(
-            dictionary! {
-                "Filter" => "FlateDecode",
-                "Length1" => plan.font_len,
-            },
-            plan.deflated_font,
-        )
+fn apply_cid_plan(doc: &mut Document, plan: CidFontPlan) {
+    let map_stream = Stream::new(dictionary! { "Filter" => "FlateDecode" }, plan.deflated_map)
         .with_compression(false);
-        doc.objects
-            .insert(plan.font_file_id, Object::Stream(font_stream));
+    let map_id = doc.add_object(map_stream);
 
-        if let Ok(Object::Dictionary(d)) = doc.get_object_mut(plan.descendant_id) {
-            d.set("CIDToGIDMap", Object::Reference(map_id));
-            d.set("BaseFont", Object::Name(plan.tagged_name.clone()));
-        }
-        if let Ok(Object::Dictionary(d)) = doc.get_object_mut(plan.type0_id) {
-            d.set("BaseFont", Object::Name(plan.tagged_name.clone()));
-        }
-        if let Ok(Object::Dictionary(d)) = doc.get_object_mut(plan.descriptor_id) {
-            d.set("FontName", Object::Name(plan.tagged_name));
-            // A stale /CIDSet would over-claim glyph coverage after the
-            // subset; it is optional metadata outside PDF/A (and PDF/A
-            // documents were skipped above), so drop it. C-M2 regenerates it.
-            d.remove(b"CIDSet");
-        }
+    let font_stream = Stream::new(
+        dictionary! {
+            "Filter" => "FlateDecode",
+            "Length1" => plan.font_len,
+        },
+        plan.deflated_font,
+    )
+    .with_compression(false);
+    doc.objects
+        .insert(plan.font_file_id, Object::Stream(font_stream));
+
+    if let Ok(Object::Dictionary(d)) = doc.get_object_mut(plan.descendant_id) {
+        d.set("CIDToGIDMap", Object::Reference(map_id));
+        d.set("BaseFont", Object::Name(plan.tagged_name.clone()));
+    }
+    if let Ok(Object::Dictionary(d)) = doc.get_object_mut(plan.type0_id) {
+        d.set("BaseFont", Object::Name(plan.tagged_name.clone()));
+    }
+    if let Ok(Object::Dictionary(d)) = doc.get_object_mut(plan.descriptor_id) {
+        d.set("FontName", Object::Name(plan.tagged_name));
+        // A stale /CIDSet would over-claim glyph coverage after the
+        // subset; it is optional metadata outside PDF/A (and PDF/A
+        // documents were skipped above), so drop it. C-M2 regenerates it.
+        d.remove(b"CIDSet");
+    }
+}
+
+fn apply_simple_plan(doc: &mut Document, plan: SimpleFontPlan) {
+    let font_stream = Stream::new(
+        dictionary! {
+            "Filter" => "FlateDecode",
+            "Length1" => plan.font_len,
+        },
+        plan.deflated_font,
+    )
+    .with_compression(false);
+    doc.objects
+        .insert(plan.font_file_id, Object::Stream(font_stream));
+
+    if let Ok(Object::Dictionary(d)) = doc.get_object_mut(plan.font_id) {
+        d.set("BaseFont", Object::Name(plan.tagged_name.clone()));
+    }
+    if let Ok(Object::Dictionary(d)) = doc.get_object_mut(plan.descriptor_id) {
+        d.set("FontName", Object::Name(plan.tagged_name));
     }
 }
 
@@ -247,11 +337,14 @@ enum CurrentFont {
     /// No `Tf` seen yet: a show operator here means text we cannot attribute,
     /// e.g. a form inheriting the invoker's text state — global abort.
     Unset,
-    /// A font we will never subset (simple fonts, non-Identity Type0):
-    /// show strings are ignored.
+    /// A font we will never subset (Type1, Type3, non-Identity Type0, inline
+    /// dictionaries): show strings are ignored.
     Other,
     /// A Type0 / Identity-H|V font: show strings are big-endian 2-byte CIDs.
     Candidate(ObjectId),
+    /// A simple TrueType font: show strings are single-byte codes.
+    /// Eligibility (encoding, flags, cmap) is decided at planning time.
+    Simple(ObjectId),
 }
 
 struct Walker<'a> {
@@ -584,11 +677,20 @@ impl<'a> Walker<'a> {
             self.abort();
             return CurrentFont::Other;
         };
-        let is_type0 = matches!(
-            dict.get(b"Subtype").map(|s| resolve(self.doc, s)),
-            Ok(Object::Name(n)) if n == b"Type0"
-        );
-        if !is_type0 {
+        let subtype = match dict.get(b"Subtype").map(|s| resolve(self.doc, s)) {
+            Ok(Object::Name(n)) => n.as_slice(),
+            _ => return CurrentFont::Other,
+        };
+        if subtype == b"TrueType" {
+            return match id {
+                Some(id) => CurrentFont::Simple(id),
+                // An inline simple dict stays untouched (usage cannot be
+                // keyed); sharing its descriptor or font file with a
+                // candidate is caught by the refcount guard.
+                None => CurrentFont::Other,
+            };
+        }
+        if subtype != b"Type0" {
             return CurrentFont::Other;
         }
         let identity = matches!(
@@ -625,6 +727,12 @@ impl<'a> Walker<'a> {
                 let set = self.used.entry(*id).or_default();
                 for pair in bytes.as_chunks::<2>().0 {
                     set.insert(u16::from_be_bytes(*pair));
+                }
+            }
+            CurrentFont::Simple(id) => {
+                let set = self.used.entry(*id).or_default();
+                for &byte in bytes {
+                    set.insert(u16::from(byte));
                 }
             }
         }
@@ -937,15 +1045,15 @@ fn strip_subset_tag(name: &[u8]) -> &[u8] {
     }
 }
 
-/// Validate one candidate font end to end and build its plan. Any failure —
-/// wrong shapes, shared structure, subsetter error, not net-smaller —
-/// returns `None` and the font ships untouched.
+/// Validate one candidate Type0 font end to end and build its plan. Any
+/// failure — wrong shapes, shared structure, subsetter error, not
+/// net-smaller — returns `None` and the font ships untouched.
 fn plan_one_font(
     doc: &Document,
     type0_id: ObjectId,
     cids: &BTreeSet<u16>,
     refcounts: &HashMap<ObjectId, usize>,
-) -> Option<FontPlan> {
+) -> Option<CidFontPlan> {
     let type0 = doc.get_object(type0_id).ok()?.as_dict().ok()?;
 
     let descendants = type0.get(b"DescendantFonts").ok()?;
@@ -1041,7 +1149,7 @@ fn plan_one_font(
     tagged_name.push(b'+');
     tagged_name.extend_from_slice(strip_subset_tag(&base_name));
 
-    Some(FontPlan {
+    Some(CidFontPlan {
         type0_id,
         descendant_id,
         descriptor_id,
@@ -1071,6 +1179,235 @@ fn base_font_name(
         }
     }
     None
+}
+
+// ---------------------------------------------------------------------------
+// Simple-TrueType planning
+// ---------------------------------------------------------------------------
+
+/// A base encoding's code -> glyph-name table plus `/Differences` overrides.
+type SimpleEncoding = (&'static [&'static str; 256], HashMap<u8, Vec<u8>>);
+
+/// The font's `/Encoding`, reduced to what the planner needs: the base
+/// code -> glyph-name table and any `/Differences` overrides. `None` for any
+/// shape outside "explicit WinAnsi/MacRoman base (+ well-formed
+/// Differences)" — an absent `/Encoding` means the font's built-in encoding,
+/// whose semantics we decline to guess.
+fn parse_simple_encoding(doc: &Document, font: &Dictionary) -> Option<SimpleEncoding> {
+    fn base_table(name: &[u8]) -> Option<&'static [&'static str; 256]> {
+        match name {
+            b"WinAnsiEncoding" => Some(&encodings::WIN_ANSI_NAMES),
+            b"MacRomanEncoding" => Some(&encodings::MAC_ROMAN_NAMES),
+            _ => None,
+        }
+    }
+    match resolve(doc, font.get(b"Encoding").ok()?) {
+        Object::Name(n) => base_table(n).map(|t| (t, HashMap::new())),
+        Object::Dictionary(d) => {
+            let base = match d.get(b"BaseEncoding").map(|b| resolve(doc, b)) {
+                Ok(Object::Name(n)) => base_table(n)?,
+                // No explicit base: per spec the *font's* encoding fills the
+                // gaps, which we cannot replicate. Decline.
+                _ => return None,
+            };
+            let mut diffs: HashMap<u8, Vec<u8>> = HashMap::new();
+            if let Ok(arr) = d.get(b"Differences") {
+                let arr = resolve(doc, arr).as_array().ok()?;
+                let mut code: i64 = -1;
+                for item in arr {
+                    match resolve(doc, item) {
+                        Object::Integer(i) => {
+                            if !(0..=255).contains(i) {
+                                return None;
+                            }
+                            code = *i;
+                        }
+                        Object::Name(n) => {
+                            let slot = u8::try_from(code).ok()?;
+                            diffs.insert(slot, n.clone());
+                            code += 1;
+                        }
+                        _ => return None,
+                    }
+                }
+            }
+            Some((base, diffs))
+        }
+        _ => None,
+    }
+}
+
+/// Validate one used simple TrueType font end to end and build its plan.
+/// Any failure — symbolic flags, unknown encoding or glyph name, a used code
+/// the cmap paths cannot resolve, shared structure, subsetter error, cmap
+/// round-trip mismatch, not net-smaller — returns `None` and the font ships
+/// untouched.
+fn plan_one_simple_font(
+    doc: &Document,
+    font_id: ObjectId,
+    codes: &BTreeSet<u16>,
+    refcounts: &HashMap<ObjectId, usize>,
+) -> Option<SimpleFontPlan> {
+    let font = doc.get_object(font_id).ok()?.as_dict().ok()?;
+    // With /Widths present every shown glyph's advance comes from the PDF,
+    // not the font program; without it we would have to prove the subset's
+    // metrics tables serve unused codes identically. Decline instead.
+    font.get(b"Widths").ok()?;
+    let (base_names, diffs) = parse_simple_encoding(doc, font)?;
+
+    let (descriptor_id, descriptor) = resolve_ref(doc, font.get(b"FontDescriptor").ok()?);
+    let descriptor_id = descriptor_id?;
+    let descriptor = descriptor.as_dict().ok()?;
+    let flags = resolve(doc, descriptor.get(b"Flags").ok()?).as_i64().ok()?;
+    // Nonsymbolic set and Symbolic clear: exactly the fonts whose lookup the
+    // nonsymbolic paths of 9.6.6.4 (replicated below) fully describe.
+    if flags & 0x04 != 0 || flags & 0x20 == 0 {
+        return None;
+    }
+    if descriptor.get(b"FontFile").is_ok() || descriptor.get(b"FontFile3").is_ok() {
+        return None;
+    }
+    let (font_file_id, font_file) = resolve_ref(doc, descriptor.get(b"FontFile2").ok()?);
+    let font_file_id = font_file_id?;
+    let font_file = font_file.as_stream().ok()?;
+    // Shared descriptor/font-program structure could serve fonts whose usage
+    // was not attributed here; mutating it would be unsound.
+    if refcounts.get(&descriptor_id) != Some(&1) || refcounts.get(&font_file_id) != Some(&1) {
+        return None;
+    }
+
+    let font_bytes = strict_stream_bytes(doc, font_file)?;
+    let glyph_count = num_glyphs(&font_bytes)?;
+    let subtables = truetype::parse_cmap(&font_bytes)?;
+    let sub = |p: u16, e: u16| {
+        subtables
+            .iter()
+            .find(|s| s.platform == p && s.encoding == e)
+    };
+    let (c31, c10, c30) = (sub(3, 1), sub(1, 0), sub(3, 0));
+    if c31.is_none() && c10.is_none() {
+        // Neither nonsymbolic lookup path exists; a viewer would be
+        // improvising and so would we.
+        return None;
+    }
+
+    // Resolve every used code through the union of the 9.6.6.4 lookup paths;
+    // every glyph any path could select is retained. A code no path resolves
+    // disqualifies the font (the original might still render it via
+    // `post`-table names, which the subset would lose).
+    let mut gids: BTreeSet<u16> = BTreeSet::new();
+    gids.insert(0);
+    for &code in codes {
+        let code = u8::try_from(code).ok()?;
+        let name: &[u8] = match diffs.get(&code) {
+            Some(n) => n,
+            None => {
+                let n = base_names[usize::from(code)];
+                if n.is_empty() {
+                    return None; // shown code with no name in the encoding
+                }
+                n.as_bytes()
+            }
+        };
+        let mut candidates: Vec<u16> = Vec::new();
+        if let Some(sub) = c31 {
+            if let Some(u) = encodings::glyph_name_to_unicode(name) {
+                candidates.extend(sub.map.get(&u));
+            }
+        }
+        if let Some(sub) = c10 {
+            if let Some(mac) = encodings::mac_roman_code_of(name) {
+                candidates.extend(sub.map.get(&u32::from(mac)));
+            }
+        }
+        if let Some(sub) = c30 {
+            candidates.extend(sub.map.get(&(0xF000 | u32::from(code))));
+            candidates.extend(sub.map.get(&u32::from(code)));
+        }
+        if candidates.is_empty() {
+            return None;
+        }
+        for gid in candidates {
+            if gid >= glyph_count {
+                return None;
+            }
+            gids.insert(gid);
+        }
+    }
+
+    let gid_list: Vec<u16> = gids.iter().copied().collect();
+    let remapper = GlyphRemapper::new_from_glyphs_sorted(&gid_list);
+    let subset = subsetter::subset(&font_bytes, 0, &remapper).ok()?;
+    if num_glyphs(&subset)? < remapper.num_gids() {
+        return None;
+    }
+
+    // Replicate every original cmap subtable restricted to retained glyphs,
+    // ids remapped. PDF simple-font lookups are BMP-only, so supplementary
+    // aliases are dropped; platform 1 codes are bytes by definition.
+    let mut new_subtables: Vec<truetype::CmapSubtable> = Vec::with_capacity(subtables.len());
+    for sub in &subtables {
+        let limit = if sub.platform == 1 { 0xFF } else { 0xFFFE };
+        let mut map = BTreeMap::new();
+        for (&ch, &gid) in &sub.map {
+            if ch > limit {
+                continue;
+            }
+            if let Some(new_gid) = remapper.get(gid) {
+                if new_gid != 0 {
+                    map.insert(ch, new_gid);
+                }
+            }
+        }
+        new_subtables.push(truetype::CmapSubtable {
+            platform: sub.platform,
+            encoding: sub.encoding,
+            map,
+        });
+    }
+    let final_font = truetype::insert_cmap(&subset, &new_subtables)?;
+
+    // Round-trip check: what a reader parses from the rebuilt font must be
+    // exactly the mappings we intended to write.
+    let mut reread = truetype::parse_cmap(&final_font)?;
+    reread.sort_by_key(|s| (s.platform, s.encoding));
+    new_subtables.sort_by_key(|s| (s.platform, s.encoding));
+    if reread.len() != new_subtables.len()
+        || reread
+            .iter()
+            .zip(&new_subtables)
+            .any(|(a, b)| (a.platform, a.encoding, &a.map) != (b.platform, b.encoding, &b.map))
+    {
+        return None;
+    }
+
+    let deflated_font = deflate_level9(&final_font)?;
+    // Net-smaller guard on stored bytes.
+    if deflated_font.len() >= font_file.content.len() {
+        return None;
+    }
+
+    let base_name = match font.get(b"BaseFont").map(|o| resolve(doc, o)) {
+        Ok(Object::Name(n)) => n.clone(),
+        _ => match descriptor.get(b"FontName").map(|o| resolve(doc, o)) {
+            Ok(Object::Name(n)) => n.clone(),
+            _ => return None,
+        },
+    };
+    let tag = subset_tag(&final_font);
+    let mut tagged_name = Vec::with_capacity(base_name.len() + 7);
+    tagged_name.extend_from_slice(&tag);
+    tagged_name.push(b'+');
+    tagged_name.extend_from_slice(strip_subset_tag(&base_name));
+
+    Some(SimpleFontPlan {
+        font_id,
+        descriptor_id,
+        font_file_id,
+        deflated_font,
+        font_len: final_font.len() as i64,
+        tagged_name,
+    })
 }
 
 #[cfg(test)]
@@ -1784,12 +2121,19 @@ mod tests {
     }
 
     #[test]
-    fn subset_fonts_is_off_by_default() {
+    fn subset_fonts_is_on_by_default_and_opt_out_restores_original() {
         let cids = gids_for("Hello");
         let pairs: Vec<(u16, char)> = cids.iter().copied().zip("Hello".chars()).collect();
         let pdf = build_text_pdf(&FontSpec::identity(pairs), &[cids]);
-        let out = optimize(&pdf);
-        assert_eq!(out, pdf, "default options must not touch fonts");
+        let on = optimize(&pdf);
+        assert_eq!(
+            on,
+            optimize_with_options(&pdf, subset_opts()),
+            "default options must subset fonts"
+        );
+        assert!(on.len() < pdf.len());
+        let off = optimize_with_options(&pdf, OptimizeOptions::default().with_subset_fonts(false));
+        assert_eq!(off, pdf, "opt-out must not touch fonts");
     }
 
     #[test]
@@ -1818,6 +2162,242 @@ mod tests {
         let cids = gids_for("Hello, World!");
         let pairs: Vec<(u16, char)> = cids.iter().copied().zip("Hello, World!".chars()).collect();
         let pdf = build_text_pdf(&FontSpec::identity(pairs), &[cids]);
+        let once = optimize_with_options(&pdf, subset_opts());
+        assert!(once.len() < pdf.len(), "first pass must shrink");
+        let twice = optimize_with_options(&once, subset_opts());
+        assert_eq!(twice, once, "second pass must be byte-stable");
+    }
+
+    // -- simple TrueType -----------------------------------------------------
+
+    struct SimpleSpec {
+        base_font: &'static str,
+        /// The `/Encoding` entry; `None` omits it (built-in encoding).
+        encoding: Option<Object>,
+        /// FontDescriptor `/Flags` (32 = Nonsymbolic).
+        flags: i64,
+        corrupt_font_file: bool,
+    }
+
+    impl SimpleSpec {
+        fn winansi() -> Self {
+            SimpleSpec {
+                base_font: "NotoSans-Regular",
+                encoding: Some(Object::Name(b"WinAnsiEncoding".to_vec())),
+                flags: 32,
+                corrupt_font_file: false,
+            }
+        }
+    }
+
+    /// Add a complete simple TrueType font to `doc`, returning the font
+    /// object id.
+    fn add_simple_tt_font(doc: &mut Document, spec: &SimpleSpec) -> ObjectId {
+        let font_data = if spec.corrupt_font_file {
+            b"this is not a truetype font at all".to_vec()
+        } else {
+            noto_bytes()
+        };
+        let font_len = font_data.len() as i64;
+        let ff_id = doc.add_object(
+            Stream::new(
+                dictionary! { "Filter" => "FlateDecode", "Length1" => font_len },
+                deflate_level9(&font_data).unwrap(),
+            )
+            .with_compression(false),
+        );
+        let descr_id = doc.add_object(dictionary! {
+            "Type" => "FontDescriptor",
+            "FontName" => Object::Name(spec.base_font.as_bytes().to_vec()),
+            "Flags" => spec.flags,
+            "FontBBox" => vec![(-619).into(), (-293).into(), 1536.into(), 1069.into()],
+            "ItalicAngle" => 0,
+            "Ascent" => 1069,
+            "Descent" => (-293),
+            "CapHeight" => 714,
+            "StemV" => 80,
+            "FontFile2" => ff_id,
+        });
+        let widths: Vec<Object> = (32..=255).map(|_| 500.into()).collect();
+        let mut font = dictionary! {
+            "Type" => "Font",
+            "Subtype" => "TrueType",
+            "BaseFont" => Object::Name(spec.base_font.as_bytes().to_vec()),
+            "FirstChar" => 32,
+            "LastChar" => 255,
+            "Widths" => widths,
+            "FontDescriptor" => descr_id,
+        };
+        if let Some(enc) = &spec.encoding {
+            font.set("Encoding", enc.clone());
+        }
+        doc.add_object(font)
+    }
+
+    /// Show single-byte codes (simple-font semantics).
+    fn show_byte_ops(font: &str, codes: &[u8]) -> Vec<Operation> {
+        vec![
+            Operation::new("BT", vec![]),
+            Operation::new(
+                "Tf",
+                vec![Object::Name(font.as_bytes().to_vec()), 10.into()],
+            ),
+            Operation::new("Td", vec![72.into(), 700.into()]),
+            Operation::new(
+                "Tj",
+                vec![Object::String(codes.to_vec(), StringFormat::Hexadecimal)],
+            ),
+            Operation::new("ET", vec![]),
+        ]
+    }
+
+    fn build_simple_pdf(spec: &SimpleSpec, codes: &[u8]) -> Vec<u8> {
+        let mut doc = Document::with_version("1.7");
+        let pages_id = doc.new_object_id();
+        let font_id = add_simple_tt_font(&mut doc, spec);
+        let page = add_text_page(&mut doc, pages_id, font_id, show_byte_ops("F1", codes));
+        finish_pdf(&mut doc, pages_id, vec![page])
+    }
+
+    /// The (first) simple TrueType font program in the output, decompressed,
+    /// plus the font dictionary.
+    fn simple_font_view(pdf: &[u8]) -> (Dictionary, Vec<u8>) {
+        let doc = Document::load_mem(pdf).unwrap();
+        for obj in doc.objects.values() {
+            let Object::Dictionary(font) = obj else {
+                continue;
+            };
+            if !matches!(font.get(b"Subtype"), Ok(Object::Name(n)) if n == b"TrueType") {
+                continue;
+            }
+            let descriptor = resolve(&doc, font.get(b"FontDescriptor").unwrap())
+                .as_dict()
+                .unwrap();
+            let ff = resolve(&doc, descriptor.get(b"FontFile2").unwrap())
+                .as_stream()
+                .unwrap();
+            let bytes = strict_stream_bytes(&doc, ff).expect("font stream must inflate");
+            return (font.clone(), bytes);
+        }
+        panic!("no simple TrueType font in output");
+    }
+
+    /// Assert the subset font resolves `ch` (through its own cmap, the
+    /// viewer's lookup path) to the same outline and advance as the original.
+    fn assert_char_preserved(subset: &[u8], original: &[u8], ch: char) {
+        let orig_face = ttf_parser::Face::parse(original, 0).unwrap();
+        let new_face = ttf_parser::Face::parse(subset, 0).unwrap();
+        let old_gid = orig_face.glyph_index(ch).expect("original glyph missing");
+        let new_gid = new_face
+            .glyph_index(ch)
+            .unwrap_or_else(|| panic!("subset cmap must map {ch:?}"));
+        let (old_outline, old_adv) = outline_and_advance(original, old_gid.0);
+        let (new_outline, new_adv) = outline_and_advance(subset, new_gid.0);
+        assert_eq!(old_outline, new_outline, "outline mismatch for {ch:?}");
+        assert_eq!(old_adv, new_adv, "advance mismatch for {ch:?}");
+    }
+
+    #[test]
+    fn simple_winansi_font_is_subsetted_with_glyphs_preserved() {
+        // 0xE9 = eacute, 0xFC = udieresis in WinAnsi; both are composite
+        // glyphs in Noto Sans, so this also exercises glyph closure.
+        let codes = b"Hello, World! \xE9\xFC";
+        let text = "Hello, World! \u{e9}\u{fc}";
+        let pdf = build_simple_pdf(&SimpleSpec::winansi(), codes);
+        let out = optimize_with_options(&pdf, subset_opts());
+        assert!(out.len() < pdf.len(), "subsetting must shrink the file");
+
+        // Content stream untouched.
+        let pre = Document::load_mem(&pdf).unwrap();
+        let post = Document::load_mem(&out).unwrap();
+        let pre_page = *pre.get_pages().get(&1).unwrap();
+        let post_page = *post.get_pages().get(&1).unwrap();
+        assert_eq!(
+            pre.get_page_content(pre_page).unwrap(),
+            post.get_page_content(post_page).unwrap(),
+            "content stream must be byte-identical"
+        );
+
+        let (font, subset) = simple_font_view(&out);
+        let original = noto_bytes();
+        assert!(
+            subset.len() < original.len() / 4,
+            "subset must be much smaller than the full font"
+        );
+        for ch in text.chars() {
+            assert_char_preserved(&subset, &original, ch);
+        }
+        // Codes, /Encoding, and /Widths untouched; name re-tagged.
+        assert!(
+            matches!(font.get(b"Encoding"), Ok(Object::Name(n)) if n == b"WinAnsiEncoding"),
+            "/Encoding must be untouched"
+        );
+        let tagged = base_name_of(&font, b"BaseFont");
+        assert_eq!(tagged[6], b'+');
+        assert_eq!(&tagged[7..], b"NotoSans-Regular");
+        // An unused glyph must actually be gone (it is a subset, not a copy).
+        let new_face = ttf_parser::Face::parse(&subset, 0).unwrap();
+        assert_eq!(
+            new_face.glyph_index('A'),
+            None,
+            "unused 'A' must not survive"
+        );
+    }
+
+    #[test]
+    fn simple_font_differences_encoding_is_resolved() {
+        // Code 65 (normally 'A') remapped to /eacute via /Differences.
+        let spec = SimpleSpec {
+            encoding: Some(Object::Dictionary(dictionary! {
+                "Type" => "Encoding",
+                "BaseEncoding" => "WinAnsiEncoding",
+                "Differences" => vec![65.into(), Object::Name(b"eacute".to_vec())],
+            })),
+            ..SimpleSpec::winansi()
+        };
+        let pdf = build_simple_pdf(&spec, b"A");
+        let out = optimize_with_options(&pdf, subset_opts());
+        assert!(out.len() < pdf.len());
+        let (_, subset) = simple_font_view(&out);
+        assert_char_preserved(&subset, &noto_bytes(), '\u{e9}');
+    }
+
+    #[test]
+    fn symbolic_simple_font_is_untouched() {
+        let spec = SimpleSpec {
+            flags: 32 | 4, // Symbolic set: outside the nonsymbolic lookup model
+            ..SimpleSpec::winansi()
+        };
+        let pdf = build_simple_pdf(&spec, b"Hello");
+        let out = optimize_with_options(&pdf, subset_opts());
+        assert_eq!(out, pdf, "symbolic simple font must be untouched");
+    }
+
+    #[test]
+    fn simple_font_without_encoding_is_untouched() {
+        let spec = SimpleSpec {
+            encoding: None, // built-in encoding: semantics we decline to guess
+            ..SimpleSpec::winansi()
+        };
+        let pdf = build_simple_pdf(&spec, b"Hello");
+        let out = optimize_with_options(&pdf, subset_opts());
+        assert_eq!(out, pdf, "font without /Encoding must be untouched");
+    }
+
+    #[test]
+    fn corrupt_simple_font_file_is_untouched() {
+        let spec = SimpleSpec {
+            corrupt_font_file: true,
+            ..SimpleSpec::winansi()
+        };
+        let pdf = build_simple_pdf(&spec, b"Hello");
+        let out = optimize_with_options(&pdf, subset_opts());
+        assert_eq!(out, pdf, "corrupt FontFile2 must return original bytes");
+    }
+
+    #[test]
+    fn simple_font_subsetting_is_idempotent() {
+        let pdf = build_simple_pdf(&SimpleSpec::winansi(), b"Hello, World!");
         let once = optimize_with_options(&pdf, subset_opts());
         assert!(once.len() < pdf.len(), "first pass must shrink");
         let twice = optimize_with_options(&once, subset_opts());

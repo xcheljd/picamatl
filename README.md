@@ -127,7 +127,7 @@ amatl report.pdf -o report.small.pdf
 
 # Overwrite in place, tune the pipeline
 amatl scan.pdf --force --target-dpi 150 --jpeg-quality 70 \
-  --recompress-bitonal-images --subset-fonts
+  --recompress-bitonal-images
 
 # Keep the output readable by pre-PDF-1.5 viewers (no ObjStm packing)
 amatl report.pdf --no-pack-object-streams
@@ -164,11 +164,13 @@ settings — 130 DPI, 1.15 threshold, DCTEncode QFactor 0.4):
 
 On a public real-world document —
 [NASA TM-20210010291](https://ntrs.nasa.gov/citations/20210010291), a 16.8 MB
-58-page technical report — amatl 0.3.1 at defaults takes 16,804,107 bytes to
-**4,655,752 bytes, a 72.3% reduction**, byte-stable under repeated
-optimization. Ghostscript 10.07.1 at the same *matched-intent* settings
-(`/ebook`, which keeps lossless images lossless) produces 4,931,425 bytes —
-amatl is **5.6% smaller** and keeps the accessibility structure tree that GS
+58-page technical report — amatl 0.3.1-dev at defaults takes 16,804,107 bytes
+to **4,448,544 bytes, a 73.5% reduction**, byte-stable under repeated
+optimization (0.3.1 released at 4,655,752; the difference is the zlib-rs
+deflate backend, −82,722 B, plus default-on font subsetting, −124,486 B).
+Ghostscript 10.07.1 at the same *matched-intent* settings (`/ebook`, which
+keeps lossless images lossless) produces 4,931,425 bytes — amatl is
+**9.8% smaller** and keeps the accessibility structure tree that GS
 silently strips. Only when Ghostscript is pushed to aggressive lossy settings
 (forced 130-DPI downsampling + `DCTEncode`) does it go smaller; amatl closes
 most of that gap with the opt-in `--allow-lossy` flag (below) without ever
@@ -180,25 +182,28 @@ re-encoding without consent.
 | --- | ---: | ---: | --- |
 | input | 16,804,107 | 100% | 58-page technical report |
 | Ghostscript `/ebook` (matched intent) | 4,931,425 | 29.3% | keeps lossless images lossless; strips accessibility; AGPL |
-| **amatl defaults** (lossless-only) | **4,655,752** | **27.7%** | every image class handled; no encoding-class changes |
-| amatl `--allow-lossy` q78 | 4,155,393 | 24.7% | + explicit consent: Flate photos → JPEG, line art auto-declined |
+| **amatl defaults** (lossless-only) | **4,448,544** | **26.5%** | every image class handled; fonts subset; no encoding-class changes |
+| amatl `--allow-lossy` q78 | 3,342,293 | 19.9% | + explicit consent: Flate photos → JPEG (incl. masked pairs), line art auto-declined |
 | Ghostscript forced 130 DPI + DCT (aggressive) | 3,054,642 | 18.2% | re-encodes *all* imagery incl. line art; strips accessibility; AGPL |
 
 What each level buys:
 
 - **Defaults (no flags):** transparency-masked JPEG requantization and coupled
   downsampling (D-M1/D-M2), masked and unmasked Flate coupled downsampling
-  (D-M3), shared-mask and under-threshold requantization (Phase 6), then a
-  serialization pass — object-stream packing (PDF 1.5), a final zlib-9
-  re-deflate of every Flate stream, and a compressed cross-reference stream.
-  Every image keeps its encoding class; lossless images stay lossless; soft
-  masks are never resized when another image shares them.
+  (D-M3), shared-mask and under-threshold requantization (Phase 6), font
+  subsetting (Type0/CIDFontType2 Identity-H/V and nonsymbolic simple
+  TrueType — rendering-preserving, text extraction bit-identical), then a
+  serialization pass — object-stream packing (PDF 1.5), a final level-9
+  re-deflate of every Flate stream through the zlib-rs backend, and a
+  compressed cross-reference stream. Every image keeps its encoding class;
+  lossless images stay lossless; soft masks are never resized when another
+  image shares them.
 - **`--allow-lossy`:** additionally re-encodes *unmasked photographic-looking*
   FlateDecode images as JPEG at the configured quality. A built-in content
   heuristic declines line-art-like images (thin lines pick up visible JPEG
   mottling for marginal savings) and the flag never changes geometry the
   lossless path declined to change — one consent covers re-encoding only.
-  Measured effect on this corpus: −10.7% over defaults, with converted streams
+  Measured effect on this corpus: −24.9% over defaults, with converted streams
   visually indistinguishable at review zoom.
 
 For calibration: at matched intent (lossless in, lossless out) amatl now
@@ -256,23 +261,31 @@ untouched. It does not (yet) recompress `CCITT`/`JBIG2` images. On
 text-heavy PDFs with default options it will honestly do very little, and by
 contract it returns the input unchanged rather than a worse file.
 
-Since 0.2.1, embedded Type0/CIDFontType2 (Identity-H/V) fonts
-can be subset to the glyphs actually shown via the opt-in
-`with_subset_fonts(true)`. The implementation replaces only `/FontFile2` and
-`/CIDToGIDMap` (as an old-CID → new-GID stream), so content-stream text
-bytes are never rewritten, `/W`/`/DW`/`/ToUnicode` stay untouched, and text
-extraction is bit-identical pre/post — the "rewrote your text wrong" bug
-class is structurally impossible. Any parse uncertainty anywhere disables
-subsetting for the affected font or the whole document; PDF/A-declared and
-encrypted documents are skipped. The flag stays opt-in until it has soaked
-against real corpora (Ghostscript subsets by default; default-ON is the
-explicit target).
+Embedded fonts are subset to the glyphs actually shown — on by default since
+0.3.1-dev (opt out with `--no-subset-fonts` / `with_subset_fonts(false)`;
+introduced opt-in in 0.2.1). Two font classes are covered, and neither ever
+rewrites content-stream text bytes:
+
+- **Type0/CIDFontType2 (Identity-H/V)**: only `/FontFile2` and
+  `/CIDToGIDMap` (as an old-CID → new-GID stream) are replaced, so
+  `/W`/`/DW`/`/ToUnicode` stay untouched and text extraction is bit-identical
+  pre/post — the "rewrote your text wrong" bug class is structurally
+  impossible.
+- **Simple TrueType** (nonsymbolic, WinAnsi/MacRoman encodings incl.
+  `/Differences`, since 0.3.1-dev): the subset font gets a freshly written
+  `cmap` replicating the original's subtables (restricted to retained
+  glyphs), so every viewer lookup path of ISO 32000-1 9.6.6.4 resolves each
+  code to the same outline as before; codes, `/Encoding`, `/Widths`, and
+  `/ToUnicode` never change. Symbolic fonts, unknown encodings or glyph
+  names, and any used code the font's `cmap` cannot resolve disqualify that
+  font, untouched.
+
+Any parse uncertainty anywhere disables subsetting for the affected font or
+the whole document; PDF/A-declared and encrypted documents are skipped.
 
 On fonts, two limitations are permanent by design, not roadmap gaps:
-**simple-font (non-Type0) subsetting is out of scope** — subsetting a simple
-TrueType or Type1 font would require converting it to Type0 and rewriting
-every text-show string in the document, which is exactly the
-"silently rewrote your text wrong" bug class amatl refuses to ship — and
+**Type1 subsetting is out of scope** (CFF/Type1 rewriting is a different
+machine, and non-embedded Type1 base fonts carry no bytes to subset), and
 **predefined CJK CMaps** (`UniGB-UCS2-H` and friends) are unsupported, since
 supporting them means bundling megabytes of Adobe mapping tables for a
 shrinking legacy corpus. In both cases the affected fonts are left entirely

@@ -10,6 +10,47 @@ and this project adheres to
 
 ### Added
 
+- **Simple-TrueType font subsetting.** `subset_fonts` now also subsets
+  nonsymbolic simple TrueType fonts (`/Encoding` WinAnsiEncoding or
+  MacRomanEncoding, incl. explicit-base `/Differences`), not just
+  Type0/CIDFontType2 Identity-H/V. Content-stream text bytes, `/Encoding`,
+  `/Widths`, and `/ToUnicode` never change: the subset font (built by
+  `subsetter`, which drops `cmap` by design) gets a freshly synthesized
+  `cmap` replicating the original's subtables — restricted to retained
+  glyphs, glyph ids remapped — so every viewer lookup path of ISO 32000-1
+  9.6.6.4 ((3,1) via glyph name → Unicode, (1,0) via glyph name → Mac OS
+  Roman code, any (3,0) present) resolves each used code to the same outline
+  as before, verified by a parse-back round-trip at plan time. Encoding
+  tables and the Adobe Glyph List subset were extracted programmatically
+  from Ghostscript's authoritative resources and cross-checked against
+  Python's cp1252/mac_roman codecs. Fail-safe posture unchanged: symbolic
+  flags, absent `/Encoding` or `/Widths`, unknown glyph names, unsupported
+  cmap formats (anything outside {0, 4, 6, 12}), shared descriptors/font
+  files, or a used code the cmap paths cannot resolve leave that font
+  untouched. On the NASA corpus all 11 embedded simple TrueType fonts
+  subset (pool 327,544 → 208,985 B stored), −115,595 B whole-file, with all
+  58 pages rendering bit-identical (pdftoppm sha256) to the non-subset
+  output.
+
+### Changed
+
+- **`subset_fonts` defaults to ON** (was opt-in since 0.2.1). Subsetting is
+  rendering-preserving and render-verified, text extraction stays
+  bit-identical, and the structure tree is untouched, so it joins the
+  lossless defaults. Opt out with `with_subset_fonts(false)` /
+  `--no-subset-fonts`. Measured on NASA: −124,486 B vs `--no-subset-fonts`.
+- **Deflate backend switched to `zlib-rs`** (`flate2` feature `zlib-rs`,
+  pure Rust). Better ratios at the same level 9 across every re-deflated
+  stream; the existing strictly-smaller + verified-roundtrip guard in
+  `redeflate_flate_streams` still gates every replacement, so no stream can
+  regress by construction. Measured on NASA: −82,722 B at defaults.
+  Dependency floor unchanged (zlib-rs 0.6.7 declares rust-version 1.75,
+  inside the 1.88 MSRV).
+- NASA TM-20210010291 measured results (defaults): 16,804,107 →
+  **4,448,544 bytes (73.5% saved)**, byte-stable on pass 2, vs 4,655,752 at
+  0.3.1 — and 9.8% under Ghostscript `/ebook` at matched intent.
+  `--allow-lossy` q78: 3,342,293 (19.9% of input).
+
 - **Soft-masked FlateDecode bases reach JPEG under `--allow-lossy`.** A
   FlateDecode image carrying an eligible 8-bit DeviceGray `/SMask` is no longer
   excluded from the consent-gated Flate→JPEG conversion. It reaches it two ways,

@@ -43,10 +43,11 @@
 //!   TARGET geometry, against the losslessly resampled mask, so a masked pair
 //!   reaches its final encoding in one pass instead of two.
 //!
-//! Optionally (opt-in via [`OptimizeOptions::subset_fonts`]), embedded
-//! Type0/CIDFontType2 (Identity-H/V) fonts are subset to the glyphs actually
-//! shown, using a `/CIDToGIDMap`-stream technique that never rewrites
-//! content-stream text bytes (see `src/fonts.rs`).
+//! By default (opt-out via [`OptimizeOptions::subset_fonts`]), embedded
+//! Type0/CIDFontType2 (Identity-H/V) fonts and nonsymbolic simple TrueType
+//! fonts (WinAnsi/MacRoman) are subset to the glyphs actually shown, using
+//! techniques that never rewrite content-stream text bytes (see
+//! `src/fonts.rs`).
 //!
 //! Hard safety guarantees:
 //!   - Images we can't measure a placement for are left untouched.
@@ -55,7 +56,9 @@
 //!   - Any failure (parse, decode, save) falls back to the original bytes.
 
 mod bitonal;
+mod encodings;
 mod fonts;
+mod truetype;
 
 use std::collections::HashMap;
 
@@ -148,14 +151,18 @@ pub struct OptimizeOptions {
     /// threshold as the JPEG path. Default: `true`.
     pub downsample_flate_images: bool,
 
-    /// Subset embedded Type0/CIDFontType2 (Identity-H/V) fonts to the glyphs
-    /// the document actually shows. Only `/FontFile2` and `/CIDToGIDMap` are
-    /// replaced (plus the subset name tag): content-stream text bytes are
-    /// never rewritten, and `/W`, `/DW`, and `/ToUnicode` stay untouched, so
-    /// text extraction is bit-identical. Any parse uncertainty disables
-    /// subsetting for the affected font or the whole document — output is
-    /// always valid. PDF/A-declared and encrypted documents are skipped.
-    /// Default: `false` (opt-in for at least one release cycle).
+    /// Subset embedded fonts to the glyphs the document actually shows:
+    /// Type0/CIDFontType2 (Identity-H/V) fonts, and nonsymbolic simple
+    /// TrueType fonts with WinAnsi/MacRoman encodings (incl. `/Differences`).
+    /// Only the font program is replaced (plus `/CIDToGIDMap` on the Type0
+    /// path and the subset name tag): content-stream text bytes are never
+    /// rewritten, and `/W`, `/DW`, `/Widths`, `/Encoding`, and `/ToUnicode`
+    /// stay untouched, so text extraction is bit-identical. Any parse
+    /// uncertainty disables subsetting for the affected font or the whole
+    /// document — output is always valid. PDF/A-declared and encrypted
+    /// documents are skipped. Default: `true` (was `false` through 0.3.1;
+    /// rendering-preserving and verified, so it joined the lossless
+    /// defaults).
     pub subset_fonts: bool,
 
     /// Losslessly recompress bitonal (1-bit) images to CCITT G4: CCITT-stored
@@ -205,7 +212,7 @@ impl Default for OptimizeOptions {
             strip_accessibility: false,
             pack_object_streams: true,
             downsample_flate_images: true,
-            subset_fonts: false,
+            subset_fonts: true,
             recompress_bitonal_images: false,
             allow_lossy_reencode: false,
         }
@@ -3929,6 +3936,18 @@ mod tests {
     /// mottles, hairlines shift color under DCT).
     fn line_art_pixels(w: u32, h: u32) -> Vec<u8> {
         let mut buf = vec![255u8; (w * h * 3) as usize];
+        // Faint deterministic paper grain (≤ 6 counts below white): invisible
+        // to all three guard metrics (same >>3 quantization bucket, far below
+        // EDGE_STEP) but deflate-hostile and DCT-cheap — this is what keeps
+        // the JPEG candidate clearing the 5% size bar "by a wide margin"
+        // below, even against the zlib-rs deflate backend.
+        for (i, byte) in buf.iter_mut().enumerate() {
+            let mut x = i as u32 ^ 0x9E37_79B9;
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            *byte -= (x % 7) as u8;
+        }
         let palette = [
             [20u8, 40, 190],
             [10, 10, 10],
@@ -3939,7 +3958,9 @@ mod tests {
         // Anti-aliased dash-dot curves at irregular (non-periodic) positions:
         // sparse ink, sharp black/white transitions, a handful of colors — and
         // deliberately NOT deflate-friendly, so the size guard alone would
-        // convert it.
+        // convert it. (The curve frequency is tuned so that holds with margin
+        // under the zlib-rs deflate backend, which out-compresses the old
+        // miniz_oxide baseline.)
         for (k, color) in palette.iter().enumerate() {
             for x in 0..w {
                 if (x as usize / (5 + k)) % 3 == 2 {
@@ -4673,7 +4694,11 @@ mod tests {
             d.downsample_flate_images,
             "Flate downsampling is default-ON (0.2.0)"
         );
-        assert!(!d.subset_fonts, "font subsetting is opt-in (decision #3)");
+        assert!(
+            d.subset_fonts,
+            "font subsetting is default-ON (rendering-preserving, verified; \
+             measured −124,486 B on NASA vs --no-subset-fonts)"
+        );
         assert!(
             !d.recompress_bitonal_images,
             "bitonal G4 recompression is opt-in (B-M1)"

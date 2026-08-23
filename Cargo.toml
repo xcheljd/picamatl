@@ -25,8 +25,10 @@ image = { version = "0.25", default-features = false, features = ["jpeg"] }
 mozjpeg = "0.10"
 # Re-deflating downsampled FlateDecode images at a controlled level (9) with
 # our own predictor choice. Already in the tree transitively via lopdf, so this
-# adds zero new code to the build.
-flate2 = "1"
+# adds zero new code to the build. The zlib-rs backend (pure Rust, via
+# libz-rs-sys) out-compresses the default miniz_oxide at the same level; the
+# strictly-smaller guard in redeflate_flate_streams makes the swap risk-free.
+flate2 = { version = "1", features = ["zlib-rs"] }
 # Parallel image work. Pure Rust, MIT OR Apache-2.0, no native deps.
 rayon = "1"
 # Font subsetting (typst org; MIT OR Apache-2.0, rust-version 1.85). With

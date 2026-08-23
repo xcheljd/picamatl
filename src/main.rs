@@ -102,7 +102,8 @@ struct Cli {
     #[arg(long)]
     no_downsample_flate_images: bool,
 
-    /// Subset embedded Type0/CIDFontType2 (Identity-H/V) fonts
+    /// Subset embedded fonts (Type0/CIDFontType2 Identity-H/V and simple
+    /// TrueType)
     #[arg(long, overrides_with = "no_subset_fonts")]
     subset_fonts: bool,
     /// Do not subset embedded fonts
