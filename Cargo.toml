@@ -50,6 +50,15 @@ fax = "0.3.0"
 # CLI argument parsing for the `amatl` binary only; the library does not
 # depend on it. clap 4.6 declares rust-version 1.85, inside our 1.88 MSRV.
 clap = { version = "4.6.6", features = ["derive"] }
+# Pure-Rust JPEG 2000 (Part 1 + HTJ2K) decoder for the opt-in JPXDecode →
+# DCTDecode conversion under --allow-lossy. Fork of hayro-jpeg2000 whose
+# release keeps rust-version 1.80 (hayro's own 0.4.0 requires 1.92, outside
+# our 1.88 floor). #![forbid(unsafe_code)]; MIT OR Apache-2.0; the
+# openjph-htj2k feature pulls openjph-core (pure-Rust OpenJPH port,
+# BSD-2-Clause) for High-Throughput codestreams only — classic EBCOT/MQ
+# decode is entirely in-crate. Decode-only here: any header/decode error
+# leaves the stream byte-identical, same posture as every other image path.
+dicom-toolkit-jpeg2000 = "0.5.0"
 
 [[bin]]
 name = "amatl"

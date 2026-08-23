@@ -605,13 +605,15 @@ enum FilterClass {
     DctOnly,
     FlateOnly,
     CcittOnly,
-    /// `/JPXDecode`: JPEG2000, a JP2 container or bare codestream. The image
-    /// crate build amatl links is JPEG-only (its `jpeg2000` feature would drag
-    /// a native `openjpeg` in), so there is no decodable pipeline and the
-    /// stream must never be mistaken for DCT/Flate. Recognized so a future
-    /// pure-Rust JPEG2000 path slots in; today it is always left untouched
-    /// (fail-safe decline — `JP2→JPEG` lossy and `JP2→Flate` lossless
-    /// conversions both require a decoder that is not linked).
+    /// `/JPXDecode`: JPEG2000, a JP2 container or bare codestream. Decodable
+    /// via the pure-Rust `dicom-toolkit-jpeg2000` crate, but ONLY the
+    /// consent-gated `JPX→JPEG` conversion under `--allow-lossy` uses it (see
+    /// `plan_jpx_conversions`); every default-options path still declines the
+    /// class wholesale. A lossless `JPX→Flate` was considered and rejected:
+    /// irreversible (9/7) codestreams decode with implementation-specific
+    /// rounding, so "the pixels we decoded" are not provably the pixels the
+    /// viewer's decoder produces — not render-identical — and deflate never
+    /// beats JPEG2000 on the photographic payloads the format carries anyway.
     JpxOnly,
     /// `/JBIG2Decode`: lossless JBIG2 bilevel compression, seen in scanned
     /// office / fax archives. No JBIG2 decoder is linked. Recognized so it is
@@ -2260,6 +2262,130 @@ fn encode_jpeg(img: DynamicImage, is_gray: bool, quality: u8) -> Option<Vec<u8>>
     started.finish().ok()
 }
 
+/// A planned `/JPXDecode` → `/DCTDecode` conversion (strictly opt-in via
+/// `--allow-lossy`, like every other encoding-class change).
+struct JpxConversion {
+    id: ObjectId,
+    content: Vec<u8>,
+    /// `DeviceRGB` or `DeviceGray` — the JPX stream may carry its color space
+    /// inside the codestream with no `/ColorSpace` in the dict at all, so the
+    /// replacement must write one explicitly for the JPEG payload.
+    colorspace: &'static [u8],
+    /// Codestream geometry. Written into the dict: PDF 32000 §7.4.9 requires
+    /// dict `/Width`/`/Height` to match the codestream, but real files get
+    /// this wrong, and viewers follow the self-framing codestream (the image
+    /// maps to the unit square either way). The replacement normalizes the
+    /// dict to the truth.
+    width: u32,
+    height: u32,
+}
+
+/// Plan lossy JPEG2000 → JPEG conversions for every eligible `/JPXDecode`
+/// image. JPX is the one payload class where a *dimension-preserving* lossy
+/// re-encode adds compatibility value beyond size: JPEG2000 support in
+/// viewers is spotty, DCT support is universal.
+///
+/// Eligibility is deliberately narrow (any doubt → untouched):
+/// - `/Subtype /Image`, scalar `/JPXDecode` filter, no `/DecodeParms`;
+/// - no `/SMask`, `/Mask`, or `/Decode` (semantics we would have to carry);
+/// - `/ColorSpace` absent (the JP2 box supplies it) or exactly the matching
+///   `DeviceRGB`/`DeviceGray` name; anything else (ICC, Indexed, Lab) would
+///   change appearance when re-tagged;
+/// - 8-bit, no alpha, opaque Gray/RGB decode (the codestream's geometry is
+///   authoritative and gets written back into the dict — see
+///   [`JpxConversion::width`]);
+/// - not line art (`looks_like_line_art`, same posture as Flate→JPEG);
+/// - the JPEG re-decodes to the same pixels within `DECODE_BACK_MAX_MAD`;
+/// - ≥5% smaller, the same arithmetic as `plan_requant_replacement` and for
+///   the same reason: the output is a DCTDecode stream a second pass would
+///   otherwise churn on, and the 5% floor keeps repeat passes byte-stable.
+fn plan_jpx_conversions(doc: &Document, options: OptimizeOptions) -> Vec<JpxConversion> {
+    use dicom_toolkit_jpeg2000::{ColorSpace, DecodeSettings, Image as JpxImage};
+
+    let quality = options.jpeg_quality.clamp(1, 100);
+    let mut plans = Vec::new();
+    for (&id, obj) in doc.objects.iter() {
+        let Object::Stream(stream) = obj else {
+            continue;
+        };
+        if !matches!(stream.dict.get(b"Subtype"), Ok(Object::Name(n)) if n == b"Image") {
+            continue;
+        }
+        let Ok(filter) = stream.dict.get(b"Filter") else {
+            continue;
+        };
+        if classify_filter(doc, filter) != FilterClass::JpxOnly {
+            continue;
+        }
+        if [&b"DecodeParms"[..], b"SMask", b"Mask", b"Decode"]
+            .iter()
+            .any(|k| !matches!(stream.dict.get(k), Err(_) | Ok(Object::Null)))
+        {
+            continue;
+        }
+        let Ok(jpx) = JpxImage::new(&stream.content, &DecodeSettings::default()) else {
+            continue;
+        };
+        if jpx.has_alpha() || jpx.original_bit_depth() != 8 {
+            continue;
+        }
+        let (is_gray, cs_name): (bool, &'static [u8]) = match jpx.color_space() {
+            ColorSpace::Gray => (true, b"DeviceGray"),
+            ColorSpace::RGB => (false, b"DeviceRGB"),
+            _ => continue,
+        };
+        match stream.dict.get(b"ColorSpace") {
+            Err(_) | Ok(Object::Null) => {}
+            Ok(cs) => match resolve(doc, cs) {
+                Object::Name(n) if n.as_slice() == cs_name => {}
+                _ => continue,
+            },
+        }
+        let (w, h) = (jpx.width(), jpx.height());
+        match stream.dict.get(b"BitsPerComponent") {
+            Err(_) | Ok(Object::Null) => {}
+            Ok(bpc) => {
+                if bpc.as_i64().ok() != Some(8) {
+                    continue;
+                }
+            }
+        }
+        let Ok(pixels) = jpx.decode() else {
+            continue;
+        };
+        let channels = if is_gray { 1usize } else { 3 };
+        if pixels.len() != (w as usize) * (h as usize) * channels {
+            continue;
+        }
+        if looks_like_line_art(&pixels, channels, w, h) {
+            continue;
+        }
+        let img = if is_gray {
+            image::GrayImage::from_raw(w, h, pixels.clone()).map(DynamicImage::ImageLuma8)
+        } else {
+            image::RgbImage::from_raw(w, h, pixels.clone()).map(DynamicImage::ImageRgb8)
+        };
+        let Some(img) = img else { continue };
+        let Some(out) = encode_jpeg(img, is_gray, quality) else {
+            continue;
+        };
+        if !decode_back_matches(&out, &pixels, is_gray, w, h, DECODE_BACK_MAX_MAD) {
+            continue;
+        }
+        if out.len() * 100 >= stream.content.len() * 95 {
+            continue;
+        }
+        plans.push(JpxConversion {
+            id,
+            content: out,
+            colorspace: cs_name,
+            width: w,
+            height: h,
+        });
+    }
+    plans
+}
+
 /// Serialize a non-stream object to bytes for hashing. Returns `None` if
 /// serialization fails (the object will not be deduplicated in that case).
 fn serialize_object(obj: &Object) -> Option<Vec<u8>> {
@@ -3004,6 +3130,31 @@ fn dedup_streams(doc: &mut Document) -> bool {
 fn try_optimize(input: &[u8], options: OptimizeOptions) -> Result<Option<Vec<u8>>, lopdf::Error> {
     let mut doc = Document::load_mem(input)?;
 
+    // Fail-safe: if any page's /Contents cannot be resolved to stream objects
+    // lopdf actually LOADED, the parse lost content — seen in the wild with a
+    // malformed /Length whose recovery scan swallowed the whole object.
+    // Viewers with more forgiving recovery still render such files; a rewrite
+    // from our (lossy) parse would serialize the loss as a blank page. The
+    // whole document is declined, byte-identical passthrough.
+    for (_, page_id) in doc.get_pages() {
+        let has_contents = doc
+            .get_object(page_id)
+            .and_then(Object::as_dict)
+            .map(|d| d.has(b"Contents"))
+            .unwrap_or(false);
+        if !has_contents {
+            continue;
+        }
+        let ids = doc.get_page_contents(page_id);
+        if ids.is_empty()
+            || ids
+                .iter()
+                .any(|&id| !matches!(doc.get_object(id), Ok(Object::Stream(_))))
+        {
+            return Ok(None);
+        }
+    }
+
     // Collapse repeated images first: every downstream step (placement
     // collection, decode/resize/re-encode, and the final write) then sees one
     // object instead of N identical ones.
@@ -3052,6 +3203,14 @@ fn try_optimize(input: &[u8], options: OptimizeOptions) -> Result<Option<Vec<u8>
         Vec::new()
     };
 
+    // Plan JPX (JPEG2000) → JPEG conversions; empty unless --allow-lossy
+    // consented to encoding-class changes. Read-only planning, applied below.
+    let jpx_plans = if options.allow_lossy_reencode {
+        plan_jpx_conversions(&doc, options)
+    } else {
+        Vec::new()
+    };
+
     // Gray-collapse work detection runs on the ORIGINAL document (the real
     // plan runs later, against post-replacement pixels, because a downsampled
     // candidate must be collapsed at its new geometry — and a downsample of a
@@ -3075,6 +3234,7 @@ fn try_optimize(input: &[u8], options: OptimizeOptions) -> Result<Option<Vec<u8>
     if replacements.is_empty()
         && font_plans.is_empty()
         && bitonal_plans.is_empty()
+        && jpx_plans.is_empty()
         && !options.strip_accessibility
         && !merged_streams
         && !merged_decoded
@@ -3153,6 +3313,25 @@ fn try_optimize(input: &[u8], options: OptimizeOptions) -> Result<Option<Vec<u8>
                     "BlackIs1" => false,
                 }),
             );
+        }
+    }
+
+    // Apply JPX→JPEG conversions: raw JPEG payload, explicit /ColorSpace
+    // (the JP2 box that used to supply it is gone with the old payload),
+    // /BitsPerComponent, and the codestream's authoritative geometry.
+    for p in jpx_plans {
+        if let Ok(Object::Stream(stream)) = doc.get_object_mut(p.id) {
+            stream.set_content(p.content);
+            stream
+                .dict
+                .set("Filter", Object::Name(b"DCTDecode".to_vec()));
+            stream
+                .dict
+                .set("ColorSpace", Object::Name(p.colorspace.to_vec()));
+            stream.dict.set("BitsPerComponent", Object::Integer(8));
+            stream.dict.set("Width", Object::Integer(p.width as i64));
+            stream.dict.set("Height", Object::Integer(p.height as i64));
+            stream.dict.remove(b"DecodeParms");
         }
     }
 
