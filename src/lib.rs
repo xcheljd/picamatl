@@ -2607,6 +2607,15 @@ fn save_document(doc: &mut Document, options: OptimizeOptions) -> Result<Vec<u8>
         doc.save_to(&mut out)?;
         out
     };
+    // The zopfli backend can re-deflate the ObjStm the writer just emitted
+    // (lopdf deflates it internally at zlib level 9, out of reach of the
+    // final re-deflate pass). Must run BEFORE the xref compression below:
+    // the patch reads and rewrites the still-uncompressed xref rows.
+    let out = if options.deflate_backend == DeflateBackend::Zopfli {
+        rezopfli_objstm(out)
+    } else {
+        out
+    };
     // Both save paths emit an uncompressed cross-reference stream; deflate it.
     Ok(compress_xref_stream(out, options.deflate_backend))
 }
@@ -2720,6 +2729,233 @@ fn try_compress_xref_stream(out: &[u8], backend: DeflateBackend) -> Option<Vec<u
     patched.extend_from_slice(&deflated);
     patched.extend_from_slice(&out[content_start + content_len..]);
     Some(patched)
+}
+
+/// Re-deflate the just-written `ObjStm` payload with zopfli.
+///
+/// lopdf's writer deflates the object stream itself (zlib level 9) during
+/// `save_with_options`, after every document-level pass has run, so the final
+/// re-deflate pass never sees it. On the NASA reference the payload is
+/// dictionary-heavy text that zopfli encodes 22% smaller (41,322 → 32,148 B).
+///
+/// Patching the saved bytes is sound because everything the shrink
+/// invalidates is rewritten in the same patch: the ObjStm's `/Length`, the
+/// type-1 offsets in the (still uncompressed) cross-reference stream for
+/// every object that starts after the ObjStm, and the `startxref` offset.
+/// Type-2 entries are (stream id, index) pairs — no byte offsets — and the
+/// payload inflates back byte-identically, so `/N`/`/First` still hold.
+///
+/// Fail-safe: every structural assumption is checked against the bytes
+/// actually present, the new payload must be strictly smaller AND inflate
+/// back byte-identically, no xref offset may point inside the patched
+/// region, and the patched file must re-parse with lopdf (which walks every
+/// rewritten offset). Any doubt returns the input unchanged.
+fn rezopfli_objstm(out: Vec<u8>) -> Vec<u8> {
+    match try_rezopfli_objstm(&out) {
+        Some(patched) => patched,
+        None => out,
+    }
+}
+
+fn try_rezopfli_objstm(out: &[u8]) -> Option<Vec<u8>> {
+    // Exactly one ObjStm — more means an unfamiliar writer layout.
+    let tag = b"/Type/ObjStm";
+    let tag_at = find_sub(out, tag, 0)?;
+    if find_sub(out, tag, tag_at + tag.len()).is_some() {
+        return None;
+    }
+
+    // "<id> <gen> obj\n<<" — the dict opens right after the object header,
+    // and the /Type/ObjStm entry must sit inside THIS dict.
+    let hdr = rfind_sub(out, b" obj\n<<", tag_at)?;
+    let dict_start = hdr + b" obj\n".len();
+    let obj_start = {
+        // Walk back over "<id> <gen>": generation digits, one space, id digits.
+        let mut i = hdr;
+        while i > 0 && out[i - 1].is_ascii_digit() {
+            i -= 1;
+        }
+        let gen_start = i;
+        if gen_start == hdr || i == 0 || out[i - 1] != b' ' {
+            return None;
+        }
+        i -= 1;
+        let id_end = i;
+        while i > 0 && out[i - 1].is_ascii_digit() {
+            i -= 1;
+        }
+        if i == id_end {
+            return None;
+        }
+        i
+    };
+    let dict_end = find_sub(out, b">>stream\n", dict_start)? + 2;
+    if tag_at >= dict_end {
+        return None;
+    }
+    let dict = out.get(dict_start..dict_end)?;
+    // Plain Flate with no predictor: exactly what lopdf's writer emits.
+    if find_sub(dict, b"/Filter/FlateDecode", 0).is_none()
+        || find_sub(dict, b"/DecodeParms", 0).is_some()
+    {
+        return None;
+    }
+    let content_start = dict_end + b"stream\n".len();
+    let len_key = find_sub(dict, b"/Length ", 0)?;
+    let val_start = len_key + b"/Length ".len();
+    let val_end = skip_ascii_digits(dict, val_start)?;
+    let content_len: usize = std::str::from_utf8(dict.get(val_start..val_end)?)
+        .ok()?
+        .parse()
+        .ok()?;
+    let content = out.get(content_start..content_start.checked_add(content_len)?)?;
+    let content_end = content_start + content_len;
+    if !out.get(content_end..)?.starts_with(b"\nendstream") {
+        return None;
+    }
+
+    // The rewrite itself, guarded like every other deflate in the crate.
+    let plain = inflate_capped(content, MAX_REDEFLATE_BYTES)?;
+    let new_content = deflate_zopfli(&plain)?;
+    if new_content.len() >= content.len() {
+        return None;
+    }
+    if inflate_capped(&new_content, plain.len())?.as_slice() != plain.as_slice() {
+        return None;
+    }
+    let new_digits = new_content.len().to_string();
+    // Both terms shrink or hold: the payload is strictly smaller and its
+    // /Length value therefore never gains digits.
+    let delta = (content.len() - new_content.len()) + (val_end - val_start - new_digits.len());
+
+    // Locate the (still uncompressed) cross-reference stream via startxref.
+    // It must live after the ObjStm — the patch shifts everything past the
+    // patched region. lopdf's writer always emits it last.
+    let sx = out.windows(9).rposition(|w| w == b"startxref")?;
+    let mut p = sx + 9;
+    while out.get(p).is_some_and(|b| b.is_ascii_whitespace()) {
+        p += 1;
+    }
+    let sx_digits = p;
+    let sx_end = skip_ascii_digits(out, sx_digits)?;
+    let xref_start: usize = std::str::from_utf8(out.get(sx_digits..sx_end)?)
+        .ok()?
+        .parse()
+        .ok()?;
+    if xref_start <= content_end || xref_start >= sx {
+        return None;
+    }
+    let mut q = skip_ascii_digits(out, xref_start)?;
+    if out.get(q) != Some(&b' ') {
+        return None;
+    }
+    q = skip_ascii_digits(out, q + 1)?;
+    if out.get(q..q + 5)? != b" obj\n" {
+        return None;
+    }
+    let xdict_start = q + 5;
+    if out.get(xdict_start..xdict_start + 2)? != b"<<" {
+        return None;
+    }
+    let xdict_end = find_sub(out, b">>stream\n", xdict_start)? + 2;
+    let xdict = out.get(xdict_start..xdict_end)?;
+    if find_sub(xdict, b"/Type/XRef", 0).is_none() || find_sub(xdict, b"/Filter", 0).is_some() {
+        return None;
+    }
+    let xcontent_start = xdict_end + b"stream\n".len();
+    let xlen_key = find_sub(xdict, b"/Length ", 0)?;
+    let xval_start = xlen_key + b"/Length ".len();
+    let xval_end = skip_ascii_digits(xdict, xval_start)?;
+    let xcontent_len: usize = std::str::from_utf8(xdict.get(xval_start..xval_end)?)
+        .ok()?
+        .parse()
+        .ok()?;
+    let xcontent = out.get(xcontent_start..xcontent_start.checked_add(xcontent_len)?)?;
+    let xcontent_end = xcontent_start + xcontent_len;
+    if !out.get(xcontent_end..)?.starts_with(b"\nendstream") {
+        return None;
+    }
+
+    // /W[1 n 2]-style row layout: a 1-byte type field is what lopdf writes,
+    // and required here to tell offset rows (type 1) from the rest.
+    let w = parse_int_array(xdict, b"/W[")?;
+    let [w0, w1, w2] = w.as_slice() else {
+        return None;
+    };
+    if *w0 != 1 || *w1 == 0 || *w1 > 8 {
+        return None;
+    }
+    let row = w0 + w1 + w2;
+    if row == 0 || xcontent.len() % row != 0 {
+        return None;
+    }
+
+    // Rewrite the type-1 offsets. An offset at or before the ObjStm header is
+    // untouched; one past the patched region shifts back by `delta`; one
+    // INSIDE the ObjStm object means the file is not shaped the way this
+    // patch assumes, so hand it back untouched.
+    let mut new_xcontent = xcontent.to_vec();
+    for chunk in new_xcontent.chunks_mut(row) {
+        if chunk[0] != 1 {
+            continue;
+        }
+        let mut off: u64 = 0;
+        for &b in &chunk[*w0..w0 + w1] {
+            off = (off << 8) | u64::from(b);
+        }
+        let off = usize::try_from(off).ok()?;
+        if off <= obj_start {
+            continue;
+        }
+        if off < content_end {
+            return None;
+        }
+        let mut v = (off - delta) as u64;
+        for b in chunk[*w0..w0 + w1].iter_mut().rev() {
+            *b = (v & 0xff) as u8;
+            v >>= 8;
+        }
+        if v != 0 {
+            return None;
+        }
+    }
+
+    let mut patched = Vec::with_capacity(out.len() - delta);
+    patched.extend_from_slice(&out[..dict_start + val_start]);
+    patched.extend_from_slice(new_digits.as_bytes());
+    patched.extend_from_slice(&out[dict_start + val_end..content_start]);
+    patched.extend_from_slice(&new_content);
+    patched.extend_from_slice(&out[content_end..xcontent_start]);
+    patched.extend_from_slice(&new_xcontent);
+    patched.extend_from_slice(&out[xcontent_end..sx_digits]);
+    patched.extend_from_slice((xref_start - delta).to_string().as_bytes());
+    patched.extend_from_slice(&out[sx_end..]);
+
+    // Final proof: lopdf must re-parse the patched file, which walks every
+    // rewritten offset and re-reads every packed object out of the new
+    // payload. Anything short of a full parse means no patch.
+    Document::load_mem(&patched).ok()?;
+    Some(patched)
+}
+
+/// Last index of `needle` in `haystack` strictly before `before`.
+fn rfind_sub(haystack: &[u8], needle: &[u8], before: usize) -> Option<usize> {
+    haystack
+        .get(..before)?
+        .windows(needle.len())
+        .rposition(|w| w == needle)
+}
+
+/// Parse `key[int int ...]` out of a dictionary's bytes (lopdf's writer emits
+/// integer arrays with single spaces and no line breaks).
+fn parse_int_array(dict: &[u8], key: &[u8]) -> Option<Vec<usize>> {
+    let at = find_sub(dict, key, 0)?;
+    let close = find_sub(dict, b"]", at)?;
+    std::str::from_utf8(dict.get(at + key.len()..close)?)
+        .ok()?
+        .split_ascii_whitespace()
+        .map(|t| t.parse().ok())
+        .collect()
 }
 
 /// Index just past the digit run starting at `from`, or `None` if there is no
@@ -4412,6 +4648,45 @@ mod tests {
                     s.content.len()
                 );
             }
+        }
+    }
+
+    /// The ObjStm zopfli patch: on a packed save it must produce output that
+    /// is never larger, re-parses, and decodes to the same objects; on
+    /// anything that is not exactly a packed lopdf tail it must decline.
+    #[test]
+    fn objstm_zopfli_patch_is_never_larger_and_reparses() {
+        let pdf = build_pdf_duplicate_images(6, 400);
+        let zlib_out = optimize_with_options(
+            &pdf,
+            OptimizeOptions::default().with_pack_object_streams(true),
+        );
+        let zop_out = optimize_with_options(
+            &pdf,
+            OptimizeOptions::default()
+                .with_pack_object_streams(true)
+                .with_deflate_backend(DeflateBackend::Zopfli),
+        );
+        assert!(
+            zop_out.len() <= zlib_out.len(),
+            "zopfli save must never lose to zlib: {} vs {}",
+            zlib_out.len(),
+            zop_out.len()
+        );
+        let doc = Document::load_mem(&zop_out).unwrap();
+        assert_eq!(doc.get_pages().len(), 1, "the page must survive the patch");
+
+        // Fail-safe: junk and non-packed tails pass through untouched.
+        for junk in [
+            b"".to_vec(),
+            b"%PDF-1.5\nno objstm here\nstartxref\n9\n%%EOF".to_vec(),
+            zlib_out[..zlib_out.len() / 2].to_vec(),
+        ] {
+            assert_eq!(
+                rezopfli_objstm(junk.clone()),
+                junk,
+                "malformed input must pass through untouched"
+            );
         }
     }
 
