@@ -154,16 +154,40 @@ settings — 130 DPI, 1.15 threshold, DCTEncode QFactor 0.4):
 
 On a public real-world document —
 [NASA TM-20210010291](https://ntrs.nasa.gov/citations/20210010291), a 16.8 MB
-58-page technical report — amatl 0.2.1 (strip, no packing) takes 16,804,107
-bytes to 11,350,430 bytes, a 32% reduction (0.1.x, JPEG-only, managed 24.5%
-on the same file), byte-stable under repeated optimization. Ghostscript 10.07.1 (`/ebook` with
-`-dDetectDuplicateImages=true`) takes the same file to 4,931,402 bytes —
-clearly ahead on raw ratio for this corpus. Most of that gap is Ghostscript's
-willingness to re-encode lossless images as JPEG (an artifact-class change
-amatl treats as a future explicit opt-in, not a default), plus font
-subsetting and structural micro-optimization. Shown honestly: on
-scan-heavy/lossless-image corpora, Ghostscript currently wins on ratio; amatl
-wins on the contract, the license, and the security surface.
+58-page technical report — amatl 0.3.0 (strip, no packing) takes 16,804,107
+bytes to **4,958,148 bytes, a 70.5% reduction**, byte-stable under repeated
+optimization. Ghostscript 10.07.1 (`/ebook` with
+`-dDetectDuplicateImages=true`) takes the same file to 3,722,562 bytes —
+a gap amatl closes further with the opt-in `--allow-lossy` flag (below).
+
+### NASA TM-20210010291 — flag comparison
+
+| Pipeline | Bytes | % of input | Notes |
+| --- | ---: | ---: | --- |
+| input | 16,804,107 | 100% | 58-page technical report |
+| Ghostscript `/ebook` | 3,722,562 | 22% | strips accessibility structure; AGPL |
+| **amatl defaults** (lossless-only) | **4,958,148** | **29.5%** | every image class handled; no encoding-class changes |
+| amatl `--allow-lossy` q78 | 4,457,789 | 26.5% | + explicit consent: Flate photos → JPEG, line art auto-declined |
+
+What each level buys:
+
+- **Defaults (no flags):** transparency-masked JPEG requantization and coupled
+  downsampling (D-M1/D-M2), masked and unmasked Flate coupled downsampling
+  (D-M3), shared-mask and under-threshold requantization (Phase 6). Every
+  image keeps its encoding class; lossless images stay lossless; soft masks
+  are never resized when another image shares them.
+- **`--allow-lossy`:** additionally re-encodes *unmasked photographic-looking*
+  FlateDecode images as JPEG at the configured quality. A built-in content
+  heuristic declines line-art-like images (thin lines pick up visible JPEG
+  mottling for marginal savings) and the flag never changes geometry the
+  lossless path declined to change — one consent covers re-encoding only.
+  Measured effect on this corpus: −10.1% over defaults, with converted streams
+  visually indistinguishable at review zoom.
+
+For calibration: the remaining distance to Ghostscript on this corpus is its
+aggressive conversion of *all* lossless imagery (including line art), font
+rewriting, and structural stripping of the accessibility tree — trades amatl
+declines by contract even under `--allow-lossy`.
 
 On a real-world retail promotion flyer (1,376 KB, image-heavy, ~2,000
 structure-tree objects) — **from a private corpus, not redistributable**:
