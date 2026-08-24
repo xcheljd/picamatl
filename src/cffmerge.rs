@@ -53,14 +53,19 @@ struct Fragment {
     glyphs: BTreeMap<NameKey, Glyph>,
     gsubrs: Vec<Vec<u8>>,
     lsubrs: Vec<Vec<u8>>,
-    /// Private DICT bytes minus the `Subrs`/`defaultWidthX`/`nominalWidthX`
-    /// entries (the family-equality comparand).
-    private_cmp: Vec<u8>,
+    /// Private DICT entries minus `Subrs`/`defaultWidthX`/`nominalWidthX`,
+    /// as (op, operands) sorted by op — the family-equality comparand.
+    /// Semantic, not byte-level: fragments routinely encode identical
+    /// operand values in different integer forms.
+    private_cmp: Vec<(u16, Vec<f64>)>,
     /// Private DICT bytes minus only the `Subrs` entry (the emission base).
     private_body: Vec<u8>,
     has_lsubrs: bool,
     default_width: f64,
     nominal_width: f64,
+    /// True when the fragment's built-in encoding is a custom encoding that
+    /// defines no codes at all (empty format 0/1, no supplements).
+    builtin_empty: bool,
 }
 
 fn be16(d: &[u8], off: usize) -> Option<u16> {
@@ -270,6 +275,7 @@ fn split_width(cs: &[u8], default_w: f64, nominal_w: f64) -> Option<(f64, Vec<u8
 }
 
 const OP_CHARSET: u16 = 15;
+const OP_ENCODING: u16 = 16;
 const OP_CHARSTRINGS: u16 = 17;
 const OP_PRIVATE: u16 = 18;
 const OP_SUBRS: u16 = 19;
@@ -327,6 +333,22 @@ fn parse_fragment(data: &[u8]) -> Option<Fragment> {
     let font_bbox = match dict_get(&top, OP_FONT_BBOX) {
         Some(e) if e.operands.len() == 4 => e.operands.clone(),
         _ => return None,
+    };
+
+    // Built-in encoding: an absent operator or operand 0/1 selects a
+    // predefined encoding (Standard/Expert, never empty); a custom one is
+    // empty when it defines zero codes and carries no supplements.
+    let builtin_empty = match dict_get(&top, OP_ENCODING) {
+        None => false,
+        Some(e) => match e.operands.as_slice() {
+            [v] if *v >= 2.0 => {
+                let at = *v as usize;
+                let fmt = *data.get(at)?;
+                let count = usize::from(*data.get(at + 1)?);
+                (fmt & 0x80) == 0 && (fmt & 0x7f) <= 1 && count == 0
+            }
+            _ => false,
+        },
     };
 
     let charstrings_at = match dict_get(&top, OP_CHARSTRINGS)?.operands.as_slice() {
@@ -417,7 +439,12 @@ fn parse_fragment(data: &[u8]) -> Option<Fragment> {
         }
         out
     };
-    let private_cmp = splice(&[OP_SUBRS, OP_DEFAULT_WIDTH, OP_NOMINAL_WIDTH]);
+    let mut private_cmp: Vec<(u16, Vec<f64>)> = private
+        .iter()
+        .filter(|e| ![OP_SUBRS, OP_DEFAULT_WIDTH, OP_NOMINAL_WIDTH].contains(&e.op))
+        .map(|e| (e.op, e.operands.clone()))
+        .collect();
+    private_cmp.sort_by_key(|e| e.0);
     let private_body = splice(&[OP_SUBRS]);
 
     // Width-normalize every glyph; duplicate names decline the fragment.
@@ -446,7 +473,17 @@ fn parse_fragment(data: &[u8]) -> Option<Fragment> {
         has_lsubrs,
         default_width,
         nominal_width,
+        builtin_empty,
     })
+}
+
+/// True when `fragment` parses as a mergeable CFF whose built-in encoding
+/// defines no codes at all. The planner uses this to admit font dictionaries
+/// whose `/Encoding` has no named base: their base encoding *is* the built-in
+/// (ISO 32000-1 Table 114), and an empty built-in is exactly what the merged
+/// program carries.
+pub(crate) fn has_empty_builtin_encoding(fragment: &[u8]) -> bool {
+    parse_fragment(fragment).is_some_and(|f| f.builtin_empty)
 }
 
 /// Merge same-family CFF subset fragments into one union program every
@@ -454,13 +491,14 @@ fn parse_fragment(data: &[u8]) -> Option<Fragment> {
 /// precondition holds (see module docs); the caller then keeps all fragments
 /// untouched. Requires at least two fragments.
 ///
-/// The caller must guarantee PDF-side preconditions: every font dictionary
-/// carries an explicit `/Encoding` whose base is a *named* encoding (the
-/// merged program drops the fragments' built-in encodings), and `/Widths`
-/// covers the shown codes (intrinsic advance widths of glyphs appended from
-/// non-base fragments are re-based, byte-exactly, on the base's width
-/// parameters).
-pub(crate) fn merge_type1c(fragments: &[&[u8]]) -> Option<Vec<u8>> {
+/// The caller must guarantee PDF-side preconditions: every font dictionary's
+/// code lookups are fully determined without the fragment's built-in
+/// encoding — an explicit `/Encoding` with a *named* base, or an empty
+/// built-in (see [`has_empty_builtin_encoding`]; the merged program carries
+/// an explicitly empty one) — and `/Widths` covers the shown codes
+/// (intrinsic advance widths of glyphs appended from non-base fragments are
+/// re-based, byte-exactly, on the base's width parameters).
+pub(crate) fn merge_type1c(fragments: &[&[u8]], write_empty_encoding: bool) -> Option<Vec<u8>> {
     if fragments.len() < 2 {
         return None;
     }
@@ -555,9 +593,10 @@ pub(crate) fn merge_type1c(fragments: &[&[u8]]) -> Option<Vec<u8>> {
         .collect();
 
     // Top DICT: FontMatrix (spliced verbatim from the base) + FontBBox +
-    // fixed-width charset/CharStrings/Private offsets. No Encoding operator:
-    // the predefined standard encoding stands in for the dropped built-ins,
-    // which the caller's explicit-/Encoding precondition makes unreachable.
+    // fixed-width Encoding/charset/CharStrings/Private offsets. The merged
+    // built-in encoding is explicitly EMPTY (format 0, zero codes): every
+    // admitted font dictionary either never consults the built-in (named
+    // /Encoding base) or consulted an empty one, which this reproduces.
     let mut top_prefix = Vec::new();
     if let Some(fm) = &base.font_matrix {
         top_prefix.extend_from_slice(fm);
@@ -580,7 +619,13 @@ pub(crate) fn merge_type1c(fragments: &[&[u8]]) -> Option<Vec<u8>> {
     let lsubr_index = cff_index(&base.lsubrs)?;
     let gsubr_index = cff_index(&base.gsubrs)?;
 
-    let top_dict_len = top_prefix.len() + (5 + 1) * 2 + (5 + 5 + 1);
+    // Explicit empty encoding (format 0, nCodes 0) only when some admitted
+    // font dictionary actually falls back to the built-in; otherwise omit
+    // the operator (predefined standard encoding, unreachable via named
+    // /Encoding bases).
+    let encoding: &[u8] = if write_empty_encoding { &[0, 0] } else { &[] };
+    let enc_entry = if write_empty_encoding { 5 + 1 } else { 0 };
+    let top_dict_len = top_prefix.len() + enc_entry + (5 + 1) * 2 + (5 + 5 + 1);
     let header = [1u8, 0, 4, 4];
     let name_index = cff_index(std::slice::from_ref(&base.name))?;
     let top_index_size = cff_index(&[vec![0u8; top_dict_len]])?.len();
@@ -589,12 +634,17 @@ pub(crate) fn merge_type1c(fragments: &[&[u8]]) -> Option<Vec<u8>> {
     let fixed =
         header.len() + name_index.len() + top_index_size + string_index.len() + gsubr_index.len();
     let charset_at = fixed;
-    let charstrings_at = charset_at + charset.len();
+    let encoding_at = charset_at + charset.len();
+    let charstrings_at = encoding_at + encoding.len();
     let private_at = charstrings_at + charstrings_index.len();
 
     let mut top_dict = top_prefix;
     dict_int32(&mut top_dict, u32::try_from(charset_at).ok()?);
     dict_op(&mut top_dict, OP_CHARSET);
+    if write_empty_encoding {
+        dict_int32(&mut top_dict, u32::try_from(encoding_at).ok()?);
+        dict_op(&mut top_dict, OP_ENCODING);
+    }
     dict_int32(&mut top_dict, u32::try_from(charstrings_at).ok()?);
     dict_op(&mut top_dict, OP_CHARSTRINGS);
     dict_int32(&mut top_dict, u32::try_from(private.len()).ok()?);
@@ -610,6 +660,7 @@ pub(crate) fn merge_type1c(fragments: &[&[u8]]) -> Option<Vec<u8>> {
     out.extend_from_slice(&string_index);
     out.extend_from_slice(&gsubr_index);
     out.extend_from_slice(&charset);
+    out.extend_from_slice(encoding);
     out.extend_from_slice(&charstrings_index);
     out.extend_from_slice(&private);
     if base.has_lsubrs {
@@ -746,7 +797,7 @@ mod tests {
             100.0,
             300.0,
         );
-        let merged = merge_type1c(&[&a, &b]).unwrap();
+        let merged = merge_type1c(&[&a, &b], true).unwrap();
         let f = parse_fragment(&merged).unwrap();
         assert_eq!(f.order.len(), 3);
         let ga = f.glyphs.get(&NameKey::Custom(b"A".to_vec())).unwrap();
@@ -767,6 +818,6 @@ mod tests {
             0.0,
             0.0,
         );
-        assert!(merge_type1c(&[&a, &b]).is_none());
+        assert!(merge_type1c(&[&a, &b], false).is_none());
     }
 }

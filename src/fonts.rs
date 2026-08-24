@@ -260,6 +260,7 @@ pub(crate) fn plan_type1c_merges(doc: &Document) -> Vec<T1cMergePlan> {
         font_file_id: ObjectId,
         bytes: Vec<u8>,
         stored_len: usize,
+        needs_empty_builtin: bool,
     }
     // Fragments grouped by base font name minus the subset tag; sorted maps
     // and sorted ids keep the plan order reproducible.
@@ -280,20 +281,23 @@ pub(crate) fn plan_type1c_merges(doc: &Document) -> Vec<T1cMergePlan> {
         if !is_type1 {
             continue;
         }
-        // The merged program drops the fragments' built-in encodings, so the
-        // PDF-side /Encoding must fully determine every code lookup: either a
-        // named base encoding, or a dictionary whose /BaseEncoding is named.
-        let encoding_ok = match font.get(b"Encoding").map(|o| resolve(doc, o)) {
-            Ok(Object::Name(_)) => true,
-            Ok(Object::Dictionary(d)) => matches!(
+        // The merged program's built-in encoding is explicitly empty, so the
+        // PDF-side /Encoding must determine every code lookup without the
+        // fragment's built-in: a named base encoding qualifies outright; an
+        // /Encoding dictionary without /BaseEncoding falls back to the
+        // built-in (Table 114) and qualifies only when that built-in is
+        // itself empty (checked below, once the fragment bytes are read).
+        let needs_empty_builtin = match font.get(b"Encoding").map(|o| resolve(doc, o)) {
+            Ok(Object::Name(_)) => false,
+            Ok(Object::Dictionary(d)) => !matches!(
                 d.get(b"BaseEncoding").map(|o| resolve(doc, o)),
                 Ok(Object::Name(_))
             ),
-            _ => false,
+            _ => continue,
         };
         // /Widths must supply the advances (appended glyphs are re-based on
         // the base fragment's width parameters; see cffmerge).
-        if !encoding_ok || font.get(b"Widths").is_err() {
+        if font.get(b"Widths").is_err() {
             continue;
         }
         let Ok(Object::Name(base_name)) = font.get(b"BaseFont").map(|o| resolve(doc, o)) else {
@@ -329,13 +333,12 @@ pub(crate) fn plan_type1c_merges(doc: &Document) -> Vec<T1cMergePlan> {
         ) {
             continue;
         }
-        // Shared structure could serve fonts not in this group.
-        if refcounts.get(&descriptor_id) != Some(&1) || refcounts.get(&font_file_id) != Some(&1) {
-            continue;
-        }
         let Some(bytes) = strict_stream_bytes(doc, font_file) else {
             continue;
         };
+        if needs_empty_builtin && !cffmerge::has_empty_builtin_encoding(&bytes) {
+            continue;
+        }
         groups
             .entry(strip_subset_tag(&base_name).to_vec())
             .or_default()
@@ -345,16 +348,44 @@ pub(crate) fn plan_type1c_merges(doc: &Document) -> Vec<T1cMergePlan> {
                 font_file_id,
                 bytes,
                 stored_len: font_file.content.len(),
+                needs_empty_builtin,
             });
     }
 
     let mut plans = Vec::new();
-    for (base_name, members) in groups {
-        if members.len() < 2 {
+    for (base_name, mut members) in groups {
+        // Producers routinely share one descriptor/FontFile3 among several
+        // same-family font dicts already. Sharing is safe exactly when every
+        // reference to the shared object comes from inside this group: the
+        // descriptor's refcount must equal the number of member font dicts
+        // pointing at it, and the font file's refcount the number of member
+        // descriptors pointing at it. Anything else could serve a font whose
+        // usage was not attributed here — drop that member, fail-safe.
+        let mut desc_refs: HashMap<ObjectId, usize> = HashMap::new();
+        let mut file_refs: HashMap<ObjectId, HashSet<ObjectId>> = HashMap::new();
+        for m in &members {
+            *desc_refs.entry(m.descriptor_id).or_insert(0) += 1;
+            file_refs
+                .entry(m.font_file_id)
+                .or_default()
+                .insert(m.descriptor_id);
+        }
+        members.retain(|m| {
+            refcounts.get(&m.descriptor_id) == Some(&desc_refs[&m.descriptor_id])
+                && refcounts.get(&m.font_file_id) == Some(&file_refs[&m.font_file_id].len())
+        });
+        // Merge over the distinct programs (shared members repeat bytes).
+        let mut seen_files: HashSet<ObjectId> = HashSet::new();
+        let unique: Vec<&Candidate> = members
+            .iter()
+            .filter(|m| seen_files.insert(m.font_file_id))
+            .collect();
+        if unique.len() < 2 {
             continue;
         }
-        let fragments: Vec<&[u8]> = members.iter().map(|m| m.bytes.as_slice()).collect();
-        let Some(merged) = cffmerge::merge_type1c(&fragments) else {
+        let fragments: Vec<&[u8]> = unique.iter().map(|m| m.bytes.as_slice()).collect();
+        let write_empty_encoding = members.iter().any(|m| m.needs_empty_builtin);
+        let Some(merged) = cffmerge::merge_type1c(&fragments, write_empty_encoding) else {
             continue;
         };
         let Some(deflated) = deflate_level9(&merged) else {
@@ -362,7 +393,7 @@ pub(crate) fn plan_type1c_merges(doc: &Document) -> Vec<T1cMergePlan> {
         };
         // Net-smaller guard on stored bytes: after the stream dedup collapses
         // the identical replacements, exactly one copy ships.
-        let stored: usize = members.iter().map(|m| m.stored_len).sum();
+        let stored: usize = unique.iter().map(|m| m.stored_len).sum();
         if deflated.len() >= stored {
             continue;
         }
