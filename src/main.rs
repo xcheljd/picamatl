@@ -33,12 +33,13 @@ fn defaults_blurb() -> String {
         "Boolean defaults (from OptimizeOptions::default()):\n  \
          strip-accessibility {}, pack-object-streams {},\n  \
          downsample-flate-images {}, subset-fonts {},\n  \
-         recompress-bitonal-images {}, allow-lossy {},\n  \
-         collapse-gray-images {}",
+         convert-type1 {}, recompress-bitonal-images {},\n  \
+         allow-lossy {}, collapse-gray-images {}",
         on_off(d.strip_accessibility),
         on_off(d.pack_object_streams),
         on_off(d.downsample_flate_images),
         on_off(d.subset_fonts),
+        on_off(d.convert_type1),
         on_off(d.recompress_bitonal_images),
         on_off(d.allow_lossy_reencode),
         on_off(d.collapse_gray_images),
@@ -111,6 +112,14 @@ struct Cli {
     /// Do not subset embedded fonts
     #[arg(long)]
     no_subset_fonts: bool,
+
+    /// Convert embedded Type1 fonts to subsetted Type1C (CFF), swapping
+    /// each font only when strictly smaller
+    #[arg(long, overrides_with = "no_convert_type1")]
+    convert_type1: bool,
+    /// Leave embedded Type1 fonts untouched
+    #[arg(long)]
+    no_convert_type1: bool,
 
     /// Losslessly recompress bitonal (1-bit) images to CCITT G4
     #[arg(long, overrides_with = "no_recompress_bitonal_images")]
@@ -193,6 +202,11 @@ fn options_from(cli: &Cli) -> OptimizeOptions {
             cli.subset_fonts,
             cli.no_subset_fonts,
             d.subset_fonts,
+        ))
+        .with_convert_type1(resolve(
+            cli.convert_type1,
+            cli.no_convert_type1,
+            d.convert_type1,
         ))
         .with_recompress_bitonal_images(resolve(
             cli.recompress_bitonal_images,

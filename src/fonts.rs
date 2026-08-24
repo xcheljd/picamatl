@@ -48,7 +48,7 @@ use lopdf::content::Content;
 use lopdf::{dictionary, Dictionary, Document, Object, ObjectId, Stream};
 use subsetter::GlyphRemapper;
 
-use crate::{deflate_level9, encodings, inflate_capped, resolve, truetype, FilterClass};
+use crate::{deflate_level9, encodings, inflate_capped, resolve, truetype, type1, FilterClass};
 
 /// Recursion bound for the form/pattern/Type3 walk (depth of nested streams).
 const MAX_WALK_DEPTH: usize = 16;
@@ -60,6 +60,7 @@ const MAX_STREAM_BYTES: usize = 64 * 1024 * 1024;
 pub(crate) enum FontPlan {
     Cid(CidFontPlan),
     Simple(SimpleFontPlan),
+    Type1(Type1FontPlan),
 }
 
 impl FontPlan {
@@ -68,6 +69,7 @@ impl FontPlan {
         match self {
             FontPlan::Cid(p) => p.type0_id,
             FontPlan::Simple(p) => p.font_id,
+            FontPlan::Type1(p) => p.font_id,
         }
     }
 }
@@ -105,9 +107,30 @@ pub(crate) struct SimpleFontPlan {
     tagged_name: Vec<u8>,
 }
 
+/// A planned Type1 → Type1C (CFF) conversion (opt-in, `convert_type1`).
+/// Applying it replaces the `/FontFile` stream object in place with a
+/// `/FontFile3` (`/Subtype /Type1C`) subset, re-keys the descriptor entry,
+/// and re-tags the font names — `/Encoding`, `/Widths`, and `/ToUnicode`
+/// never change, so text extraction is bit-identical.
+pub(crate) struct Type1FontPlan {
+    font_id: ObjectId,
+    descriptor_id: ObjectId,
+    font_file_id: ObjectId,
+    /// Flate-compressed CFF font program.
+    deflated_cff: Vec<u8>,
+    /// `TAG+BaseFont` name applied to `/BaseFont` and `/FontName`.
+    tagged_name: Vec<u8>,
+}
+
 /// Plan every eligible font subset. Read-only; returns an empty vector (and
-/// therefore changes nothing) on any global disqualifier.
-pub(crate) fn plan_font_subsets(doc: &Document) -> Vec<FontPlan> {
+/// therefore changes nothing) on any global disqualifier. `subset_fonts`
+/// gates the Type0/TrueType subsetting planners; `convert_type1` gates the
+/// Type1 → Type1C conversion planner.
+pub(crate) fn plan_font_subsets(
+    doc: &Document,
+    subset_fonts: bool,
+    convert_type1: bool,
+) -> Vec<FontPlan> {
     if doc.is_encrypted() || pdfa_blocked(doc) {
         return Vec::new();
     }
@@ -141,27 +164,33 @@ pub(crate) fn plan_font_subsets(doc: &Document) -> Vec<FontPlan> {
         .used
         .iter()
         .filter(|(id, cids)| !walker.ineligible.contains(id) && !cids.is_empty())
-        .filter_map(|(&id, cids)| plan_one(doc, id, cids, &refcounts))
+        .filter_map(|(&id, cids)| plan_one(doc, id, cids, &refcounts, subset_fonts, convert_type1))
         .collect();
     // HashMap iteration order is arbitrary; sort so output is reproducible.
     plans.sort_by_key(FontPlan::font_id);
     plans
 }
 
-/// Dispatch a used font to the planner matching its subtype.
+/// Dispatch a used font to the planner matching its subtype (each planner
+/// gated by its own option).
 fn plan_one(
     doc: &Document,
     id: ObjectId,
     codes: &BTreeSet<u16>,
     refcounts: &HashMap<ObjectId, usize>,
+    subset_fonts: bool,
+    convert_type1: bool,
 ) -> Option<FontPlan> {
     let dict = doc.get_object(id).ok()?.as_dict().ok()?;
     match dict.get(b"Subtype").map(|s| resolve(doc, s)) {
-        Ok(Object::Name(n)) if n == b"Type0" => {
+        Ok(Object::Name(n)) if n == b"Type0" && subset_fonts => {
             plan_one_font(doc, id, codes, refcounts).map(FontPlan::Cid)
         }
-        Ok(Object::Name(n)) if n == b"TrueType" => {
+        Ok(Object::Name(n)) if n == b"TrueType" && subset_fonts => {
             plan_one_simple_font(doc, id, codes, refcounts).map(FontPlan::Simple)
+        }
+        Ok(Object::Name(n)) if n == b"Type1" && convert_type1 => {
+            plan_one_type1_font(doc, id, codes, refcounts).map(FontPlan::Type1)
         }
         _ => None,
     }
@@ -173,6 +202,7 @@ pub(crate) fn apply_font_subsets(doc: &mut Document, plans: Vec<FontPlan>) {
         match plan {
             FontPlan::Cid(plan) => apply_cid_plan(doc, plan),
             FontPlan::Simple(plan) => apply_simple_plan(doc, plan),
+            FontPlan::Type1(plan) => apply_type1_plan(doc, plan),
         }
     }
 }
@@ -226,6 +256,30 @@ fn apply_simple_plan(doc: &mut Document, plan: SimpleFontPlan) {
     }
     if let Ok(Object::Dictionary(d)) = doc.get_object_mut(plan.descriptor_id) {
         d.set("FontName", Object::Name(plan.tagged_name));
+    }
+}
+
+fn apply_type1_plan(doc: &mut Document, plan: Type1FontPlan) {
+    // The stream object keeps its id but changes role: `/FontFile3` streams
+    // carry `/Subtype /Type1C` and none of the Type1 `/Length1..3` splits.
+    let font_stream = Stream::new(
+        dictionary! {
+            "Filter" => "FlateDecode",
+            "Subtype" => "Type1C",
+        },
+        plan.deflated_cff,
+    )
+    .with_compression(false);
+    doc.objects
+        .insert(plan.font_file_id, Object::Stream(font_stream));
+
+    if let Ok(Object::Dictionary(d)) = doc.get_object_mut(plan.descriptor_id) {
+        d.remove(b"FontFile");
+        d.set("FontFile3", Object::Reference(plan.font_file_id));
+        d.set("FontName", Object::Name(plan.tagged_name.clone()));
+    }
+    if let Ok(Object::Dictionary(d)) = doc.get_object_mut(plan.font_id) {
+        d.set("BaseFont", Object::Name(plan.tagged_name));
     }
 }
 
@@ -337,13 +391,14 @@ enum CurrentFont {
     /// No `Tf` seen yet: a show operator here means text we cannot attribute,
     /// e.g. a form inheriting the invoker's text state — global abort.
     Unset,
-    /// A font we will never subset (Type1, Type3, non-Identity Type0, inline
-    /// dictionaries): show strings are ignored.
+    /// A font we will never touch (Type3, MMType1, non-Identity Type0,
+    /// inline dictionaries): show strings are ignored.
     Other,
     /// A Type0 / Identity-H|V font: show strings are big-endian 2-byte CIDs.
     Candidate(ObjectId),
-    /// A simple TrueType font: show strings are single-byte codes.
-    /// Eligibility (encoding, flags, cmap) is decided at planning time.
+    /// A simple TrueType or Type1 font: show strings are single-byte codes.
+    /// Eligibility (encoding, flags, cmap, font program) is decided at
+    /// planning time, per subtype.
     Simple(ObjectId),
 }
 
@@ -681,7 +736,7 @@ impl<'a> Walker<'a> {
             Ok(Object::Name(n)) => n.as_slice(),
             _ => return CurrentFont::Other,
         };
-        if subtype == b"TrueType" {
+        if subtype == b"TrueType" || subtype == b"Type1" {
             return match id {
                 Some(id) => CurrentFont::Simple(id),
                 // An inline simple dict stays untouched (usage cannot be
@@ -1210,31 +1265,37 @@ fn parse_simple_encoding(doc: &Document, font: &Dictionary) -> Option<SimpleEnco
                 // gaps, which we cannot replicate. Decline.
                 _ => return None,
             };
-            let mut diffs: HashMap<u8, Vec<u8>> = HashMap::new();
-            if let Ok(arr) = d.get(b"Differences") {
-                let arr = resolve(doc, arr).as_array().ok()?;
-                let mut code: i64 = -1;
-                for item in arr {
-                    match resolve(doc, item) {
-                        Object::Integer(i) => {
-                            if !(0..=255).contains(i) {
-                                return None;
-                            }
-                            code = *i;
-                        }
-                        Object::Name(n) => {
-                            let slot = u8::try_from(code).ok()?;
-                            diffs.insert(slot, n.clone());
-                            code += 1;
-                        }
-                        _ => return None,
-                    }
-                }
-            }
-            Some((base, diffs))
+            Some((base, parse_differences(doc, d)?))
         }
         _ => None,
     }
+}
+
+/// The `/Differences` overrides of an encoding dictionary (empty when the
+/// entry is absent); `None` for any malformed shape.
+fn parse_differences(doc: &Document, d: &Dictionary) -> Option<HashMap<u8, Vec<u8>>> {
+    let mut diffs: HashMap<u8, Vec<u8>> = HashMap::new();
+    if let Ok(arr) = d.get(b"Differences") {
+        let arr = resolve(doc, arr).as_array().ok()?;
+        let mut code: i64 = -1;
+        for item in arr {
+            match resolve(doc, item) {
+                Object::Integer(i) => {
+                    if !(0..=255).contains(i) {
+                        return None;
+                    }
+                    code = *i;
+                }
+                Object::Name(n) => {
+                    let slot = u8::try_from(code).ok()?;
+                    diffs.insert(slot, n.clone());
+                    code += 1;
+                }
+                _ => return None,
+            }
+        }
+    }
+    Some(diffs)
 }
 
 /// Validate one used simple TrueType font end to end and build its plan.
@@ -1406,6 +1467,136 @@ fn plan_one_simple_font(
         font_file_id,
         deflated_font,
         font_len: final_font.len() as i64,
+        tagged_name,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Type1 → Type1C planning
+// ---------------------------------------------------------------------------
+
+/// The base of a Type1 font's effective encoding: an explicit Annex D table
+/// or the font program's built-in encoding.
+enum Type1Base {
+    Builtin,
+    Table(&'static [&'static str; 256]),
+}
+
+/// The font's `/Encoding`, reduced to base + `/Differences`. Unlike the
+/// TrueType path, an absent `/Encoding` (or a dictionary without
+/// `/BaseEncoding`) is fully supported: the built-in encoding it defers to
+/// is parsed out of the font program itself and replicated in the emitted
+/// CFF, so every viewer lookup path resolves identically.
+fn parse_type1_encoding(
+    doc: &Document,
+    font: &Dictionary,
+) -> Option<(Type1Base, HashMap<u8, Vec<u8>>)> {
+    fn base_table(name: &[u8]) -> Option<&'static [&'static str; 256]> {
+        match name {
+            b"WinAnsiEncoding" => Some(&encodings::WIN_ANSI_NAMES),
+            b"MacRomanEncoding" => Some(&encodings::MAC_ROMAN_NAMES),
+            _ => None,
+        }
+    }
+    match font.get(b"Encoding") {
+        Err(_) => Some((Type1Base::Builtin, HashMap::new())),
+        Ok(obj) => match resolve(doc, obj) {
+            Object::Name(n) => Some((Type1Base::Table(base_table(n)?), HashMap::new())),
+            Object::Dictionary(d) => {
+                let base = match d.get(b"BaseEncoding").map(|b| resolve(doc, b)) {
+                    Ok(Object::Name(n)) => Type1Base::Table(base_table(n)?),
+                    Err(_) => Type1Base::Builtin,
+                    _ => return None,
+                };
+                Some((base, parse_differences(doc, d)?))
+            }
+            _ => None,
+        },
+    }
+}
+
+/// Validate one used Type1 font end to end and build its Type1C conversion
+/// plan. Any failure — unparseable font program, unknown encoding shape,
+/// charstring anomalies, shared structure, not strictly smaller — returns
+/// `None` and the font ships untouched.
+fn plan_one_type1_font(
+    doc: &Document,
+    font_id: ObjectId,
+    codes: &BTreeSet<u16>,
+    refcounts: &HashMap<ObjectId, usize>,
+) -> Option<Type1FontPlan> {
+    let font = doc.get_object(font_id).ok()?.as_dict().ok()?;
+    let (descriptor_id, descriptor) = resolve_ref(doc, font.get(b"FontDescriptor").ok()?);
+    let descriptor_id = descriptor_id?;
+    let descriptor = descriptor.as_dict().ok()?;
+    // Exactly one font program, of the Type1 kind: a descriptor already
+    // carrying a `/FontFile3` (or a TrueType program) is not ours to touch.
+    if descriptor.get(b"FontFile2").is_ok() || descriptor.get(b"FontFile3").is_ok() {
+        return None;
+    }
+    let (font_file_id, font_file) = resolve_ref(doc, descriptor.get(b"FontFile").ok()?);
+    let font_file_id = font_file_id?;
+    let font_file = font_file.as_stream().ok()?;
+    // Shared descriptor/font-program structure could serve fonts whose usage
+    // was not attributed here; mutating it would be unsound.
+    if refcounts.get(&descriptor_id) != Some(&1) || refcounts.get(&font_file_id) != Some(&1) {
+        return None;
+    }
+
+    let font_bytes = strict_stream_bytes(doc, font_file)?;
+    let t1 = type1::parse(&font_bytes)?;
+    let (base, diffs) = parse_type1_encoding(doc, font)?;
+
+    // Resolve every used code to a glyph name through the same encoding the
+    // viewer applies (`/Differences`, then the base). A code that resolves
+    // to no name, or to a glyph the font does not carry, renders `.notdef`
+    // before AND after conversion (the encoding objects never change), so it
+    // constrains nothing.
+    let mut keep: BTreeSet<Vec<u8>> = BTreeSet::new();
+    for &code in codes {
+        let code = u8::try_from(code).ok()?;
+        let name: Option<Vec<u8>> = match diffs.get(&code) {
+            Some(n) => Some(n.clone()),
+            None => match &base {
+                Type1Base::Table(table) => {
+                    let n = table[usize::from(code)];
+                    (!n.is_empty()).then(|| n.as_bytes().to_vec())
+                }
+                Type1Base::Builtin => t1.builtin_name(code).map(<[u8]>::to_vec),
+            },
+        };
+        if let Some(name) = name {
+            if t1.has_glyph(&name) {
+                keep.insert(name);
+            }
+        }
+    }
+
+    let cff = type1::convert_to_cff(&t1, &keep)?;
+    let deflated_cff = deflate_level9(&cff)?;
+    // Strict-smaller guard on stored bytes, per font: never regress one.
+    if deflated_cff.len() >= font_file.content.len() {
+        return None;
+    }
+
+    let base_name = match font.get(b"BaseFont").map(|o| resolve(doc, o)) {
+        Ok(Object::Name(n)) => n.clone(),
+        _ => match descriptor.get(b"FontName").map(|o| resolve(doc, o)) {
+            Ok(Object::Name(n)) => n.clone(),
+            _ => return None,
+        },
+    };
+    let tag = subset_tag(&cff);
+    let mut tagged_name = Vec::with_capacity(base_name.len() + 7);
+    tagged_name.extend_from_slice(&tag);
+    tagged_name.push(b'+');
+    tagged_name.extend_from_slice(strip_subset_tag(&base_name));
+
+    Some(Type1FontPlan {
+        font_id,
+        descriptor_id,
+        font_file_id,
+        deflated_cff,
         tagged_name,
     })
 }

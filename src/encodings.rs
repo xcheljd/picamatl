@@ -530,6 +530,45 @@ pub(crate) const MAC_ROMAN_NAMES: [&str; 256] = [
     "caron",
 ];
 
+/// Adobe `StandardEncoding` (ISO 32000-1 Annex D.2, "StandardEncoding"
+/// column). Consumed by the Type1 path: a font program declaring
+/// `/Encoding StandardEncoding def`, and `seac` accent composition (whose
+/// `bchar`/`achar` operands are StandardEncoding codes by definition).
+/// Empty string = no name at that code (`.notdef`).
+#[rustfmt::skip]
+pub(crate) const STANDARD_NAMES: [&str; 256] = [
+    "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "",
+    "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "",
+    "space", "exclam", "quotedbl", "numbersign", "dollar", "percent",
+    "ampersand", "quoteright", "parenleft", "parenright", "asterisk", "plus",
+    "comma", "hyphen", "period", "slash",
+    "zero", "one", "two", "three", "four", "five", "six", "seven",
+    "eight", "nine", "colon", "semicolon", "less", "equal", "greater",
+    "question",
+    "at", "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M",
+    "N", "O", "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z",
+    "bracketleft", "backslash", "bracketright", "asciicircum", "underscore",
+    "quoteleft", "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l",
+    "m", "n", "o", "p", "q", "r", "s", "t", "u", "v", "w", "x", "y", "z",
+    "braceleft", "bar", "braceright", "asciitilde", "",
+    "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "",
+    "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "",
+    "", "exclamdown", "cent", "sterling", "fraction", "yen", "florin",
+    "section", "currency", "quotesingle", "quotedblleft", "guillemotleft",
+    "guilsinglleft", "guilsinglright", "fi", "fl",
+    "", "endash", "dagger", "daggerdbl", "periodcentered", "", "paragraph",
+    "bullet", "quotesinglbase", "quotedblbase", "quotedblright",
+    "guillemotright", "ellipsis", "perthousand", "", "questiondown",
+    "", "grave", "acute", "circumflex", "tilde", "macron", "breve",
+    "dotaccent", "dieresis", "", "ring", "cedilla", "", "hungarumlaut",
+    "ogonek", "caron",
+    "emdash", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "",
+    "", "AE", "", "ordfeminine", "", "", "", "", "Lslash", "Oslash", "OE",
+    "ordmasculine", "", "", "", "",
+    "", "ae", "", "", "", "dotlessi", "", "", "lslash", "oslash", "oe",
+    "germandbls", "", "", "", "",
+];
+
 pub(crate) const NAME_TO_UNICODE: &[(&str, u32)] = &[
     ("A", 0x0041),
     ("AE", 0x00C6),

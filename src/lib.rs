@@ -59,6 +59,7 @@ mod bitonal;
 mod encodings;
 mod fonts;
 mod truetype;
+mod type1;
 
 use std::collections::HashMap;
 
@@ -165,6 +166,20 @@ pub struct OptimizeOptions {
     /// defaults).
     pub subset_fonts: bool,
 
+    /// Convert embedded Type1 (`/FontFile`) fonts to subsetted Type1C/CFF
+    /// (`/FontFile3`), the same re-encoding Ghostscript applies. Charstrings
+    /// are re-expressed as Type2 with outlines preserved exactly (flex
+    /// becomes the curves it rasterizes as, `seac` composites are inlined,
+    /// stem hints and widths carry over); only the glyphs the document shows
+    /// are retained. The font dictionary's `/Encoding`, `/Widths`, and
+    /// `/ToUnicode` never change (the CFF replicates the font's built-in
+    /// encoding, so every name-lookup path resolves as before) and each font
+    /// is swapped only when the new stream is strictly smaller. Any parse or
+    /// conversion doubt — MM OtherSubrs, non-zero `/PaintType`, encoding
+    /// constructions we cannot replicate — leaves that font untouched.
+    /// Default: `false` (opt-in for at least one release cycle).
+    pub convert_type1: bool,
+
     /// Losslessly recompress bitonal (1-bit) images to CCITT G4: CCITT-stored
     /// sources (G4 `/K -1`, or EOL-framed G3 `/K 0` with `/EndOfLine true`)
     /// and Flate-stored 1-bit images. Pixels are never resampled and
@@ -250,6 +265,7 @@ impl Default for OptimizeOptions {
             pack_object_streams: true,
             downsample_flate_images: true,
             subset_fonts: true,
+            convert_type1: false,
             recompress_bitonal_images: false,
             allow_lossy_reencode: false,
             collapse_gray_images: false,
@@ -311,6 +327,14 @@ impl OptimizeOptions {
     #[must_use]
     pub fn with_subset_fonts(mut self, subset: bool) -> Self {
         self.subset_fonts = subset;
+        self
+    }
+
+    /// Enable/disable Type1 → Type1C (CFF) font conversion
+    /// (off by default). See [`OptimizeOptions::convert_type1`].
+    #[must_use]
+    pub fn with_convert_type1(mut self, convert: bool) -> Self {
+        self.convert_type1 = convert;
         self
     }
 
@@ -3187,8 +3211,8 @@ fn try_optimize(input: &[u8], options: OptimizeOptions) -> Result<Option<Vec<u8>
     // when the option is off or anything at all disqualified the document —
     // see src/fonts.rs for the eligibility posture). Applied further down,
     // after the image replacements.
-    let font_plans = if options.subset_fonts {
-        fonts::plan_font_subsets(&doc)
+    let font_plans = if options.subset_fonts || options.convert_type1 {
+        fonts::plan_font_subsets(&doc, options.subset_fonts, options.convert_type1)
     } else {
         Vec::new()
     };
