@@ -31,11 +31,13 @@ fn defaults_blurb() -> String {
     let d = OptimizeOptions::default();
     format!(
         "Boolean defaults (from OptimizeOptions::default()):\n  \
-         strip-accessibility {}, pack-object-streams {},\n  \
+         strip-accessibility {}, strip-metadata {},\n  \
+         pack-object-streams {},\n  \
          downsample-flate-images {}, subset-fonts {},\n  \
          convert-type1 {}, recompress-bitonal-images {},\n  \
          allow-lossy {}, collapse-gray-images {}",
         on_off(d.strip_accessibility),
+        on_off(d.strip_metadata),
         on_off(d.pack_object_streams),
         on_off(d.downsample_flate_images),
         on_off(d.subset_fonts),
@@ -90,6 +92,14 @@ struct Cli {
     /// Keep the accessibility structure tree
     #[arg(long)]
     no_strip_accessibility: bool,
+
+    /// Strip every /Metadata (XMP) packet; breaks PDF/A and PDF/UA
+    /// identification
+    #[arg(long, overrides_with = "no_strip_metadata")]
+    strip_metadata: bool,
+    /// Keep /Metadata (XMP) packets
+    #[arg(long)]
+    no_strip_metadata: bool,
 
     /// Pack eligible objects into PDF 1.5 object streams
     #[arg(long, overrides_with = "no_pack_object_streams")]
@@ -187,6 +197,11 @@ fn options_from(cli: &Cli) -> OptimizeOptions {
             cli.strip_accessibility,
             cli.no_strip_accessibility,
             d.strip_accessibility,
+        ))
+        .with_strip_metadata(resolve(
+            cli.strip_metadata,
+            cli.no_strip_metadata,
+            d.strip_metadata,
         ))
         .with_pack_object_streams(resolve(
             cli.pack_object_streams,

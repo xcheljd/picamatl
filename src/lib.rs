@@ -138,6 +138,14 @@ pub struct OptimizeOptions {
     /// Default: `false`.
     pub strip_accessibility: bool,
 
+    /// If true, remove every `/Metadata` entry (XMP packets on the catalog,
+    /// pages, and XObjects). Visually lossless — no viewer consults XMP to
+    /// render — but it discards document provenance and breaks PDF/A and
+    /// PDF/UA identification, so it is strictly opt-in. Producers that write a
+    /// full XMP packet per page/XObject can spend a double-digit percentage of
+    /// the file on it (adobe-spec: 860 KB, 12%). Default: `false`.
+    pub strip_metadata: bool,
+
     /// If true, pack eligible non-stream objects into PDF 1.5 `ObjStm` streams
     /// with a binary cross-reference stream (additional structural
     /// compression). Default: `true` (was `false` through 0.3.0). Lossless —
@@ -262,6 +270,7 @@ impl Default for OptimizeOptions {
             jpeg_quality: JPEG_QUALITY,
             dpi_margin: DPI_MARGIN,
             strip_accessibility: false,
+            strip_metadata: false,
             pack_object_streams: true,
             downsample_flate_images: true,
             subset_fonts: true,
@@ -304,6 +313,13 @@ impl OptimizeOptions {
     #[must_use]
     pub fn with_strip_accessibility(mut self, strip: bool) -> Self {
         self.strip_accessibility = strip;
+        self
+    }
+
+    /// Enable/disable stripping every `/Metadata` (XMP) entry.
+    #[must_use]
+    pub fn with_strip_metadata(mut self, strip: bool) -> Self {
+        self.strip_metadata = strip;
         self
     }
 
@@ -3407,6 +3423,21 @@ fn try_optimize(input: &[u8], options: OptimizeOptions) -> Result<Option<Vec<u8>
             catalog.remove(b"StructTreeRoot");
             catalog.remove(b"MarkInfo");
             catalog.remove(b"Lang");
+        }
+    }
+
+    // Optionally drop every XMP packet. Producers that stamp a full packet on
+    // each page and XObject can spend a double-digit percentage of the file on
+    // metadata no viewer reads to render (adobe-spec: 134 packets, 860 KB,
+    // 12% of the optimized output). The reference is what costs bytes; the
+    // orphaned streams themselves go in `prune_objects()` below.
+    if options.strip_metadata {
+        for object in doc.objects.values_mut() {
+            match object {
+                Object::Dictionary(dict) => dict.remove(b"Metadata"),
+                Object::Stream(stream) => stream.dict.remove(b"Metadata"),
+                _ => None,
+            };
         }
     }
 
@@ -6769,6 +6800,53 @@ mod tests {
             catalog.get(b"MarkInfo").is_err(),
             "MarkInfo must be removed"
         );
+    }
+
+    #[test]
+    fn strip_metadata_drops_xmp_packets_and_is_opt_in() {
+        // A catalog-level and a page-level XMP packet, both large enough that
+        // removing them must shrink the file.
+        let pdf = build_pdf(80, 100);
+        let mut doc = Document::load_mem(&pdf).unwrap();
+        let packet = vec![b'x'; 4096];
+        let page_id = doc.get_pages().values().copied().next().unwrap();
+        let meta_a = doc.add_object(Stream::new(
+            dictionary! { "Type" => "Metadata", "Subtype" => "XML" },
+            packet.clone(),
+        ));
+        let meta_b = doc.add_object(Stream::new(
+            dictionary! { "Type" => "Metadata", "Subtype" => "XML" },
+            packet,
+        ));
+        doc.catalog_mut()
+            .unwrap()
+            .set("Metadata", Object::Reference(meta_a));
+        if let Ok(Object::Dictionary(page)) = doc.get_object_mut(page_id) {
+            page.set("Metadata", Object::Reference(meta_b));
+        }
+        let mut reencoded: Vec<u8> = Vec::new();
+        doc.save_to(&mut reencoded).unwrap();
+
+        let kept = optimize_with_options(&reencoded, OptimizeOptions::default());
+        let kept_doc = Document::load_mem(&kept).expect("default output must load");
+        assert!(
+            kept_doc.catalog().unwrap().get(b"Metadata").is_ok(),
+            "default must keep XMP"
+        );
+
+        let opts = OptimizeOptions::default().with_strip_metadata(true);
+        let out = optimize_with_options(&reencoded, opts);
+        let out_doc = Document::load_mem(&out).expect("stripped output must load");
+        assert!(
+            out_doc.catalog().unwrap().get(b"Metadata").is_err(),
+            "catalog /Metadata must be removed"
+        );
+        for object in out_doc.objects.values() {
+            if let Object::Dictionary(d) = object {
+                assert!(d.get(b"Metadata").is_err(), "no /Metadata may survive");
+            }
+        }
+        assert!(out.len() < kept.len(), "stripping must shrink the output");
     }
 
     #[test]

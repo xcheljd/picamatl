@@ -81,6 +81,7 @@ let opts = OptimizeOptions::default()
     .with_target_dpi(110.0)
     .with_jpeg_quality(70)
     .with_strip_accessibility(true)     // opt-in, off by default
+    .with_strip_metadata(true)          // drop XMP packets; opt-in, off by default
     .with_pack_object_streams(false);   // PDF 1.5 ObjStm packing, ON by default
 let optimized = amatl::optimize_with_options(&input_bytes, opts);
 ```
@@ -103,6 +104,13 @@ Amatl's default keeps it; `strip_accessibility` is a deliberate, documented
 opt-in for callers who know their audience (it buys roughly 18 percentage
 points of additional reduction on structure-heavy documents, and degrades the
 file from tagged to untagged).
+
+**Metadata is kept by default.** Some producers stamp a full XMP packet on
+every page and XObject — the PDF 1.7 specification file carries 134 of them,
+860 KB, 12% of its optimized size. `--strip-metadata`
+(library: `.with_strip_metadata(true)`) removes every `/Metadata` entry. It is
+render-identical but discards provenance and breaks PDF/A and PDF/UA
+identification, so it is opt-in.
 
 **Amatl will never lossy-symbol-encode your scans.** Symbol-mode JBIG2 — the
 encoding behind the Xerox scanner scandal, where visually plausible character

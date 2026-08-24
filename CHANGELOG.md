@@ -10,6 +10,24 @@ and this project adheres to
 
 ### Added
 
+- **`strip_metadata` (`--strip-metadata`), opt-in, off by default.** Removes
+  every `/Metadata` (XMP) entry. Producers that stamp a full packet on each
+  page and XObject spend a double-digit share of the file on data no viewer
+  reads to render: adobe-spec carries 134 packets, 860 KB, 12% of its
+  optimized output (6,289,645 with the flag vs 7,166,167 without). Visually
+  lossless, but it discards provenance and breaks PDF/A and PDF/UA
+  identification, hence opt-in.
+
+### Changed
+
+- **Duplicate TrueType subsets now dedup.** After subsetting, several embeds
+  of the same subset of the same font differ only in the six-letter `ABCDEF+`
+  subset tag inside the `name` table and the `head.checkSumAdjustment` it
+  perturbs. Those tags are now masked (and both checksums repaired), so the
+  programs are byte-equal and the existing stream dedup shares one copy. The
+  tag a viewer sees comes from `/BaseFont`, which amatl already rewrites from
+  a content hash. arxiv-attention 1,553,042 → 1,475,800 (−5.0%).
+
 - **Simple-TrueType font subsetting.** `subset_fonts` now also subsets
   nonsymbolic simple TrueType fonts (`/Encoding` WinAnsiEncoding or
   MacRomanEncoding, incl. explicit-base `/Differences`), not just
