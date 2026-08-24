@@ -986,9 +986,12 @@ impl<'a> Interp<'a> {
         let args = self.take(n as usize)?;
         match othersubr as i64 {
             0 => {
-                // Flex end: 17 args (all reconstructible from the collected
-                // rmoveto points, which is what rasterizers use too).
-                if args.len() != 17 || !self.in_flex || self.flex_pts.len() != 7 {
+                // Flex end. The Adobe OtherSubrs[0] takes 17 args; the
+                // reduced private protocol dvips-embedded fonts use takes 3
+                // (flex height, end x, end y). Either way the outline comes
+                // from the collected rmoveto points, which is what
+                // rasterizers use too.
+                if !matches!(args.len(), 3 | 17) || !self.in_flex || self.flex_pts.len() != 7 {
                     return None;
                 }
                 let p = std::mem::take(&mut self.flex_pts);
@@ -1669,4 +1672,96 @@ pub(crate) fn convert_to_cff(
     out.extend_from_slice(&charstrings_index);
     out.extend_from_slice(&private);
     Some(out)
+}
+
+#[cfg(test)]
+mod probe {
+    fn disasm(code: &[u8]) -> String {
+        let mut out = String::new();
+        let mut pos = 0;
+        while pos < code.len() {
+            let b0 = code[pos];
+            pos += 1;
+            let tok = match b0 {
+                32..=246 => format!("{} ", i32::from(b0) - 139),
+                247..=250 => {
+                    let b1 = code[pos];
+                    pos += 1;
+                    format!("{} ", (i32::from(b0) - 247) * 256 + i32::from(b1) + 108)
+                }
+                251..=254 => {
+                    let b1 = code[pos];
+                    pos += 1;
+                    format!("{} ", -(i32::from(b0) - 251) * 256 - i32::from(b1) - 108)
+                }
+                255 => {
+                    let v = i32::from_be_bytes(code[pos..pos + 4].try_into().unwrap());
+                    pos += 4;
+                    format!("{v} ")
+                }
+                12 => {
+                    let b1 = code[pos];
+                    pos += 1;
+                    format!("esc{b1} ")
+                }
+                op => format!("op{op} "),
+            };
+            out.push_str(&tok);
+        }
+        out
+    }
+
+    #[test]
+    #[ignore]
+    fn dump_one() {
+        let data = std::fs::read("target/scratch/t1/fonts/5871.pfa").unwrap();
+        let f = super::parse(&data).unwrap();
+        println!("one: {}", disasm(&f.charstrings[b"one".as_slice()]));
+        for (i, s) in f.subrs.iter().enumerate() {
+            println!("subr{i}: {}", disasm(s));
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn probe_corpus_fonts() {
+        let dir = std::path::Path::new("target/scratch/t1/fonts");
+        let mut entries: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        entries.sort();
+        for path in entries {
+            let data = std::fs::read(&path).unwrap();
+            match super::parse(&data) {
+                None => println!("{}: PARSE FAIL", path.display()),
+                Some(f) => {
+                    let keep: std::collections::BTreeSet<Vec<u8>> =
+                        f.charstrings.keys().cloned().collect();
+                    match super::convert_to_cff(&f, &keep) {
+                        None => {
+                            let bad: Vec<String> = keep
+                                .iter()
+                                .filter(|n| super::interpret_glyph(&f, n, true).is_none())
+                                .map(|n| String::from_utf8_lossy(n).into_owned())
+                                .collect();
+                            println!(
+                                "{}: CONVERT FAIL ({} glyphs) bad={:?}",
+                                path.display(),
+                                keep.len(),
+                                bad
+                            );
+                        }
+                        Some(cff) => println!(
+                            "{}: ok t1={} cff={} glyphs={}",
+                            path.display(),
+                            data.len(),
+                            cff.len(),
+                            keep.len()
+                        ),
+                    }
+                }
+            }
+        }
+    }
 }
