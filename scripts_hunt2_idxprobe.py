@@ -18,7 +18,7 @@ def probe(path, label):
             if "/FlateDecode" not in filt: continue
             cs = xo.get("/ColorSpace")
             if not isinstance(cs, pikepdf.Array) or "/Indexed" not in str(cs[0]): continue
-            hival = int(str(cs[1]))
+            hival = int(str(cs[1])) if not isinstance(cs[1], pikepdf.Array) else -1
             w, h = int(xo["/Width"]), int(xo["/Height"])
             slen = len(xo.read_raw_bytes())
             raw = xo.read_bytes()

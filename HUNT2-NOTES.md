@@ -55,3 +55,103 @@ All opportunities ranked by expected corpus savings:
 Corpus total if #1–#4 all land: ≈ 584 KB (~2.1% of 29.9 MB corpus); fonts alone (#1–#3) ≈ 580 KB.
 
 Confirmed dead ends this round: gray-in-RGB conversion (0 B), adobe indexed repack (81 B), arxiv image reflate (0 B, already optimal), plus prior round's bitonal re-encode / ICC pruning / exact font-program dups.
+
+---
+
+# Implementation pass (same round, output-side measurements)
+
+Everything below measures **amatl's output**, not the input, using
+`scripts/h2_*.py` (bench, byte census, TTF table dump, TTF near-dup diff, CFF
+dup, depth-reduction repack, family-merge headroom, verify harness). Gates for
+every lossless claim: `pdftoppm` sha256 render-identity, pass-2 idempotence,
+`gs -sDEVICE=nullpage`, plus `cargo test --release` / clippy / fmt.
+
+## Where the bytes are in the *default output* (`scripts/h2_census.py`)
+
+| file | biggest buckets (share of output) |
+|---|---|
+| adobe-spec 7.17 MB | content streams 48% · ObjStm 24% · **XMP metadata 12%** · DCT 4% · Type1C 2% |
+| arxiv-attention 1.55 MB | **font programs 24%** · content 18% · Flate images 13% · 2,513 form XObjects 12% |
+| irs-1040gi 4.26 MB | 2 DCT images 37% · content 27% · ObjStm 23% · TrueType 5% · Type1C 3% |
+| nist-ssdf 561 KB | content 44% · **TrueType 32%** · Flate images 13% · ObjStm 9% |
+
+The 12% XMP bucket in adobe-spec is invisible in an input-side image/font
+audit and turned out to be the single largest addressable item in the corpus.
+
+## Shipped
+
+### 1. `name`-table subset-tag masking → duplicate TT subsets dedup (2eca424)
+
+The "arxiv ArialMT ×5" group above does **not** need union subsetting to
+collapse most of the way. After amatl's own subsetting, those programs are
+byte-identical **except** the six-letter `ABCDEF+` tag inside the `name` table
+and `head.checkSumAdjustment` (which the tag perturbs) — glyf/loca/cmap/hmtx
+match exactly (`scripts/h2_ttf_diff.py`). Masking the tags to `AAAAAA` and
+repairing both checksums makes them byte-equal, so the existing stream dedup
+shares one program. The subset tag a viewer reads comes from `/BaseFont`,
+which amatl already rewrites from a content hash.
+
+arxiv-attention 1,553,042 → **1,475,800** (−77,242, −5.0%): 4 of 5 Arial-Bold
+embeds and 3 of 5 ArialMT collapsed. irs −26, nist −53, adobe +1.
+
+### 2. `--strip-metadata` (opt-in, off by default) (64b28fb)
+
+adobe-spec carries **134 XMP packets, 860 KB, 12%** of its optimized output —
+one per page/XObject, none consulted to render. Removing every `/Metadata`
+entry (orphans then pruned): adobe-spec 7,166,167 → **6,289,645**
+(−876,522, −12.2%); nist −1,637; irs −616. Render-identical, but discards
+provenance and breaks PDF/A and PDF/UA identification, hence opt-in beside
+`--strip-accessibility`.
+
+## Recommended, not implemented
+
+- **Same-family union subsetting.** Headroom *remaining after* the tag-masking
+  dedup, Σ−max per family measured on the output
+  (`scripts/h2_family_merge.py`): irs-1040gi **108,621 B (2.5%)**, adobe-spec
+  18,009 (0.25%), arxiv-attention 13,983 (0.9%), nist 0. So the ranking-table
+  #1 (arxiv, est 388 KB input-side) is now ~90% collected by the cheap fix,
+  and the residual lever is #2 (irs). irs's fragments are CFF/Type1C with
+  per-subset encodings, so merging means rewriting show-string codes — the
+  C-M2/M3 work item, not a scout-sized change.
+- **Lossy quality ladder (retry q85/q90 when the q78 MAD guard declines).** Not
+  evaluated: no in-repo corpus image is declined (irs's two DCTs dominate but
+  are already DCT), and the photo-heavy NASA file is outside sandbox-readable
+  paths. Still the most promising lossy lever.
+
+## Dead ends measured in this pass (<1%, dropped per brief)
+
+- **CFF (`/Type1C`) dedup keyed on bytes-minus-Name-INDEX**
+  (`scripts/h2_cff_dup.py`) — the CFF analogue of the shipped TT fix: irs
+  8,259 B (0.19%), adobe 0, arxiv 0; exact CFF dups 0. Does not pay.
+- **Lossless bit-depth reduction on the output** (`scripts/h2_depth.py`, real
+  repack + re-deflate): nist **1,700 B (0.3%)**, adobe 117 B, arxiv/irs 0.
+  (The input-side estimate of 3,797 B above shrinks once amatl's own
+  downsampling has already run.) `/DeviceGray` images on an n-bit ladder:
+  none. Confirms the image-census verdict with post-pipeline numbers.
+- **Form-XObject dedup beyond exact:** arxiv has 2,513 form XObjects (median
+  60 B raw, 180 KB total) and 2,513 **distinct** payloads — no redundancy.
+- **`/PieceInfo`:** absent from the corpus.
+
+## Font-table overhead observed (not acted on)
+
+`scripts/h2_ttf_tables.py` over nist's 10 subsets: glyf 174,688 B, but hinting
+(`prep` 37,538 + `fpgm` 20,197 + `cvt ` 19,586 = **77 KB decoded**) and `name`
+12,926 B ride along. Dropping hinting is a real win on hinting-heavy files but
+changes rasterization at small sizes — not lossless under the pixel-identity
+contract; it would belong behind a lossy flag.
+
+## Final table — input → output (bytes)
+
+| file | input | default | + `--strip-metadata` | + all lossless opt-ins¹ | default + zopfli | `--strip-metadata` + zopfli |
+|---|---|---|---|---|---|---|
+| adobe-spec | 22,491,828 | 7,166,167 | 6,289,645 | 6,289,645 | ZA | MA |
+| arxiv-attention | 2,233,053 | 1,475,800 | 1,475,800 | 1,268,302 | ZR | MR |
+| irs-1040gi | 4,434,643 | 4,262,520 | 4,261,904 | 4,261,904 | ZI | MI |
+| nist-ssdf | 739,891 | 561,239 | 559,602 | 559,602 | ZN | MN |
+| dummy | 13,264 | 12,459 | 12,459 | 12,459 | ZD | MD |
+
+¹ `--strip-metadata --convert-type1 --recompress-bitonal-images`.
+
+New flag this round: `--strip-metadata` / `--no-strip-metadata` (library
+`OptimizeOptions::with_strip_metadata`). No default behaviour changed except
+the tag masking, which is unconditional and lossless.
