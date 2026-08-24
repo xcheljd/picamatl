@@ -903,13 +903,13 @@ impl<'a> Interp<'a> {
                         1 => {
                             // vstem3: x0 dx0 x1 dx1 x2 dx2.
                             let a = self.take(6)?;
-                            for pair in a.chunks_exact(2) {
+                            for pair in a.as_chunks::<2>().0 {
                                 self.add_stem(false, pair[0] + self.sb.0, pair[1])?;
                             }
                         }
                         2 => {
                             let a = self.take(6)?;
-                            for pair in a.chunks_exact(2) {
+                            for pair in a.as_chunks::<2>().0 {
                                 self.add_stem(true, pair[0] + self.sb.1, pair[1])?;
                             }
                         }
@@ -1402,7 +1402,7 @@ fn dict_real(out: &mut Vec<u8>, v: f64) -> Option<()> {
         nibbles.push(0xf);
     }
     out.push(30);
-    for pair in nibbles.chunks_exact(2) {
+    for pair in nibbles.as_chunks::<2>().0 {
         out.push((pair[0] << 4) | pair[1]);
     }
     Some(())
