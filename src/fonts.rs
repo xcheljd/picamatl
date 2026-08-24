@@ -1172,6 +1172,9 @@ fn plan_one_font(
     let gid_list: Vec<u16> = gids.iter().copied().collect();
     let remapper = GlyphRemapper::new_from_glyphs_sorted(&gid_list);
     let subset = subsetter::subset(&font_bytes, 0, &remapper).ok()?;
+    // Mask the producer's `name`-table subset tags so two identical subsets
+    // of the same font become byte-equal and the stream dedup collapses them.
+    let subset = truetype::mask_subset_tags(&subset).unwrap_or(subset);
     // Cheap structural sanity on the output before trusting it: it must have
     // at least as many glyphs as we remapped (composite closure adds more).
     if num_glyphs(&subset)? < remapper.num_gids() {
@@ -1427,6 +1430,9 @@ fn plan_one_simple_font(
         });
     }
     let final_font = truetype::insert_cmap(&subset, &new_subtables)?;
+    // See the CID path: masking the `name`-table subset tags makes identical
+    // subsets byte-equal so the stream dedup can share one program.
+    let final_font = truetype::mask_subset_tags(&final_font).unwrap_or(final_font);
 
     // Round-trip check: what a reader parses from the rebuilt font must be
     // exactly the mappings we intended to write.

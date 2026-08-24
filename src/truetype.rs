@@ -285,6 +285,68 @@ fn table_checksum(data: &[u8]) -> u32 {
     sum
 }
 
+/// Neutralise the six-letter `ABCDEF+` subset tags the producer left inside
+/// the `name` table's string storage, replacing each with `AAAAAA`.
+///
+/// Two embeds of the same subset of the same font differ only in those tag
+/// letters and in `head.checkSumAdjustment` (which the tags perturb), so
+/// masking them makes byte-equal subsets *actually* byte-equal and the
+/// document-wide stream dedup collapses them. Names in the `name` table play
+/// no part in rendering an embedded PDF font — the viewer takes the subset
+/// tag from `/BaseFont`, which amatl rewrites from a content hash anyway, so
+/// the mask is no more of a mismatch than what already ships.
+///
+/// Both 1-byte and UTF-16BE name strings are handled. `None` on any
+/// structural doubt (caller then keeps the font as-is, fail-safe).
+pub(crate) fn mask_subset_tags(font: &[u8]) -> Option<Vec<u8>> {
+    let (name_off, name_len) = find_table(font, b"name")?;
+    let (head_off, head_len) = find_table(font, b"head")?;
+    if head_len < 12 {
+        return None;
+    }
+    let mut out = font.to_vec();
+    let name = &mut out[name_off..name_off + name_len];
+    let mut i = 0usize;
+    while i < name.len() {
+        if name[i] == b'+' && i >= 6 && name[i - 6..i].iter().all(u8::is_ascii_uppercase) {
+            name[i - 6..i].fill(b'A');
+        } else if name[i] == b'+' && i >= 13 && name[i - 1] == 0 {
+            // UTF-16BE: 00 X 00 X ... 00 '+'
+            let tag = &name[i - 13..i - 1];
+            if tag
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .all(|p| p[0] == 0 && p[1].is_ascii_uppercase())
+            {
+                for pair in name[i - 13..i - 1].as_chunks_mut::<2>().0 {
+                    pair[1] = b'A';
+                }
+            }
+        }
+        i += 1;
+    }
+    if out[name_off..name_off + name_len] == font[name_off..name_off + name_len] {
+        return Some(out); // nothing masked; checksums still valid
+    }
+
+    // Repair the `name` directory checksum, then `head.checkSumAdjustment`.
+    let count = usize::from(be16(&out, 4)?);
+    for i in 0..count {
+        let rec = 12 + i * 16;
+        if out.get(rec..rec + 4)? == b"name" {
+            // table_checksum zero-pads the short final chunk, matching the
+            // font's own 4-byte table padding.
+            let sum = table_checksum(&out[name_off..name_off + name_len]);
+            out[rec + 4..rec + 8].copy_from_slice(&sum.to_be_bytes());
+        }
+    }
+    out[head_off + 8..head_off + 12].fill(0);
+    let adjustment = 0xB1B0_AFBAu32.wrapping_sub(table_checksum(&out));
+    out[head_off + 8..head_off + 12].copy_from_slice(&adjustment.to_be_bytes());
+    Some(out)
+}
+
 /// Splice `subtables` into `font` as its `cmap`, rebuilding the table
 /// directory, per-table checksums, and `head.checkSumAdjustment`. Replaces
 /// any existing `cmap`. `None` on any structural doubt about the input.
@@ -364,6 +426,62 @@ mod tests {
         let map = sample_map(&[(0x20, 5), (0x7E, 2), (0xCA, 7)]);
         let body = build_format6(&map);
         assert_eq!(parse_subtable(&body).unwrap(), map);
+    }
+
+    /// Minimal two-table sfnt (`head`, `name`) whose `name` body is `body`.
+    fn tiny_font(body: &[u8]) -> Vec<u8> {
+        let head = vec![0u8; 54];
+        let tables: [(&[u8; 4], &[u8]); 2] = [(b"head", &head), (b"name", body)];
+        let mut out = vec![0x00, 0x01, 0x00, 0x00, 0x00, 0x02, 0, 32, 0, 1, 0, 0];
+        let mut offset = 12 + 32;
+        for (tag, data) in tables {
+            out.extend_from_slice(tag);
+            out.extend_from_slice(&table_checksum(data).to_be_bytes());
+            out.extend_from_slice(&(offset as u32).to_be_bytes());
+            out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+            offset += data.len().next_multiple_of(4);
+        }
+        for (_, data) in tables {
+            out.extend_from_slice(data);
+            out.resize(out.len().next_multiple_of(4), 0);
+        }
+        out
+    }
+
+    #[test]
+    fn masking_makes_same_subset_under_different_tags_byte_equal() {
+        let a = tiny_font(b"SKOJEB+ArialMT\x00\x00");
+        let b = tiny_font(b"RZEDQD+ArialMT\x00\x00");
+        assert_ne!(a, b);
+        let (ma, mb) = (mask_subset_tags(&a).unwrap(), mask_subset_tags(&b).unwrap());
+        assert_eq!(ma, mb);
+        assert!(contains_window(&ma, b"AAAAAA+ArialMT"));
+        // Whole-font checksum invariant holds after the repair.
+        let head = find_table(&ma, b"head").unwrap().0;
+        let mut zeroed = ma.clone();
+        let adj = u32::from_be_bytes(ma[head + 8..head + 12].try_into().unwrap());
+        zeroed[head + 8..head + 12].fill(0);
+        assert_eq!(adj, 0xB1B0_AFBAu32.wrapping_sub(table_checksum(&zeroed)));
+    }
+
+    #[test]
+    fn masking_handles_utf16be_names_and_leaves_untagged_fonts_alone() {
+        let mut utf16 = Vec::new();
+        for ch in "SKOJEB+Arial".chars() {
+            utf16.extend_from_slice(&[0, ch as u8]);
+        }
+        let masked = mask_subset_tags(&tiny_font(&utf16)).unwrap();
+        assert!(contains_window(
+            &masked,
+            b"\x00A\x00A\x00A\x00A\x00A\x00A\x00+"
+        ));
+
+        let plain = tiny_font(b"ArialMT\x00");
+        assert_eq!(mask_subset_tags(&plain).unwrap(), plain);
+    }
+
+    fn contains_window(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.windows(needle.len()).any(|w| w == needle)
     }
 
     #[test]
