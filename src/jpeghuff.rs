@@ -1,4 +1,4 @@
-//! Lossless Huffman-table re-optimization for baseline JPEG streams.
+//! Lossless Huffman-table re-optimization for JPEG streams.
 //!
 //! Producers routinely emit the ITU-T T.81 Annex K example Huffman tables
 //! instead of tables fitted to the image's own symbol statistics. Rebuilding
@@ -9,20 +9,28 @@
 //! bit-identical pixels by construction.
 //!
 //! The pass is syntactic, not photometric. A scan is decoded into its token
-//! sequence — for every block, the DC magnitude symbol plus its additional
-//! bits, then the run/size AC symbols plus theirs — the per-table symbol
-//! frequencies are counted, optimal (length-limited, canonical) tables are
-//! generated with libjpeg's `jpeg_gen_optimal_table` algorithm, and the same
-//! token sequence is re-emitted against them. Nothing else in the file moves:
-//! `APPn`, `COM`, `DQT`, `SOF`, `DRI` and the `SOS` headers are copied
-//! verbatim, restart markers land at the same MCU boundaries, and only the
-//! `DHT` segments are replaced.
+//! sequence — Huffman symbols with their additional bits, plus the raw
+//! successive-approximation bits progressive refinement passes emit outside
+//! any table — the per-table symbol frequencies are counted, optimal
+//! (length-limited, canonical) tables are generated with libjpeg's
+//! `jpeg_gen_optimal_table` algorithm, and the same token sequence is
+//! re-emitted against them. Nothing else in the file moves: `APPn`, `COM`,
+//! `DQT`, `SOF`, `DRI` and the `SOS` headers are copied verbatim, restart
+//! markers land at the same MCU boundaries, and only the `DHT` segments are
+//! replaced.
 //!
-//! Scope: baseline and extended sequential Huffman frames (`SOF0`/`SOF1`) at
-//! 8-bit precision. Progressive (`SOF2`) carries a per-coefficient refinement
-//! state this token model does not reproduce, and arithmetic-coded or
-//! hierarchical frames are a different codec; all of them decline, leaving
-//! the stream byte-identical.
+//! Scope: baseline and extended sequential (`SOF0`/`SOF1`) and progressive
+//! (`SOF2`) Huffman frames at 8-bit precision. Arithmetic-coded (`SOF9`-`SOF11`),
+//! lossless (`SOF3`/`SOF7`) and hierarchical (`SOF5`/`SOF6`, `DHP`) frames are a
+//! different codec and decline, leaving the stream byte-identical.
+//!
+//! Progressive costs one piece of state the sequential path does not need. An
+//! AC refinement scan's bit layout depends on which coefficients earlier scans
+//! already made nonzero — that decides whether the next bit is a correction
+//! bit — so the frame threads a nonzero mask, one `u64` per block, between its
+//! scans (see [`Nonzero`]). Nothing else about the coefficients is tracked or
+//! reconstructed: correction bits and refinement sign bits ride through as
+//! [`Token::Raw`], unexamined and re-emitted at the same bit positions.
 //!
 //! Fail-safe contract: [`optimize`] returns `None` — meaning "ship the
 //! original bytes" — on *any* parse surprise, on any structure outside the
@@ -30,16 +38,45 @@
 //! rebuilt stream does not decode back to exactly the token sequence that was
 //! read out of the input. That last check is a full round trip: it proves the
 //! output's entropy-coded data carries the same symbols and the same
-//! additional bits, i.e. the same coefficients, as the input.
+//! additional bits, i.e. the same coefficients, as the input. The test module
+//! adds an independent reference decoder that reconstructs full coefficient
+//! arrays and asserts they are unchanged across the rebuild.
 
-/// One entropy-coded token: a Huffman symbol plus the additional bits that
-/// follow it. `table` is `class << 4 | id` (class 0 = DC, 1 = AC).
+/// One entropy-coded token.
+///
+/// [`Token::Sym`] is a Huffman symbol plus the additional bits that follow it;
+/// `table` is `class << 4 | id` (class 0 = DC, 1 = AC). [`Token::Raw`] is a
+/// group of bits carrying no Huffman symbol at all: progressive
+/// successive-approximation scans emit DC refinement bits and AC correction
+/// bits directly into the entropy stream, outside any table. Raw bits are
+/// copied through untouched, so they contribute nothing to the symbol
+/// statistics and re-emit at exactly the same bit positions.
 #[derive(Clone, Copy, PartialEq, Eq)]
-struct Token {
-    table: u8,
-    sym: u8,
-    bits: u16,
-    nbits: u8,
+enum Token {
+    Sym {
+        table: u8,
+        sym: u8,
+        bits: u16,
+        nbits: u8,
+    },
+    Raw {
+        bits: u32,
+        nbits: u8,
+    },
+}
+
+/// Append one raw bit, coalescing into the trailing [`Token::Raw`] group while
+/// it still has room. Refinement scans emit long runs of these; packing them
+/// keeps the token vector proportional to bytes rather than bits.
+fn push_raw_bit(run: &mut Vec<Token>, bit: u32) {
+    if let Some(Token::Raw { bits, nbits }) = run.last_mut() {
+        if *nbits < 32 {
+            *bits = (*bits << 1) | bit;
+            *nbits += 1;
+            return;
+        }
+    }
+    run.push(Token::Raw { bits: bit, nbits: 1 });
 }
 
 /// A frame component as declared in `SOF`.
@@ -54,6 +91,11 @@ struct Frame {
     comps: Vec<Component>,
     /// Component index by component id, for `SOS` lookup.
     ids: Vec<u8>,
+    /// Total blocks in each component's own grid — the grid every
+    /// non-interleaved scan walks, so it indexes the progressive coefficient
+    /// state consistently across a frame's scans.
+    blocks: Vec<usize>,
+    progressive: bool,
 }
 
 /// A decoded scan: its `SOS` payload verbatim and the tokens of each
@@ -358,11 +400,17 @@ fn slot_of(table: u8) -> usize {
     usize::from((table >> 4) * 4 + (table & 0xF))
 }
 
-/// Blocks-per-MCU layout and MCU count for one scan.
-struct McuPlan {
-    /// For each scan component: (blocks per MCU, dc table, ac table).
-    comps: Vec<(usize, u8, u8)>,
+/// Blocks-per-MCU layout, MCU count and spectral parameters for one scan.
+struct ScanPlan {
+    /// For each scan component: (frame component index, blocks per MCU,
+    /// dc table, ac table).
+    comps: Vec<(usize, usize, u8, u8)>,
     mcus: usize,
+    /// Spectral selection and successive approximation from the `SOS` header.
+    /// Sequential scans are always `0..=63` at `Ah = Al = 0`.
+    ss: u8,
+    se: u8,
+    ah: u8,
 }
 
 fn ceil_div(a: usize, b: usize) -> Option<usize> {
@@ -373,7 +421,7 @@ fn ceil_div(a: usize, b: usize) -> Option<usize> {
 }
 
 /// Work out the MCU geometry a scan walks, from the frame and `SOS` header.
-fn plan_scan(frame: &Frame, sos: &[u8]) -> Option<McuPlan> {
+fn plan_scan(frame: &Frame, sos: &[u8]) -> Option<ScanPlan> {
     // SOS payload (after the 2 length bytes): Ns, (Cs Td|Ta)*Ns, Ss, Se, Ah|Al.
     let ns = usize::from(*sos.get(2)?);
     if ns == 0 || ns > 4 || sos.len() != 2 + 1 + ns * 2 + 3 {
@@ -381,8 +429,25 @@ fn plan_scan(frame: &Frame, sos: &[u8]) -> Option<McuPlan> {
     }
     let (ss, se) = (*sos.get(2 + 1 + ns * 2)?, *sos.get(2 + 2 + ns * 2)?);
     let ahal = *sos.get(2 + 3 + ns * 2)?;
-    // Sequential scans are always the full 0..=63 spectrum at zero shift.
-    if ss != 0 || se != 63 || ahal != 0 {
+    let (ah, al) = (ahal >> 4, ahal & 0xF);
+
+    if frame.progressive {
+        // T.81 G.1.1.1.1: a DC scan is Ss = Se = 0 and may interleave; an AC
+        // scan is a single component over a band of 1..=63. Al bounds the
+        // point transform to a shift the 16-bit coefficient range can hold,
+        // and Ah is either 0 (first pass) or exactly Al + 1 (refinement).
+        if al > 13 || (ah != 0 && ah != al + 1) {
+            return None;
+        }
+        if ss == 0 {
+            if se != 0 {
+                return None;
+            }
+        } else if ns != 1 || se < ss || se > 63 {
+            return None;
+        }
+    } else if ss != 0 || se != 63 || ahal != 0 {
+        // Sequential scans are always the full 0..=63 spectrum at zero shift.
         return None;
     }
 
@@ -399,6 +464,9 @@ fn plan_scan(frame: &Frame, sos: &[u8]) -> Option<McuPlan> {
         let cs = *sos.get(3 + i * 2)?;
         let t = *sos.get(4 + i * 2)?;
         let idx = frame.ids.iter().position(|&id| id == cs)?;
+        if comps.iter().any(|c: &(usize, usize, u8, u8)| c.0 == idx) {
+            return None; // the same component twice in one scan
+        }
         let (td, ta) = (t >> 4, t & 0xF);
         if td > 3 || ta > 3 {
             return None;
@@ -407,61 +475,242 @@ fn plan_scan(frame: &Frame, sos: &[u8]) -> Option<McuPlan> {
         comps.push((idx, usize::from(c.h) * usize::from(c.v), td, ta));
     }
 
-    if ns == 1 {
+    let mcus = if ns == 1 {
         // Non-interleaved: one block per MCU, over the component's own grid.
-        let idx = comps[0].0;
-        let c = frame.comps.get(idx)?;
-        let bw = ceil_div(ceil_div(x * usize::from(c.h), hmax)?, 8)?;
-        let bh = ceil_div(ceil_div(y * usize::from(c.v), vmax)?, 8)?;
-        Some(McuPlan {
-            comps: vec![(1, comps[0].2, comps[0].3)],
-            mcus: bw.checked_mul(bh)?,
-        })
+        comps[0].1 = 1;
+        *frame.blocks.get(comps[0].0)?
     } else {
         let mx = ceil_div(x, 8 * hmax)?;
         let my = ceil_div(y, 8 * vmax)?;
-        Some(McuPlan {
-            comps: comps.iter().map(|c| (c.1, c.2, c.3)).collect(),
-            mcus: mx.checked_mul(my)?,
-        })
-    }
+        mx.checked_mul(my)?
+    };
+    Some(ScanPlan {
+        comps,
+        mcus,
+        ss,
+        se,
+        ah,
+    })
 }
 
-/// Decode one sequential scan's entropy-coded data into tokens, grouped by
-/// restart interval. Returns the tokens and the offset of the byte just past
-/// the scan's entropy data.
+/// Per-coefficient state a progressive frame carries between its scans: one
+/// bit per coefficient of every block, set once that coefficient has become
+/// nonzero. AC refinement scans need exactly this and nothing more — whether
+/// a coefficient is already nonzero decides whether the next bit in the
+/// stream is a correction bit for it — so a `u64` mask per block is the whole
+/// state, at one eighth of a byte per pixel.
+type Nonzero = Vec<Vec<u64>>;
+
+/// One block's worth of an AC first pass (`Ah == 0`), following T.81 G.1.2.2.
+fn decode_ac_first(
+    reader: &mut BitReader,
+    run: &mut Vec<Token>,
+    ac: &DecodeTable,
+    ta: u8,
+    nz: &mut u64,
+    plan: &ScanPlan,
+    eobrun: &mut u32,
+) -> Option<()> {
+    if *eobrun > 0 {
+        *eobrun -= 1;
+        return Some(());
+    }
+    let mut k = usize::from(plan.ss);
+    let se = usize::from(plan.se);
+    while k <= se {
+        let rs = reader.decode(ac)?;
+        let (r, sz) = (rs >> 4, rs & 0xF);
+        if sz != 0 {
+            let extra = reader.bits(sz)?;
+            run.push(Token::Sym {
+                table: 0x10 | ta,
+                sym: rs,
+                bits: extra,
+                nbits: sz,
+            });
+            k += usize::from(r);
+            if k > se {
+                return None;
+            }
+            *nz |= 1u64 << k;
+            k += 1;
+        } else if r != 15 {
+            // EOB run: 2^r blocks, plus r additional bits, this one included.
+            let extra = reader.bits(r)?;
+            run.push(Token::Sym {
+                table: 0x10 | ta,
+                sym: rs,
+                bits: extra,
+                nbits: r,
+            });
+            *eobrun = (1u32 << r) + u32::from(extra) - 1;
+            return Some(());
+        } else {
+            // ZRL: sixteen zero coefficients, no additional bits.
+            run.push(Token::Sym {
+                table: 0x10 | ta,
+                sym: rs,
+                bits: 0,
+                nbits: 0,
+            });
+            k += 16;
+        }
+    }
+    Some(())
+}
+
+/// One block's worth of an AC refinement pass (`Ah > 0`), following T.81
+/// G.1.2.3. Coefficients already nonzero take a correction bit; newly coded
+/// ones take a sign bit. Only the nonzero mask is tracked — the correction
+/// bits themselves are copied through as raw bits.
+fn decode_ac_refine(
+    reader: &mut BitReader,
+    run: &mut Vec<Token>,
+    ac: &DecodeTable,
+    ta: u8,
+    nz: &mut u64,
+    plan: &ScanPlan,
+    eobrun: &mut u32,
+) -> Option<()> {
+    let se = usize::from(plan.se);
+    let mut k = usize::from(plan.ss);
+    if *eobrun == 0 {
+        while k <= se {
+            let rs = reader.decode(ac)?;
+            let (mut r, sz) = (i32::from(rs >> 4), rs & 0xF);
+            let mut newly_nonzero = false;
+            if sz != 0 {
+                // Only magnitude 1 can appear: refinement adds one bit plane,
+                // so a coefficient can only ever cross into +-1 << Al.
+                if sz != 1 {
+                    return None;
+                }
+                run.push(Token::Sym {
+                    table: 0x10 | ta,
+                    sym: rs,
+                    bits: 0,
+                    nbits: 0,
+                });
+                push_raw_bit(run, reader.bit()?); // sign of the new coefficient
+                newly_nonzero = true;
+            } else if r != 15 {
+                let extra = reader.bits(u8::try_from(r).ok()?)?;
+                run.push(Token::Sym {
+                    table: 0x10 | ta,
+                    sym: rs,
+                    bits: extra,
+                    nbits: u8::try_from(r).ok()?,
+                });
+                *eobrun = (1u32 << r) + u32::from(extra);
+                break;
+            } else {
+                run.push(Token::Sym {
+                    table: 0x10 | ta,
+                    sym: rs,
+                    bits: 0,
+                    nbits: 0,
+                });
+            }
+            // Walk forward over `r` history-zero coefficients, taking a
+            // correction bit for each already-nonzero one on the way.
+            while k <= se {
+                if *nz & (1u64 << k) != 0 {
+                    push_raw_bit(run, reader.bit()?);
+                } else {
+                    r -= 1;
+                    if r < 0 {
+                        break;
+                    }
+                }
+                k += 1;
+            }
+            if newly_nonzero {
+                if k > se {
+                    return None; // no room left for the coefficient just coded
+                }
+                *nz |= 1u64 << k;
+            }
+            k += 1;
+        }
+    }
+    if *eobrun > 0 {
+        // Inside an EOB run every remaining nonzero coefficient still takes a
+        // correction bit; only the run/size symbols are suppressed.
+        while k <= se {
+            if *nz & (1u64 << k) != 0 {
+                push_raw_bit(run, reader.bit()?);
+            }
+            k += 1;
+        }
+        *eobrun -= 1;
+    }
+    Some(())
+}
+
+/// Decode one scan's entropy-coded data into tokens, grouped by restart
+/// interval. Returns the tokens and the offset of the byte just past the
+/// scan's entropy data. `nonzero` carries progressive coefficient state
+/// across the frame's scans and is unused for sequential frames.
 fn decode_scan(
     data: &[u8],
     start: usize,
-    plan: &McuPlan,
+    plan: &ScanPlan,
     dri: usize,
     tables: &[Option<DecodeTable>; 8],
+    progressive: bool,
+    nonzero: &mut Nonzero,
 ) -> Option<(Vec<Vec<Token>>, usize)> {
     let mut reader = BitReader::new(data, start);
     let mut runs: Vec<Vec<Token>> = Vec::new();
     let mut run: Vec<Token> = Vec::new();
     let mut restarts = 0usize;
+    let mut eobrun = 0u32;
+    let ac_band = progressive && plan.ss != 0;
 
     for mcu in 0..plan.mcus {
         if dri > 0 && mcu > 0 && mcu % dri == 0 {
             runs.push(std::mem::take(&mut run));
             reader.restart(u8::try_from(restarts & 7).ok()?)?;
             restarts += 1;
+            // T.81 G.1.2.2: EOB runs never cross a restart boundary.
+            eobrun = 0;
         }
-        for &(blocks, td, ta) in &plan.comps {
+        if ac_band {
+            // AC scans are single-component and non-interleaved, so the MCU
+            // index is the block index in that component's own grid.
+            let &(idx, _, _, ta) = plan.comps.first()?;
+            let ac = tables[slot_of(0x10 | ta)].as_ref()?;
+            let mut nz = *nonzero.get(idx)?.get(mcu)?;
+            if plan.ah == 0 {
+                decode_ac_first(&mut reader, &mut run, ac, ta, &mut nz, plan, &mut eobrun)?;
+            } else {
+                decode_ac_refine(&mut reader, &mut run, ac, ta, &mut nz, plan, &mut eobrun)?;
+            }
+            *nonzero.get_mut(idx)?.get_mut(mcu)? = nz;
+            continue;
+        }
+        for &(_, blocks, td, ta) in &plan.comps {
             for _ in 0..blocks {
+                if progressive && plan.ah != 0 {
+                    // DC refinement: one raw bit per block, no Huffman at all.
+                    push_raw_bit(&mut run, reader.bit()?);
+                    continue;
+                }
                 let dc = tables[slot_of(td)].as_ref()?;
                 let sym = reader.decode(dc)?;
                 if sym > 15 {
                     return None;
                 }
                 let extra = reader.bits(sym)?;
-                run.push(Token {
+                run.push(Token::Sym {
                     table: td,
                     sym,
                     bits: extra,
                     nbits: sym,
                 });
+                if progressive {
+                    continue; // a progressive DC scan stops at the DC term
+                }
 
                 let ac = tables[slot_of(0x10 | ta)].as_ref()?;
                 let mut k = 1usize;
@@ -469,7 +718,7 @@ fn decode_scan(
                     let rs = reader.decode(ac)?;
                     let (r, s) = (rs >> 4, rs & 0xF);
                     let extra = reader.bits(s)?;
-                    run.push(Token {
+                    run.push(Token::Sym {
                         table: 0x10 | ta,
                         sym: rs,
                         bits: extra,
@@ -497,39 +746,32 @@ fn decode_scan(
 }
 
 /// Re-encode a decoded scan against freshly generated tables. Returns the
-/// `DHT` segment bytes and the entropy-coded data.
-fn encode_scan(runs: &[Vec<Token>]) -> Option<(Vec<u8>, Vec<u8>)> {
+/// tables the scan needs (by `class * 4 + id` slot) and the entropy-coded
+/// data; the caller assembles the `DHT` segment.
+fn encode_scan(
+    runs: &[Vec<Token>],
+    gen: fn(&[u64; 256]) -> Option<EncodeTable>,
+) -> Option<(Vec<Option<EncodeTable>>, Vec<u8>)> {
     let mut freqs: [[u64; 256]; 8] = [[0; 256]; 8];
     let mut used = [false; 8];
     for run in runs {
         for t in run {
-            let slot = slot_of(t.table);
-            freqs[slot][usize::from(t.sym)] += 1;
+            let Token::Sym { table, sym, .. } = t else {
+                continue; // raw refinement bits carry no symbol
+            };
+            let slot = slot_of(*table);
+            freqs[slot][usize::from(*sym)] += 1;
             used[slot] = true;
         }
     }
     let mut tables: Vec<Option<EncodeTable>> = Vec::with_capacity(8);
     for (slot, &is_used) in used.iter().enumerate() {
         tables.push(if is_used {
-            Some(gen_optimal_table(&freqs[slot])?)
+            Some(gen(&freqs[slot])?)
         } else {
             None
         });
     }
-
-    // DHT segment carrying every table this scan uses.
-    let mut payload: Vec<u8> = Vec::new();
-    for (slot, table) in tables.iter().enumerate() {
-        let Some(t) = table else { continue };
-        let class = u8::try_from(slot / 4).ok()?;
-        let id = u8::try_from(slot % 4).ok()?;
-        payload.push((class << 4) | id);
-        payload.extend_from_slice(&t.counts);
-        payload.extend_from_slice(&t.values);
-    }
-    let mut dht = vec![0xFF, 0xC4];
-    dht.extend_from_slice(&u16::try_from(payload.len() + 2).ok()?.to_be_bytes());
-    dht.extend_from_slice(&payload);
 
     let mut w = BitWriter::default();
     let mut entropy: Vec<u8> = Vec::new();
@@ -542,20 +784,66 @@ fn encode_scan(runs: &[Vec<Token>]) -> Option<(Vec<u8>, Vec<u8>)> {
         w.buf = 0;
         w.cnt = 0;
         for t in run {
-            let table = tables.get(slot_of(t.table))?.as_ref()?;
-            let len = table.len[usize::from(t.sym)];
-            if len == 0 {
-                return None;
-            }
-            w.put(table.code[usize::from(t.sym)], len);
-            if t.nbits > 0 {
-                w.put(u32::from(t.bits), t.nbits);
+            match *t {
+                Token::Sym {
+                    table,
+                    sym,
+                    bits,
+                    nbits,
+                } => {
+                    let table = tables.get(slot_of(table))?.as_ref()?;
+                    let len = table.len[usize::from(sym)];
+                    if len == 0 {
+                        return None;
+                    }
+                    w.put(table.code[usize::from(sym)], len);
+                    if nbits > 0 {
+                        w.put(u32::from(bits), nbits);
+                    }
+                }
+                Token::Raw { bits, nbits } => w.put(bits, nbits),
             }
         }
         w.flush();
         entropy.extend_from_slice(&w.out);
     }
-    Some((dht, entropy))
+    Some((tables, entropy))
+}
+
+/// The `BITS`/`HUFFVAL` pair a `DHT` entry carries, as currently in effect
+/// for one table slot.
+type TableState = Option<(Box<[u8; 16]>, Vec<u8>)>;
+
+/// Assemble the `DHT` segment a scan needs, given the tables already in
+/// effect. `in_effect` is updated to what the decoder will hold after this
+/// segment. Returns an empty vector when nothing has to be (re)defined — a
+/// progressive DC refinement scan codes no symbols at all.
+fn dht_segment(
+    tables: &[Option<EncodeTable>],
+    in_effect: &mut [TableState; 8],
+    dedupe: bool,
+) -> Option<Vec<u8>> {
+    let mut payload: Vec<u8> = Vec::new();
+    for (slot, table) in tables.iter().enumerate() {
+        let Some(t) = table else { continue };
+        let fresh = (Box::new(t.counts), t.values.clone());
+        if dedupe && in_effect.get(slot)?.as_ref() == Some(&fresh) {
+            continue;
+        }
+        let class = u8::try_from(slot / 4).ok()?;
+        let id = u8::try_from(slot % 4).ok()?;
+        payload.push((class << 4) | id);
+        payload.extend_from_slice(&t.counts);
+        payload.extend_from_slice(&t.values);
+        *in_effect.get_mut(slot)? = Some(fresh);
+    }
+    if payload.is_empty() {
+        return Some(Vec::new());
+    }
+    let mut dht = vec![0xFF, 0xC4];
+    dht.extend_from_slice(&u16::try_from(payload.len() + 2).ok()?.to_be_bytes());
+    dht.extend_from_slice(&payload);
+    Some(dht)
 }
 
 /// Parse a `DHT` segment payload into decode tables, slotted by
@@ -590,6 +878,7 @@ struct Parsed {
     /// Index into `prefix` after which each scan is written.
     scan_at: Vec<usize>,
     trailer: Vec<u8>,
+    progressive: bool,
 }
 
 fn parse(data: &[u8]) -> Option<Parsed> {
@@ -601,6 +890,7 @@ fn parse(data: &[u8]) -> Option<Parsed> {
     let mut scan_at: Vec<usize> = Vec::new();
     let mut tables: [Option<DecodeTable>; 8] = Default::default();
     let mut frame: Option<Frame> = None;
+    let mut nonzero: Nonzero = Vec::new();
     let mut dri = 0usize;
     let mut i = 2usize;
 
@@ -624,10 +914,11 @@ fn parse(data: &[u8]) -> Option<Parsed> {
                     scans,
                     scan_at,
                     trailer: data.get(seg..)?.to_vec(),
+                    progressive: frame.is_some_and(|f| f.progressive),
                 });
             }
             0x01 | 0xD0..=0xD7 => return None, // stray marker outside a scan
-            0xC0 | 0xC1 => {
+            0xC0..=0xC2 => {
                 let len = usize::from(u16::from_be_bytes([*data.get(seg)?, *data.get(seg + 1)?]));
                 let payload = data.get(seg + 2..seg + len)?;
                 if frame.is_some() || *payload.first()? != 8 {
@@ -651,15 +942,43 @@ fn parse(data: &[u8]) -> Option<Parsed> {
                     ids.push(id);
                     comps.push(Component { h, v });
                 }
-                frame = Some(Frame { x, y, comps, ids });
+                // Per-component block grids, and the coefficient state a
+                // progressive frame's AC scans thread through.
+                let hmax = usize::from(comps.iter().map(|c| c.h).max()?);
+                let vmax = usize::from(comps.iter().map(|c| c.v).max()?);
+                if x == 0 || y == 0 {
+                    return None;
+                }
+                let mut blocks = Vec::with_capacity(nf);
+                for c in &comps {
+                    let bw = ceil_div(
+                        ceil_div(usize::from(x) * usize::from(c.h), hmax)?,
+                        8,
+                    )?;
+                    let bh = ceil_div(
+                        ceil_div(usize::from(y) * usize::from(c.v), vmax)?,
+                        8,
+                    )?;
+                    blocks.push(bw.checked_mul(bh)?);
+                }
+                let progressive = m == 0xC2;
+                if progressive {
+                    nonzero = blocks.iter().map(|&n| vec![0u64; n]).collect();
+                }
+                frame = Some(Frame {
+                    x,
+                    y,
+                    comps,
+                    ids,
+                    blocks,
+                    progressive,
+                });
                 prefix.push(data.get(i..seg + len)?.to_vec());
                 i = seg + len;
             }
-            // Anything else in the SOF family — progressive, lossless,
-            // arithmetic, hierarchical — is out of scope.
-            0xC2..=0xC3 | 0xC5..=0xC7 | 0xC9..=0xCB | 0xCD..=0xCF | 0xCC | 0xDE | 0xDF => {
-                return None
-            }
+            // Anything else in the SOF family — lossless, arithmetic,
+            // hierarchical — is out of scope.
+            0xC3 | 0xC5..=0xC7 | 0xC9..=0xCB | 0xCD..=0xCF | 0xCC | 0xDE | 0xDF => return None,
             0xC4 => {
                 let len = usize::from(u16::from_be_bytes([*data.get(seg)?, *data.get(seg + 1)?]));
                 read_dht(data.get(seg + 2..seg + len)?, &mut tables)?;
@@ -683,7 +1002,15 @@ fn parse(data: &[u8]) -> Option<Parsed> {
                 let header = data.get(seg..seg + len)?.to_vec();
                 let frame = frame.as_ref()?;
                 let plan = plan_scan(frame, &header)?;
-                let (runs, end) = decode_scan(data, seg + len, &plan, dri, &tables)?;
+                let (runs, end) = decode_scan(
+                    data,
+                    seg + len,
+                    &plan,
+                    dri,
+                    &tables,
+                    frame.progressive,
+                    &mut nonzero,
+                )?;
                 scans.push(Scan { header, runs });
                 scan_at.push(prefix.len());
                 i = end;
@@ -706,13 +1033,24 @@ fn parse(data: &[u8]) -> Option<Parsed> {
 }
 
 fn rebuild(p: &Parsed) -> Option<Vec<u8>> {
+    rebuild_with(p, gen_optimal_table)
+}
+
+/// The rebuild, parameterized by table generator so tests can substitute a
+/// deliberately bad one.
+fn rebuild_with(
+    p: &Parsed,
+    gen: fn(&[u64; 256]) -> Option<EncodeTable>,
+) -> Option<Vec<u8>> {
     let mut out: Vec<u8> = Vec::new();
+    let mut in_effect: [TableState; 8] = Default::default();
     let mut next_scan = 0usize;
     for (idx, seg) in p.prefix.iter().enumerate() {
         out.extend_from_slice(seg);
         while next_scan < p.scans.len() && p.scan_at[next_scan] == idx + 1 {
             let scan = &p.scans[next_scan];
-            let (dht, entropy) = encode_scan(&scan.runs)?;
+            let (tables, entropy) = encode_scan(&scan.runs, gen)?;
+            let dht = dht_segment(&tables, &mut in_effect, p.progressive)?;
             out.extend_from_slice(&dht);
             out.extend_from_slice(&[0xFF, 0xDA]);
             out.extend_from_slice(&scan.header);
@@ -764,6 +1102,357 @@ pub(crate) fn optimize(data: &[u8]) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Fixtures live at `fixtures/jpeg`; regenerate with
+    /// `python3 fixtures/jpeg/generate.py`.
+    fn fixture(name: &str) -> Vec<u8> {
+        let path = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/jpeg"))
+            .join(name);
+        std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+    }
+
+    const FIXTURES: [&str; 6] = [
+        "prog_color.jpg",
+        "prog_color444.jpg",
+        "prog_gray.jpg",
+        "prog_restart.jpg",
+        "prog_deep.jpg",
+        "seq_color.jpg",
+    ];
+
+    // ---------------------------------------------------------------------
+    // An independent reference decoder, used only to prove losslessness.
+    //
+    // It walks the file from scratch — its own marker loop, its own scan
+    // decoders — and produces the full dequantized-free DCT coefficient array
+    // of every component. Nothing in it shares code with the token model the
+    // optimizer uses beyond the bit reader and the canonical-table lookup, so
+    // agreeing on coefficients before and after the rebuild is a real check,
+    // not a restatement of the optimizer's own bookkeeping.
+    // ---------------------------------------------------------------------
+
+    /// Coefficients in zigzag order, per component, per block of that
+    /// component's own (MCU-padded) grid.
+    type Coefs = Vec<Vec<[i32; 64]>>;
+
+    fn extend(v: u16, s: u8) -> i32 {
+        let v = i32::from(v);
+        if s == 0 {
+            0
+        } else if v < (1 << (s - 1)) {
+            v - (1 << s) + 1
+        } else {
+            v
+        }
+    }
+
+    struct RefComp {
+        h: usize,
+        v: usize,
+        id: u8,
+        /// Grid width in blocks, padded out to whole MCUs.
+        bw: usize,
+        /// Width of the non-interleaved grid, which may be narrower.
+        bw_scan: usize,
+        bh_scan: usize,
+    }
+
+    /// Decode every DCT coefficient in `data`. Panics on anything it cannot
+    /// parse — it is only ever pointed at streams the optimizer accepted.
+    fn decode_coefficients(data: &[u8]) -> Coefs {
+        assert_eq!(&data[..2], &[0xFF, 0xD8], "SOI");
+        let mut tables: [Option<DecodeTable>; 8] = Default::default();
+        let mut comps: Vec<RefComp> = Vec::new();
+        let mut coefs: Coefs = Vec::new();
+        let mut progressive = false;
+        let (mut mcux, mut mcuy) = (0usize, 0usize);
+        let mut dri = 0usize;
+        let mut i = 2usize;
+
+        loop {
+            assert_eq!(data[i], 0xFF);
+            let mut j = i + 1;
+            while data[j] == 0xFF {
+                j += 1;
+            }
+            let m = data[j];
+            let seg = j + 1;
+            if m == 0xD9 {
+                return coefs;
+            }
+            let len = usize::from(u16::from_be_bytes([data[seg], data[seg + 1]]));
+            match m {
+                0xC0..=0xC2 => {
+                    progressive = m == 0xC2;
+                    let p = &data[seg + 2..seg + len];
+                    let y = usize::from(u16::from_be_bytes([p[1], p[2]]));
+                    let x = usize::from(u16::from_be_bytes([p[3], p[4]]));
+                    let nf = usize::from(p[5]);
+                    let raw: Vec<(u8, usize, usize)> = (0..nf)
+                        .map(|c| {
+                            (
+                                p[6 + c * 3],
+                                usize::from(p[7 + c * 3] >> 4),
+                                usize::from(p[7 + c * 3] & 0xF),
+                            )
+                        })
+                        .collect();
+                    let hmax = raw.iter().map(|r| r.1).max().unwrap();
+                    let vmax = raw.iter().map(|r| r.2).max().unwrap();
+                    mcux = x.div_ceil(8 * hmax);
+                    mcuy = y.div_ceil(8 * vmax);
+                    for &(id, h, v) in &raw {
+                        let bw_scan = (x * h).div_ceil(hmax).div_ceil(8);
+                        let bh_scan = (y * v).div_ceil(vmax).div_ceil(8);
+                        let bw = (mcux * h).max(bw_scan);
+                        let bh = (mcuy * v).max(bh_scan);
+                        comps.push(RefComp {
+                            h,
+                            v,
+                            id,
+                            bw,
+                            bw_scan,
+                            bh_scan,
+                        });
+                        coefs.push(vec![[0i32; 64]; bw * bh]);
+                    }
+                    i = seg + len;
+                }
+                0xC4 => {
+                    read_dht(&data[seg + 2..seg + len], &mut tables).expect("DHT");
+                    i = seg + len;
+                }
+                0xDD => {
+                    dri = usize::from(u16::from_be_bytes([data[seg + 2], data[seg + 3]]));
+                    i = seg + len;
+                }
+                0xDA => {
+                    let p = &data[seg + 2..seg + len];
+                    let ns = usize::from(p[0]);
+                    let sel: Vec<(usize, u8, u8)> = (0..ns)
+                        .map(|k| {
+                            let idx = comps.iter().position(|c| c.id == p[1 + k * 2]).unwrap();
+                            (idx, p[2 + k * 2] >> 4, p[2 + k * 2] & 0xF)
+                        })
+                        .collect();
+                    let (ss, se) = (p[1 + ns * 2], p[2 + ns * 2]);
+                    let (ah, al) = (p[3 + ns * 2] >> 4, p[3 + ns * 2] & 0xF);
+                    let mut r = BitReader::new(data, seg + len);
+                    let mut pred = vec![0i32; comps.len()];
+                    let mut restarts = 0usize;
+                    let mut eobrun = 0u32;
+
+                    let mcus = if ns == 1 {
+                        let c = &comps[sel[0].0];
+                        c.bw_scan * c.bh_scan
+                    } else {
+                        mcux * mcuy
+                    };
+                    for mcu in 0..mcus {
+                        if dri > 0 && mcu > 0 && mcu % dri == 0 {
+                            r.restart(u8::try_from(restarts & 7).unwrap()).expect("RST");
+                            restarts += 1;
+                            pred.iter_mut().for_each(|v| *v = 0);
+                            eobrun = 0;
+                        }
+                        // (component index, block index) for every block of
+                        // this MCU, in scan order.
+                        let mut blocks: Vec<(usize, usize)> = Vec::new();
+                        if ns == 1 {
+                            let (idx, ..) = sel[0];
+                            let c = &comps[idx];
+                            let (bx, by) = (mcu % c.bw_scan, mcu / c.bw_scan);
+                            blocks.push((idx, by * c.bw + bx));
+                        } else {
+                            let (mx, my) = (mcu % mcux, mcu / mcux);
+                            for &(idx, ..) in &sel {
+                                let c = &comps[idx];
+                                for by in 0..c.v {
+                                    for bx in 0..c.h {
+                                        let row = my * c.v + by;
+                                        let col = mx * c.h + bx;
+                                        blocks.push((idx, row * c.bw + col));
+                                    }
+                                }
+                            }
+                        }
+                        let mut b = 0usize;
+                        for (k, &(idx, td, ta)) in sel.iter().enumerate() {
+                            let n = if ns == 1 { 1 } else { comps[idx].h * comps[idx].v };
+                            let _ = k;
+                            for _ in 0..n {
+                                let (ci, bi) = blocks[b];
+                                b += 1;
+                                let blk = &mut coefs[ci][bi];
+                                if !progressive {
+                                    let dc = tables[slot_of(td)].as_ref().unwrap();
+                                    let sz = r.decode(dc).unwrap();
+                                    let diff = extend(r.bits(sz).unwrap(), sz);
+                                    pred[ci] += diff;
+                                    blk[0] = pred[ci];
+                                    let ac = tables[slot_of(0x10 | ta)].as_ref().unwrap();
+                                    let mut kk = 1usize;
+                                    while kk < 64 {
+                                        let rs = r.decode(ac).unwrap();
+                                        let (run, sz) = (usize::from(rs >> 4), rs & 0xF);
+                                        if sz == 0 {
+                                            if run != 15 {
+                                                break;
+                                            }
+                                            kk += 16;
+                                        } else {
+                                            kk += run;
+                                            blk[kk] = extend(r.bits(sz).unwrap(), sz);
+                                            kk += 1;
+                                        }
+                                    }
+                                } else if ss == 0 {
+                                    if ah == 0 {
+                                        let dc = tables[slot_of(td)].as_ref().unwrap();
+                                        let sz = r.decode(dc).unwrap();
+                                        let diff = extend(r.bits(sz).unwrap(), sz);
+                                        pred[ci] += diff;
+                                        blk[0] = pred[ci] << al;
+                                    } else if r.bit().unwrap() != 0 {
+                                        blk[0] |= 1 << al;
+                                    }
+                                } else {
+                                    let ac = tables[slot_of(0x10 | ta)].as_ref().unwrap();
+                                    if ah == 0 {
+                                        ref_ac_first(&mut r, ac, blk, ss, se, al, &mut eobrun);
+                                    } else {
+                                        ref_ac_refine(&mut r, ac, blk, ss, se, al, &mut eobrun);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    r.cnt = 0;
+                    i = r.pos;
+                    assert_eq!(data[i], 0xFF, "scan must end at a marker");
+                }
+                _ => i = seg + len,
+            }
+        }
+    }
+
+    fn ref_ac_first(
+        r: &mut BitReader,
+        ac: &DecodeTable,
+        blk: &mut [i32; 64],
+        ss: u8,
+        se: u8,
+        al: u8,
+        eobrun: &mut u32,
+    ) {
+        if *eobrun > 0 {
+            *eobrun -= 1;
+            return;
+        }
+        let mut k = usize::from(ss);
+        while k <= usize::from(se) {
+            let rs = r.decode(ac).unwrap();
+            let (run, sz) = (usize::from(rs >> 4), rs & 0xF);
+            if sz != 0 {
+                k += run;
+                blk[k] = extend(r.bits(sz).unwrap(), sz) << al;
+                k += 1;
+            } else if run != 15 {
+                *eobrun = (1u32 << run) + u32::from(r.bits(u8::try_from(run).unwrap()).unwrap()) - 1;
+                return;
+            } else {
+                k += 16;
+            }
+        }
+    }
+
+    fn ref_ac_refine(
+        r: &mut BitReader,
+        ac: &DecodeTable,
+        blk: &mut [i32; 64],
+        ss: u8,
+        se: u8,
+        al: u8,
+        eobrun: &mut u32,
+    ) {
+        let p1 = 1i32 << al;
+        let m1 = -1i32 << al;
+        let se = usize::from(se);
+        let mut k = usize::from(ss);
+        if *eobrun == 0 {
+            while k <= se {
+                let rs = r.decode(ac).unwrap();
+                let (mut run, sz) = (i32::from(rs >> 4), rs & 0xF);
+                let mut newval = 0i32;
+                if sz != 0 {
+                    assert_eq!(sz, 1, "refinement magnitude must be 1");
+                    newval = if r.bit().unwrap() != 0 { p1 } else { m1 };
+                } else if run != 15 {
+                    *eobrun = (1u32 << run)
+                        + u32::from(r.bits(u8::try_from(run).unwrap()).unwrap());
+                    break;
+                }
+                while k <= se {
+                    if blk[k] != 0 {
+                        if r.bit().unwrap() != 0 && blk[k] & p1 == 0 {
+                            blk[k] += if blk[k] >= 0 { p1 } else { m1 };
+                        }
+                    } else {
+                        run -= 1;
+                        if run < 0 {
+                            break;
+                        }
+                    }
+                    k += 1;
+                }
+                if newval != 0 {
+                    blk[k] = newval;
+                }
+                k += 1;
+            }
+        }
+        if *eobrun > 0 {
+            while k <= se {
+                if blk[k] != 0 && r.bit().unwrap() != 0 && blk[k] & p1 == 0 {
+                    blk[k] += if blk[k] >= 0 { p1 } else { m1 };
+                }
+                k += 1;
+            }
+            *eobrun -= 1;
+        }
+    }
+
+    /// Re-encode a parsed stream with deliberately bad tables: every symbol a
+    /// scan uses gets an 8-bit code, whatever its frequency. That is what a
+    /// producer shipping fixed tables looks like, and it gives the optimizer
+    /// something to win back on fixtures that libjpeg already optimized.
+    fn flat_table(freq: &[u64; 256]) -> Option<EncodeTable> {
+        let values: Vec<u8> = (0..=255u8)
+            .filter(|&s| freq[usize::from(s)] > 0)
+            .take(255)
+            .collect();
+        if values.is_empty() || values.len() != freq.iter().filter(|&&f| f > 0).count() {
+            return None;
+        }
+        let mut counts = [0u8; 16];
+        counts[7] = u8::try_from(values.len()).ok()?;
+        let (mut code, mut len) = ([0u32; 256], [0u8; 256]);
+        for (n, &sym) in values.iter().enumerate() {
+            code[usize::from(sym)] = u32::try_from(n).ok()?;
+            len[usize::from(sym)] = 8;
+        }
+        Some(EncodeTable {
+            counts,
+            values,
+            code,
+            len,
+        })
+    }
+
+    fn deoptimize(data: &[u8]) -> Vec<u8> {
+        let parsed = parse(data).expect("fixture must parse");
+        rebuild_with(&parsed, flat_table).expect("fixture must re-encode")
+    }
 
     /// Symbol frequencies must produce a table no code longer than 16 bits,
     /// with every used symbol assigned and the all-ones code left free.
@@ -880,18 +1569,132 @@ mod tests {
         assert!(optimize(&once).is_none(), "second pass must decline");
     }
 
-    /// Progressive frames are out of scope and must leave the bytes alone.
+    /// Frame types outside the Huffman-sequential/progressive scope — lossless,
+    /// arithmetic, hierarchical — must leave the bytes alone on the frame tag
+    /// alone, whatever the entropy data says.
     #[test]
-    fn progressive_declines() {
-        let mut jpeg = flat_table_jpeg(8, 0);
-        // Retag SOF0 as SOF2 (the entropy data is then nonsense, which is
-        // the point: the frame type alone must stop the pass).
-        let at = jpeg
-            .windows(2)
-            .position(|w| w == [0xFF, 0xC0])
-            .expect("SOF0");
-        jpeg[at + 1] = 0xC2;
-        assert!(optimize(&jpeg).is_none());
+    fn out_of_scope_frames_decline() {
+        for sof in [0xC3u8, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF] {
+            let mut jpeg = flat_table_jpeg(8, 0);
+            let at = jpeg
+                .windows(2)
+                .position(|w| w == [0xFF, 0xC0])
+                .expect("SOF0");
+            jpeg[at + 1] = sof;
+            assert!(optimize(&jpeg).is_none(), "SOF {sof:#04X} must decline");
+        }
+    }
+
+    /// A `DHP` marker introduces a hierarchical sequence: out of scope.
+    #[test]
+    fn hierarchical_declines() {
+        let jpeg = flat_table_jpeg(8, 0);
+        let mut hier = jpeg[..2].to_vec();
+        hier.extend_from_slice(&[0xFF, 0xDE, 0x00, 0x08, 0x08, 0, 8, 0, 8, 0]);
+        hier.extend_from_slice(&jpeg[2..]);
+        assert!(optimize(&hier).is_none());
+    }
+
+    /// Every fixture the pass accepts must decode to exactly the same DCT
+    /// coefficients before and after. This is the losslessness proof: the
+    /// reference decoder below reconstructs full coefficient arrays from the
+    /// raw bitstream, independently of the optimizer's token bookkeeping.
+    #[test]
+    fn coefficients_survive_the_rebuild() {
+        for name in FIXTURES {
+            let orig = fixture(name);
+            // Both the fixture as shipped and a deliberately de-optimized
+            // copy of it, so the optimizer is exercised on a stream it will
+                // actually accept.
+            let flat = deoptimize(&orig);
+            let before = decode_coefficients(&orig);
+            assert_eq!(before, decode_coefficients(&flat), "{name}: de-optimize");
+            let out = optimize(&flat).unwrap_or_else(|| panic!("{name}: must optimize"));
+            assert_eq!(before, decode_coefficients(&out), "{name}: optimize");
+            if let Some(out) = optimize(&orig) {
+                assert_eq!(before, decode_coefficients(&out), "{name}: optimize orig");
+            }
+        }
+    }
+
+    /// The same thing seen from outside: an independent decoder must render
+    /// identical pixels from the original and the rebuild.
+    #[test]
+    fn fixture_pixels_are_identical() {
+        for name in FIXTURES {
+            let flat = deoptimize(&fixture(name));
+            let out = optimize(&flat).unwrap();
+            let a = image::load_from_memory_with_format(&flat, image::ImageFormat::Jpeg)
+                .unwrap_or_else(|e| panic!("{name}: original decodes: {e}"));
+            let b = image::load_from_memory_with_format(&out, image::ImageFormat::Jpeg)
+                .unwrap_or_else(|e| panic!("{name}: rebuild decodes: {e}"));
+            assert_eq!(a.to_rgb8().into_raw(), b.to_rgb8().into_raw(), "{name}");
+        }
+    }
+
+    /// Flat tables over skewed statistics must shrink, on every fixture.
+    #[test]
+    fn progressive_flat_tables_shrink() {
+        for name in FIXTURES {
+            let flat = deoptimize(&fixture(name));
+            let out = optimize(&flat).unwrap();
+            assert!(out.len() < flat.len(), "{name}: {} vs {}", out.len(), flat.len());
+        }
+    }
+
+    /// libjpeg already fits per-scan tables to the data, so its own output is
+    /// at or near the fixpoint: the pass must either decline or shrink, never
+    /// grow, and a second pass over its own output must decline.
+    #[test]
+    fn progressive_output_is_a_fixpoint() {
+        for name in FIXTURES {
+            let flat = deoptimize(&fixture(name));
+            let once = optimize(&flat).unwrap();
+            assert!(optimize(&once).is_none(), "{name}: second pass must decline");
+        }
+    }
+
+    /// The pass must not silently drop a scan or reorder the frame: the
+    /// rebuild carries the same SOS headers, in the same places.
+    #[test]
+    fn scan_structure_is_preserved() {
+        for name in FIXTURES {
+            let flat = deoptimize(&fixture(name));
+            let out = optimize(&flat).unwrap();
+            let (a, b) = (parse(&flat).unwrap(), parse(&out).unwrap());
+            assert_eq!(a.scans.len(), b.scans.len(), "{name}");
+            assert_eq!(a.scan_at, b.scan_at, "{name}");
+            for (x, y) in a.scans.iter().zip(&b.scans) {
+                assert_eq!(x.header, y.header, "{name}");
+                assert_eq!(x.runs.len(), y.runs.len(), "{name}");
+            }
+        }
+    }
+
+    /// Truncating a progressive stream anywhere must decline rather than
+    /// produce a stream, and must never panic.
+    #[test]
+    fn truncated_progressive_declines() {
+        let jpeg = fixture("prog_color.jpg");
+        for cut in (1..jpeg.len()).step_by(7) {
+            assert!(optimize(&jpeg[..cut]).is_none(), "cut {cut}");
+        }
+    }
+
+    /// Single-bit corruption anywhere in a progressive stream must either
+    /// decline or produce something that still round-trips its own tokens —
+    /// the verification gate in `optimize` guarantees the latter. Never a
+    /// panic, never a silent coefficient change.
+    #[test]
+    fn corrupted_progressive_never_panics() {
+        let jpeg = fixture("prog_gray.jpg");
+        for byte in 0..jpeg.len() {
+            for bit in [0u32, 3, 7] {
+                let mut bad = jpeg.clone();
+                bad[byte] ^= 1 << bit;
+                let _ = optimize(&bad);
+            }
+        }
     }
 
     #[test]
