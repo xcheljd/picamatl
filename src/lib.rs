@@ -3722,7 +3722,7 @@ fn try_compress_xref_stream(out: &[u8], backend: DeflateBackend) -> Option<Vec<u
     Some(patched)
 }
 
-/// Re-deflate the just-written `ObjStm` payload with zopfli.
+/// Re-deflate every just-written `ObjStm` payload with zopfli.
 ///
 /// lopdf's writer deflates the object stream itself (zlib level 9) during
 /// `save_with_options`, after every document-level pass has run, so the final
@@ -3742,20 +3742,30 @@ fn try_compress_xref_stream(out: &[u8], backend: DeflateBackend) -> Option<Vec<u
 /// region, and the patched file must re-parse with lopdf (which walks every
 /// rewritten offset). Any doubt returns the input unchanged.
 fn rezopfli_objstm(out: Vec<u8>) -> Vec<u8> {
-    match try_rezopfli_objstm(&out) {
-        Some(patched) => patched,
-        None => out,
+    // Files above `max_objects_per_stream` objects get several ObjStms, so patch
+    // every one of them. Strictly last-to-first: a patch only ever shifts bytes
+    // *after* the stream it rewrites, so the tag positions of the streams still
+    // to come — all of which sit earlier — stay valid in the patched buffer.
+    // Each patch is independently validated and re-parsed, so a stream that
+    // declines simply stays zlib without affecting the others.
+    let tag = b"/Type/ObjStm";
+    let mut tags = Vec::new();
+    let mut from = 0;
+    while let Some(at) = find_sub(&out, tag, from) {
+        tags.push(at);
+        from = at + tag.len();
     }
+    let mut cur = out;
+    for &tag_at in tags.iter().rev() {
+        if let Some(patched) = try_rezopfli_objstm(&cur, tag_at) {
+            cur = patched;
+        }
+    }
+    cur
 }
 
-fn try_rezopfli_objstm(out: &[u8]) -> Option<Vec<u8>> {
-    // Exactly one ObjStm — more means an unfamiliar writer layout.
-    let tag = b"/Type/ObjStm";
-    let tag_at = find_sub(out, tag, 0)?;
-    if find_sub(out, tag, tag_at + tag.len()).is_some() {
-        return None;
-    }
-
+/// Re-deflate the single `ObjStm` whose `/Type/ObjStm` token sits at `tag_at`.
+fn try_rezopfli_objstm(out: &[u8], tag_at: usize) -> Option<Vec<u8>> {
     // "<id> <gen> obj\n<<" — the dict opens right after the object header,
     // and the /Type/ObjStm entry must sit inside THIS dict.
     let hdr = rfind_sub(out, b" obj\n<<", tag_at)?;
