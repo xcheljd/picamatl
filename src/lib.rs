@@ -1120,6 +1120,30 @@ fn plan_replacement(
     })
 }
 
+/// Which pipeline a DCTDecode payload belongs to, decided from its frame
+/// header's component count alone.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum JpegRoute {
+    /// 1 or 3 components — the historical gray/RGB pipeline, byte-for-byte
+    /// unchanged. An unparseable header also lands here so that streams the
+    /// real decoders have always accepted keep being accepted.
+    GrayOrRgb,
+    /// 4 components — CMYK or YCCK, handled by [`plan_dct_cmyk`].
+    Cmyk,
+    /// Anything else (2 components, or a frame header claiming 0). Nothing
+    /// here knows what those channels mean, so the stream is left untouched
+    /// rather than passed to a decoder that would guess.
+    Decline,
+}
+
+fn jpeg_route(data: &[u8]) -> JpegRoute {
+    match jpeg_component_count(data) {
+        Some(4) => JpegRoute::Cmyk,
+        Some(1) | Some(3) | None => JpegRoute::GrayOrRgb,
+        Some(_) => JpegRoute::Decline,
+    }
+}
+
 /// The JPEG re-encode path: decode (scaled when possible), resize, re-encode
 /// via mozjpeg. Channel count is preserved to match the unchanged /ColorSpace.
 fn plan_dct(
@@ -1130,8 +1154,18 @@ fn plan_dct(
 ) -> Option<Vec<u8>> {
     let quality = options.jpeg_quality.clamp(1, 100);
 
-    // Prefer scaled decoding; fall back to a full decode for color spaces the
-    // scaled path declines (CMYK/YCCK) or if libjpeg refuses the stream.
+    match jpeg_route(&stream.content) {
+        // CMYK/YCCK downsample in native four-component space and come back
+        // out as YCCK. This MUST be routed before the code below: the general
+        // `image` fallback converts CMYK to RGB, and a 3-component payload
+        // under an unchanged 4-component /ColorSpace is a corrupt page.
+        JpegRoute::Cmyk => return plan_dct_cmyk(stream, quality, target_w, target_h, false),
+        JpegRoute::Decline => return None,
+        JpegRoute::GrayOrRgb => {}
+    }
+
+    // Prefer scaled decoding; fall back to a full decode when libjpeg refuses
+    // the stream.
     let (decoded, is_gray) =
         decode_jpeg_scaled(&stream.content, target_w, target_h).or_else(|| {
             let decoded =
@@ -1185,6 +1219,16 @@ fn plan_dct_requant(
     px_h: u32,
 ) -> Option<Vec<u8>> {
     let quality = options.jpeg_quality.clamp(1, 100);
+
+    match jpeg_route(&stream.content) {
+        // CMYK/YCCK: the same dimension-preserving contract, enforced inside
+        // `plan_dct_cmyk` by its exact-source-geometry mode. It carries the
+        // decode-back verification and the quantization-table idempotence
+        // guard too, so this branch is complete as written.
+        JpegRoute::Cmyk => return plan_dct_cmyk(stream, quality, px_w, px_h, true),
+        JpegRoute::Decline => return None,
+        JpegRoute::GrayOrRgb => {}
+    }
 
     // Full decode: same path as the resize pipeline, with the target set to
     // the stream's own geometry (libjpeg then picks the unscaled 8/8 DCT
@@ -1365,6 +1409,15 @@ fn plan_dct_resize_verified(
     target_h: u32,
 ) -> Option<Vec<u8>> {
     let quality = options.jpeg_quality.clamp(1, 100);
+    match jpeg_route(&stream.content) {
+        // A CMYK base under an /SMask: the mask half is an independent
+        // single-channel stream, so the pair only needs the base to land on
+        // the same target geometry — which `plan_dct_cmyk` guarantees, along
+        // with the decode-back verification this function is named for.
+        JpegRoute::Cmyk => return plan_dct_cmyk(stream, quality, target_w, target_h, false),
+        JpegRoute::Decline => return None,
+        JpegRoute::GrayOrRgb => {}
+    }
     let (decoded, is_gray) = decode_jpeg(&stream.content, target_w, target_h)?;
     let resized = decoded.resize_exact(target_w, target_h, image::imageops::FilterType::Lanczos3);
     // Reference pixels are the exact buffer handed to the encoder; the
@@ -2336,6 +2389,326 @@ fn encode_jpeg(img: DynamicImage, is_gray: bool, quality: u8) -> Option<Vec<u8>>
     let mut started = comp.start_compress(Vec::new()).ok()?;
     started.write_scanlines(&data).ok()?;
     started.finish().ok()
+}
+
+// ---------------------------------------------------------------------------
+// CMYK / YCCK JPEG support.
+//
+// Four-component DCTDecode streams (PDF `/ColorSpace /DeviceCMYK`, ICCBased
+// N=4, DeviceN, ...) used to be handled by accident rather than on purpose:
+// `decode_jpeg_scaled` declined them, and the caller then fell back to the
+// general-purpose `image` decoder, which converts CMYK to RGB. Re-encoding
+// that as a 3-component JPEG under an unchanged 4-component `/ColorSpace`
+// produces a corrupt page. The code below handles them deliberately instead.
+//
+// THE CENTRAL INVARIANT: everything here works in RAW STORED SAMPLE SPACE and
+// never interprets it. libjpeg is the only thing that touches the Adobe APP14
+// transform: on decode it maps YCCK (transform 2) back to stored CMYK samples,
+// on encode it maps them forward again and emits the matching APP14 marker.
+// We never parse APP14 ourselves and never invert a channel.
+//
+// That is what makes the classic CMYK-JPEG bug class unreachable here. The
+// "is it inverted?" question — Adobe writes CMYK JPEGs with 255-x samples,
+// most other producers do not, and PDF producers sometimes bolt a
+// `/Decode [1 0 1 0 1 0 1 0]` array on top to compensate — is a property of
+// the SAMPLE VALUES, and we pass those through unchanged. Whatever convention
+// the input used, the output uses the same one, so the unchanged dict keeps
+// meaning exactly what it meant before.
+// ---------------------------------------------------------------------------
+
+/// A decoded four-component JPEG in raw stored-sample space, interleaved
+/// C,M,Y,K. Deliberately NOT a `DynamicImage`: the `image` crate has no CMYK
+/// variant, and smuggling four channels through `Rgba8` would hand them to
+/// resampling code that may treat the fourth channel as alpha.
+struct CmykImage {
+    width: u32,
+    height: u32,
+    /// `width * height * 4` bytes, interleaved.
+    data: Vec<u8>,
+}
+
+/// The component count declared by a JPEG's frame header (SOF), or `None` if
+/// the marker structure does not parse cleanly.
+///
+/// This is a purely STRUCTURAL walk — it never looks at APP14 — used only to
+/// route a stream to the right pipeline: 1 or 3 components take the untouched
+/// gray/RGB path, 4 takes the CMYK path below, anything else is declined
+/// outright rather than guessed at. `None` deliberately keeps the historical
+/// gray/RGB behaviour: an unparseable header means the real decoders get the
+/// same shot at the stream they have always had.
+fn jpeg_component_count(data: &[u8]) -> Option<u8> {
+    if data.len() < 2 || data[0] != 0xFF || data[1] != 0xD8 {
+        return None;
+    }
+    let mut i = 2usize;
+    while i + 2 <= data.len() {
+        if data[i] != 0xFF {
+            return None;
+        }
+        let marker = data[i + 1];
+        match marker {
+            // Fill bytes before a marker.
+            0xFF => {
+                i += 1;
+                continue;
+            }
+            // Standalone markers (no length field).
+            0x01 | 0xD0..=0xD7 => {
+                i += 2;
+                continue;
+            }
+            // A scan before any frame header: malformed, draw no conclusion.
+            0xDA => return None,
+            _ => {}
+        }
+        if i + 4 > data.len() {
+            return None;
+        }
+        let len = ((data[i + 2] as usize) << 8) | data[i + 3] as usize;
+        if len < 2 || i + 2 + len > data.len() {
+            return None;
+        }
+        // Every SOF flavour (baseline, extended, progressive, lossless,
+        // arithmetic) shares the same header layout; DHT (0xC4), JPG (0xC8)
+        // and DAC (0xCC) sit in the same numeric range and are not frames.
+        if matches!(marker, 0xC0..=0xCF) && !matches!(marker, 0xC4 | 0xC8 | 0xCC) {
+            // precision(1) + height(2) + width(2) + component count(1)
+            if len < 8 {
+                return None;
+            }
+            return Some(data[i + 9]);
+        }
+        i += 2 + len;
+    }
+    None
+}
+
+/// True if this image dict carries a `/Decode` array.
+///
+/// A `/Decode` array remaps every sample after decoding, and for DeviceCMYK
+/// the common one is `[1 0 1 0 1 0 1 0]` — a producer inverting the whole
+/// image. Passing raw samples through unchanged would still be correct under
+/// such a remap in exact arithmetic, because inversion and a linear resampling
+/// kernel commute; they do NOT commute once Lanczos3's ringing overshoot is
+/// clamped to 0..=255, since the clamp happens on the pre-`/Decode` values.
+/// The asymmetry is small but real, and it lands on exactly the images where a
+/// channel-polarity mistake is invisible to us and glaring to a reader — so
+/// this declines instead. `plan_mask_resample` declines on `/Decode` for the
+/// same reason.
+fn has_decode_array(dict: &lopdf::Dictionary) -> bool {
+    !matches!(dict.get(b"Decode"), Err(_) | Ok(Object::Null))
+}
+
+/// Decode a four-component JPEG to raw CMYK samples, using the same `n/8`
+/// DCT-scaled decoding trick as [`decode_jpeg_scaled`] so a heavily
+/// over-resolution source is never materialized at full size.
+///
+/// Requesting `JCS_CMYK` output explicitly is the whole point: for a YCCK
+/// stream libjpeg applies the inverse Adobe transform for us, and for a plain
+/// CMYK stream it passes samples through. Either way we get stored-sample
+/// space. Returns `None` unless the stream really is CMYK or YCCK — a caller
+/// that routed a 3-component stream here must not silently get RGB back.
+fn decode_cmyk_jpeg_scaled(data: &[u8], target_w: u32, target_h: u32) -> Option<CmykImage> {
+    use mozjpeg::ColorSpace;
+
+    let mut dec = mozjpeg::Decompress::new_mem(data).ok()?;
+    let (full_w, full_h) = (dec.width(), dec.height());
+    if full_w == 0 || full_h == 0 {
+        return None;
+    }
+    if !matches!(
+        dec.color_space(),
+        ColorSpace::JCS_CMYK | ColorSpace::JCS_YCCK
+    ) {
+        return None;
+    }
+
+    // Smallest n/8 that still covers the target in BOTH axes (never upscale).
+    let mut numerator = 8u8;
+    for n in 1..=8u8 {
+        let scaled_w = (full_w * n as usize).div_ceil(8);
+        let scaled_h = (full_h * n as usize).div_ceil(8);
+        if scaled_w >= target_w as usize && scaled_h >= target_h as usize {
+            numerator = n;
+            break;
+        }
+    }
+    dec.scale(numerator);
+
+    let mut started = dec.to_colorspace(ColorSpace::JCS_CMYK).ok()?;
+    let (w, h) = (started.width(), started.height());
+    let data: Vec<u8> = started.read_scanlines::<u8>().ok()?;
+    started.finish().ok()?;
+
+    let (w, h) = (u32::try_from(w).ok()?, u32::try_from(h).ok()?);
+    // Guard the arithmetic before trusting the buffer length.
+    let expected = (w as usize).checked_mul(h as usize)?.checked_mul(4)?;
+    if w == 0 || h == 0 || data.len() != expected {
+        return None;
+    }
+    Some(CmykImage {
+        width: w,
+        height: h,
+        data,
+    })
+}
+
+/// Resample all four channels to `(target_w, target_h)` with the Lanczos3
+/// kernel — the same filter, and the same `image` implementation, the RGB path
+/// gets from `resize_exact`.
+///
+/// Each channel is resampled independently as an 8-bit gray plane. That is
+/// exactly what `image` does internally for a multi-channel image (its
+/// resampler is separable and per-channel), and doing it explicitly keeps the
+/// fourth channel from ever being mistaken for alpha by an image type that has
+/// one.
+fn resize_cmyk_lanczos3(img: &CmykImage, target_w: u32, target_h: u32) -> Option<CmykImage> {
+    if target_w == 0 || target_h == 0 {
+        return None;
+    }
+    let (sw, sh) = (img.width as usize, img.height as usize);
+    let pixels = sw.checked_mul(sh)?;
+    let out_pixels = (target_w as usize).checked_mul(target_h as usize)?;
+    let mut out = vec![0u8; out_pixels.checked_mul(4)?];
+    let mut plane = vec![0u8; pixels];
+    for c in 0..4usize {
+        for (dst, src) in plane.iter_mut().zip(img.data.chunks_exact(4)) {
+            *dst = src[c];
+        }
+        let gray = image::GrayImage::from_raw(img.width, img.height, std::mem::take(&mut plane))?;
+        let resized = image::imageops::resize(
+            &gray,
+            target_w,
+            target_h,
+            image::imageops::FilterType::Lanczos3,
+        );
+        if resized.len() != out_pixels {
+            return None;
+        }
+        for (dst, src) in out.chunks_exact_mut(4).zip(resized.iter()) {
+            dst[c] = *src;
+        }
+        // Reuse the source plane buffer for the next channel.
+        plane = gray.into_raw();
+    }
+    Some(CmykImage {
+        width: target_w,
+        height: target_h,
+        data: out,
+    })
+}
+
+/// Encode raw CMYK samples as a four-component YCCK JPEG.
+///
+/// `in_color_space = JCS_CMYK` tells libjpeg what we are handing it;
+/// `jpeg_set_colorspace(JCS_YCCK)` tells it what to write. libjpeg then applies
+/// the forward Adobe transform and emits the APP14 marker with transform = 2
+/// itself — the marker and the pixel transform can therefore never disagree,
+/// which is the failure mode that produces channel-swapped CMYK JPEGs. YCCK
+/// (rather than re-emitting plain CMYK) is chosen for the same reason YCbCr
+/// beats RGB: it decorrelates the chromatic channels and subsamples them, and
+/// it is what Adobe's own encoders write.
+fn encode_cmyk_jpeg(img: &CmykImage, quality: u8) -> Option<Vec<u8>> {
+    use mozjpeg::{ColorSpace, Compress};
+
+    if img.data.len() != (img.width as usize) * (img.height as usize) * 4 {
+        return None;
+    }
+    let mut comp = Compress::new(ColorSpace::JCS_CMYK);
+    comp.set_size(img.width as usize, img.height as usize);
+    comp.set_color_space(ColorSpace::JCS_YCCK);
+    comp.set_quality(quality as f32);
+
+    let mut started = comp.start_compress(Vec::new()).ok()?;
+    started.write_scanlines(&img.data).ok()?;
+    started.finish().ok()
+}
+
+/// The CMYK counterpart of [`decode_back_matches`]: re-decoding `out` must
+/// reproduce the reference's geometry, its four-component nature, and its raw
+/// samples within `max_mad`.
+///
+/// Comparing in raw stored-sample space is what makes this a polarity check
+/// and not just a quality check: a channel inversion or a C/M/Y/K reordering
+/// anywhere in the round trip moves the mean absolute difference to roughly
+/// half of full scale, an order of magnitude past the ceiling.
+fn cmyk_decode_back_matches(out: &[u8], reference: &CmykImage, max_mad: f64) -> bool {
+    let Some(decoded) = decode_cmyk_jpeg_scaled(out, reference.width, reference.height) else {
+        return false;
+    };
+    if decoded.width != reference.width || decoded.height != reference.height {
+        return false;
+    }
+    if decoded.data.len() != reference.data.len() || reference.data.is_empty() {
+        return false;
+    }
+    let sad: u64 = reference
+        .data
+        .iter()
+        .zip(&decoded.data)
+        .map(|(a, b)| u64::from(a.abs_diff(*b)))
+        .sum();
+    sad as f64 / reference.data.len() as f64 <= max_mad
+}
+
+/// The whole CMYK pipeline as one fail-safe unit: eligibility, scaled decode,
+/// Lanczos3 resample to the exact target geometry, YCCK re-encode, decode-back
+/// verification. Any doubt returns `None` and the stream is left untouched.
+///
+/// `target_w`/`target_h` are the caller's intent: the over-resolution
+/// downsample passes its computed target, the dimension-preserving requant
+/// passes the stream's own geometry. In BOTH cases the output is required to
+/// land exactly on that geometry, so a stream whose dict lies about its size
+/// can never desynchronize the dict from the payload.
+fn plan_dct_cmyk(
+    stream: &lopdf::Stream,
+    quality: u8,
+    target_w: u32,
+    target_h: u32,
+    require_exact_source_geometry: bool,
+) -> Option<Vec<u8>> {
+    if has_decode_array(&stream.dict) {
+        return None;
+    }
+    let decoded = decode_cmyk_jpeg_scaled(&stream.content, target_w, target_h)?;
+    // Never upscale: the DCT-scaled decode already refuses to go below the
+    // target, so a source smaller than the target means the dict's geometry
+    // and the payload disagree. Decline rather than invent samples.
+    if decoded.width < target_w || decoded.height < target_h {
+        return None;
+    }
+    // The dimension-preserving callers additionally require the payload to BE
+    // the declared geometry, not merely cover it: a dict that lies about its
+    // size would otherwise be silently "corrected" by the resample, which for
+    // a masked base means breaking alignment with a mask nobody resized.
+    if require_exact_source_geometry && (decoded.width != target_w || decoded.height != target_h) {
+        return None;
+    }
+    let resized = if decoded.width == target_w && decoded.height == target_h {
+        decoded
+    } else {
+        resize_cmyk_lanczos3(&decoded, target_w, target_h)?
+    };
+
+    let out = encode_cmyk_jpeg(&resized, quality)?;
+
+    // Same idempotence guard as the RGB requant path: byte-identical
+    // quantization tables mean the source is ALREADY at this quality and a
+    // re-encode would be pure generation loss. (A plain-CMYK source and a YCCK
+    // candidate never collide here — `jpeg_set_colorspace` gives CMYK one
+    // shared table and YCCK two, so the DQT payloads differ by construction.)
+    if let (Some(src_tables), Some(out_tables)) =
+        (jpeg_quant_tables(&stream.content), jpeg_quant_tables(&out))
+    {
+        if src_tables == out_tables {
+            return None;
+        }
+    }
+
+    if !cmyk_decode_back_matches(&out, &resized, DECODE_BACK_MAX_MAD) {
+        return None;
+    }
+    Some(out)
 }
 
 /// A planned `/JPXDecode` → `/DCTDecode` conversion (strictly opt-in via
