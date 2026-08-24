@@ -18,13 +18,11 @@ fn main() {
                 );
             }
         }
-        match doc.get_page_content(page_id) {
-            Ok(c) => println!(
-                "content ({} bytes):\n{}",
-                c.len(),
-                String::from_utf8_lossy(&c)
-            ),
-            Err(e) => println!("content error {e:?}"),
-        }
+        let c = doc.get_page_content(page_id);
+        println!(
+            "content ({} bytes):\n{}",
+            c.len(),
+            String::from_utf8_lossy(&c)
+        );
     }
 }

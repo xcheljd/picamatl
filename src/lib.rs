@@ -530,9 +530,7 @@ fn collect_placements(doc: &Document) -> HashMap<ObjectId, (f32, f32)> {
         if names.is_empty() {
             continue;
         }
-        let Ok(content_bytes) = doc.get_page_content(page_id) else {
-            continue;
-        };
+        let content_bytes = doc.get_page_content(page_id);
         let Ok(content) = Content::decode(&content_bytes) else {
             continue;
         };

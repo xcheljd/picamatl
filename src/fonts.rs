@@ -1973,8 +1973,8 @@ mod tests {
         let pre_page = *pre.get_pages().get(&1).unwrap();
         let post_page = *post.get_pages().get(&1).unwrap();
         assert_eq!(
-            pre.get_page_content(pre_page).unwrap(),
-            post.get_page_content(post_page).unwrap(),
+            pre.get_page_content(pre_page),
+            post.get_page_content(post_page),
             "content stream must be byte-identical"
         );
 
@@ -2504,8 +2504,8 @@ mod tests {
         let pre_page = *pre.get_pages().get(&1).unwrap();
         let post_page = *post.get_pages().get(&1).unwrap();
         assert_eq!(
-            pre.get_page_content(pre_page).unwrap(),
-            post.get_page_content(post_page).unwrap(),
+            pre.get_page_content(pre_page),
+            post.get_page_content(post_page),
             "content stream must be byte-identical"
         );
 

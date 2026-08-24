@@ -20,7 +20,7 @@ targets = ["x86_64-unknown-linux-gnu"]
 # Hard ceiling: 0.43 and 0.44 do not compile against current `time` (their
 # datetime.rs calls FormatItem::StringLiteral, removed in time 0.3.47).
 # Re-test the bump when lopdf publishes a release that fixes this.
-lopdf = "0.42"
+lopdf = "0.44"
 image = { version = "0.25", default-features = false, features = ["jpeg"] }
 mozjpeg = "0.10"
 # Re-deflating downsampled FlateDecode images at a controlled level (9) with
