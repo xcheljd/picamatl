@@ -38,7 +38,6 @@ def jpegtran(path):
         best = len(raw)
         for args in (
             ["jpegtran", "-optimize", "-copy", "none"],
-            ["jpegtran", "-optimize", "-progressive", "-copy", "none"],
         ):
             try:
                 r = subprocess.run(args, input=raw, capture_output=True, check=True)
@@ -141,6 +140,10 @@ def icc(path):
     tot = 0
     for o in pdf.objects:
         if not isinstance(o, pikepdf.Stream) or "/N" not in o:
+            continue
+        dec = bytes(o.read_bytes())
+        # /N also means "object count" on an ObjStm; require the ICC 'acsp' tag.
+        if len(dec) < 40 or dec[36:40] != b"acsp":
             continue
         d = bytes(o.read_raw_bytes())
         tot += len(d)
