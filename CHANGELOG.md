@@ -8,6 +8,41 @@ and this project adheres to
 
 ## [Unreleased]
 
+### Fixed
+
+- **CMYK/YCCK JPEGs were re-encoded to RGB under an unchanged `/DeviceCMYK`
+  `/ColorSpace`.** `decode_jpeg_scaled` declined four-component payloads, but
+  every caller then fell back to the general-purpose `image` decoder, which
+  does *not* decline — it converts CMYK to RGB. The three resulting channels
+  were written back into a stream whose dict still declared four, producing a
+  corrupt page. Reproduced on `corpus-expanded/cmyk-jpeg.pdf`: rendered
+  through Ghostscript, the old output differed from the original by up to 251
+  levels across 5.8% of the page, confined exactly to the image bounding box.
+
+  Four-component streams now take a dedicated end-to-end path — decode to raw
+  CMYK samples with libjpeg's explicit `JCS_CMYK` output, resample all four
+  channels with the same Lanczos3 kernel the RGB path uses, re-encode as YCCK
+  with libjpeg writing the Adobe APP14 marker itself. Everything stays in raw
+  stored-sample space, so amatl never parses APP14 and never inverts or
+  reorders a channel: whatever ink convention the input used, the output uses
+  the same one. Verification is per-channel (the shared MAD ceiling of 96
+  cannot catch a four-channel swap — a C/K swap pools to 29), truncated
+  streams are caught structurally rather than trusted to libjpeg's lenient
+  grey-fill "repair", and any `/Decode` array declines the stream. A
+  dict/payload cross-check (found by a byte-mutation sweep) additionally
+  declines any `/DCTDecode` image whose declared colour-space component count
+  disagrees with its frame header where four components are involved —
+  including a frame header too damaged to read under a four-component colour
+  space.
+
+  This is not new consent surface: CMYK images take the same default-on
+  downsample and requant paths RGB images already took, under the same
+  quality, never-larger and 5%-minimum guards. The correctness fix costs size
+  on the one affected corpus file (76.7% → 78.2% lossless, 65.9% → 67.4%
+  kitchen sink); the old numbers were bought with the corruption above. RGB
+  and grayscale output is byte-for-byte identical on every other corpus file.
+  See [`docs/CMYK-JPEG.md`](docs/CMYK-JPEG.md).
+
 ### Added
 
 - **JPEG Huffman-table re-optimization, on by default, strictly lossless.**
@@ -20,7 +55,8 @@ and this project adheres to
   `SOF`, `DRI` and the `SOS` headers are copied verbatim, restart markers
   keep their MCU boundaries). Because it is bit-exact it needs no consent
   flag. The headroom is in JPEGs the image path passes through untouched —
-  above all CMYK/Separation payloads it declines to re-encode:
+  above all the `/Decode`-carrying CMYK and Separation payloads it declines to
+  re-encode:
   irs-1040gi 4,158,663 → 4,104,994 (−53,669 B, −1.3%). Streams amatl
   re-encoded itself carry mozjpeg's already-optimal tables and decline.
   Scope is baseline/extended sequential Huffman frames at 8-bit precision;

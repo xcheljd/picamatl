@@ -295,9 +295,9 @@ settings as above:
 | Pipeline | arxiv-gpt4 | census | cmyk-jpeg | irs-w2 | nist-sp800 | wiki | TOTAL |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | input | 5,245,564 B | 545,684 B | 374,080 B | 2,150,352 B | 1,480,377 B | 2,196,261 B | 11,992,318 B |
-| **amatl lossless** | 39.6% | **52.3%** | 76.7% | 88.4% | **58.6%** | 48.5% | 54.1% |
-| + `--strip-accessibility` | 33.1% | 43.2% | 76.7% | 84.7% | 53.2% | **26.0%** | 45.4% |
-| kitchen sink | 32.2% | **35.9%** | **65.9%** | 82.9% | **39.7%** | **22.8%** | 41.7% |
+| **amatl lossless** | 39.6% | **52.3%** | 78.2% | 88.4% | **58.6%** | 48.5% | 54.1% |
+| + `--strip-accessibility` | 33.1% | 43.2% | 78.2% | 84.7% | 53.2% | **26.0%** | 45.4% |
+| kitchen sink | 32.2% | **35.9%** | 67.4% | 82.9% | **39.7%** | **22.8%** | 41.7% |
 | Ghostscript forced lossy | **28.4%** | 60.0% | 4.6%* | **8.8%*** | 70.1% | 37.1% | **32.3%** |
 
 \* Not a fair fight — see below.
@@ -318,9 +318,18 @@ Findings from this sweep:
   is by contract, gs's is silent.
 - **cmyk-jpeg is the mirror image:** a 374 KB file whose payload is one large
   CMYK JPEG. Ghostscript's 4.6% comes from re-compressing that single image
-  into submission; amatl's conservative CMYK fallback path declines it, so
-  65.9% is its floor here. This is the known CMYK limitation documented under
-  Scope — on the roadmap only as a verified-safe decode path.
+  into submission; amatl re-encodes it as YCCK at `jpeg_quality`, which is a
+  far more conservative trade, so 67.4% is its floor here.
+
+  These two cells got *worse* than the numbers first published for this
+  corpus (76.7% and 65.9%), and the correction is worth stating plainly: the
+  old numbers were bought with a **corrupt page**. The pre-0.3.2 CMYK
+  "fallback" did not decline as the text here claimed — it decoded the image
+  to RGB and wrote three channels back under a `/ColorSpace` that still said
+  `/DeviceCMYK`. Rendered through Ghostscript, the old output differed from
+  the original by up to 251 levels across 5.8% of the page, exactly the image
+  bounding box. Full analysis and the cross-decoder verification are in
+  [`docs/CMYK-JPEG.md`](docs/CMYK-JPEG.md).
 - **Everywhere else amatl wins or ties:** census brief (35.9% vs 60.0%) —
   vector charts plus fonts respond to subsetting and Type1→CFF conversion;
   NIST SP 800-63B (39.7% vs 70.1%); the Wikipedia render collapses to 22.8%
@@ -355,8 +364,10 @@ Amatl exists because shelling out to `gs` was evaluated and rejected:
 ## Scope
 
 Amatl currently optimizes baseline-JPEG (`DCTDecode`) images without soft
-masks, in RGB or grayscale (CMYK/YCCK decode through a conservative fallback
-path), and — since 0.2.0 — 8-bit `FlateDecode` raster images in
+masks, in RGB, grayscale, or CMYK/YCCK (four-component payloads are resampled
+in native CMYK space and re-encoded as YCCK, never converted to RGB; streams
+carrying a `/Decode` array are declined — see
+[`docs/CMYK-JPEG.md`](docs/CMYK-JPEG.md)), and — since 0.2.0 — 8-bit `FlateDecode` raster images in
 DeviceRGB/DeviceGray/ICCBased(N=1,3), downsampled in place with the format and
 color space preserved. Flate images that are Indexed, 1/2/4/16-bit,
 soft-masked, `/Decode`-remapped, or TIFF-predicted are deliberately left
