@@ -21,3 +21,14 @@ which side is authoritative (compare object bytes w/ original) + full-file count
 lopdf 0.42.0 src/writer.rs:175 -> `index: index_in_stream as u16` (hardcoded),
 written as u16 BE with /W [1 4 2] (writer.rs ~226,462-463). ObjStm indices
 >=65536 wrap silently. amatl bug = trusting upstream width for huge ObjStms.
+
+## FIX (t+12min): cap max_objects_per_stream at 65_535
+src/lib.rs pack_and_save(): 100_000_000 -> 65_535. lopdf starts a fresh ObjStm
+when the cap is hit, so every type-2 index fits its 2-byte /W field.
+Output now has 2 ObjStms; full audit of all 116,800 type-2 entries: 0 mismatches.
+GATES (pdftoppm -r 72, cmp/magick AE vs corpus/adobe-spec.pdf):
+  page 19: IDENTICAL   page 84: IDENTICAL
+  page 752: 195 px diff — byte-for-byte same residual as main-adobe.pdf,
+            i.e. caused by another optimizer pass, NOT the xref bug.
+Committed on fix/xref-prev. Upstream-worthy: lopdf writer.rs should widen W or
+assert index < 65536.

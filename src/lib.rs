@@ -3989,7 +3989,14 @@ fn pack_and_save(doc: &mut Document) -> Result<Vec<u8>, lopdf::Error> {
     let options = lopdf::SaveOptions::builder()
         .use_object_streams(true)
         .use_xref_streams(true)
-        .max_objects_per_stream(100_000_000)
+        // Cap objects per stream at 65_535: lopdf writes each xref type-2 entry's
+        // object-stream index as a u16 (`writer.rs`: `index_in_stream as u16`) under
+        // /W[1 4 2]. A stream packing more than 65_535 objects wraps its higher
+        // indices mod 2^16, silently pointing xref entries at the wrong objects
+        // (51_264 wrong entries on the 756-page Adobe spec corpus). lopdf starts a
+        // new ObjStm whenever this cap is reached, so every index stays
+        // representable in the 2-byte /W field.
+        .max_objects_per_stream(65_535)
         .compression_level(9)
         .build();
     let mut out: Vec<u8> = Vec::new();
