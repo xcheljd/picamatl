@@ -5009,6 +5009,83 @@ mod tests {
         assert_eq!(twice, out, "second pass must be byte-stable");
     }
 
+    /// Mean absolute difference between a reference RGB buffer and a JPEG's
+    /// decode-back, in 0..=255 units — the quantity `decode_back_matches`
+    /// thresholds against `DECODE_BACK_MAX_MAD`.
+    fn jpeg_mad(jpeg: &[u8], reference: &[u8], w: u32, h: u32) -> f64 {
+        let (decoded, _) = decode_jpeg(jpeg, w, h).expect("candidate must decode");
+        let actual = decoded.to_rgb8().into_raw();
+        assert_eq!(actual.len(), reference.len());
+        let sad: u64 = reference
+            .iter()
+            .zip(&actual)
+            .map(|(a, b)| u64::from(a.abs_diff(*b)))
+            .sum();
+        sad as f64 / reference.len() as f64
+    }
+
+    /// HUNT4 item 11 — is the "retry at a higher quality after a MAD decline"
+    /// ladder reachable at all?
+    ///
+    /// Feeds the encoder the worst case a JPEG can be handed: per-channel
+    /// independent uniform noise, which has no spatial correlation for the DCT
+    /// to exploit. Two facts get pinned down:
+    ///
+    /// 1. even here the q78 MAD lands *far* below `DECODE_BACK_MAX_MAD`, so no
+    ///    real image can trip the guard — the ladder has no reachable trigger;
+    /// 2. the ladder's *premise* is still sound: at a threshold between the two
+    ///    measured MADs, q78 declines where q90 passes. The mechanism works;
+    ///    it simply never fires at the shipped ceiling.
+    #[test]
+    fn lossy_quality_ladder_has_no_reachable_trigger() {
+        let (w, h) = (128u32, 128u32);
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut pixels = Vec::with_capacity((w * h * 3) as usize);
+        for _ in 0..w * h * 3 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            pixels.push((state >> 33) as u8);
+        }
+        let img = |p: &Vec<u8>| {
+            DynamicImage::ImageRgb8(image::RgbImage::from_raw(w, h, p.clone()).unwrap())
+        };
+        let q78 = encode_jpeg(img(&pixels), false, 78).expect("q78 must encode");
+        let q90 = encode_jpeg(img(&pixels), false, 90).expect("q90 must encode");
+
+        let mad78 = jpeg_mad(&q78, &pixels, w, h);
+        let mad90 = jpeg_mad(&q90, &pixels, w, h);
+
+        eprintln!("HUNT4 item 11: noise q78 MAD {mad78:.2}, q90 MAD {mad90:.2}, ceiling {DECODE_BACK_MAX_MAD}");
+        // (1) The shipped ceiling is unreachable: pure noise still passes.
+        assert!(
+            mad78 < DECODE_BACK_MAX_MAD,
+            "adversarial noise must still pass the shipped MAD ceiling \
+             (q78 MAD {mad78:.1} vs ceiling {DECODE_BACK_MAX_MAD}) — if this \
+             ever fails, the ladder has become reachable and is worth building"
+        );
+        assert!(
+            decode_back_matches(&q78, &pixels, false, w, h, DECODE_BACK_MAX_MAD),
+            "the guard itself must agree"
+        );
+
+        // (2) The ladder would work if a decline existed: pick a threshold
+        // between the two MADs and watch q78 fail where q90 passes.
+        assert!(
+            mad90 < mad78,
+            "higher quality must reduce MAD (q90 {mad90:.1} vs q78 {mad78:.1})"
+        );
+        let between = f64::midpoint(mad90, mad78);
+        assert!(
+            !decode_back_matches(&q78, &pixels, false, w, h, between),
+            "forced-decline scenario: q78 must fail at MAD {between:.1}"
+        );
+        assert!(
+            decode_back_matches(&q90, &pixels, false, w, h, between),
+            "forced-decline scenario: q90 must pass at MAD {between:.1}"
+        );
+    }
+
     #[test]
     fn lossy_reencode_over_resolution_jpeg_candidate_competes() {
         // Flag on, over-resolution photographic image (400 px into 100 pt ≈
