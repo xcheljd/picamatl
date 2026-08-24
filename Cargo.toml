@@ -17,10 +17,11 @@ rust-version = "1.88.0"
 targets = ["x86_64-unknown-linux-gnu"]
 
 [dependencies]
-# Hard ceiling: 0.43 and 0.44 do not compile against current `time` (their
-# datetime.rs calls FormatItem::StringLiteral, removed in time 0.3.47).
-# Re-test the bump when lopdf publishes a release that fixes this.
-lopdf = "0.44"
+# Verified 2026-08-24: lopdf 0.44 compiles clean against time 0.3.55 (the old
+# FormatItem::StringLiteral break is gone), and with default-features off the
+# chrono/jiff/time datetime backends drop out of the tree entirely. amatl never
+# parses PDF datetimes itself, and corpus outputs are byte-identical either way.
+lopdf = { version = "0.44", default-features = false }
 image = { version = "0.25", default-features = false, features = ["jpeg"] }
 mozjpeg = "0.10"
 # Re-deflating downsampled FlateDecode images at a controlled level (9) with
