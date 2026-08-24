@@ -49,7 +49,8 @@ use lopdf::{dictionary, Dictionary, Document, Object, ObjectId, Stream};
 use subsetter::GlyphRemapper;
 
 use crate::{
-    cffmerge, deflate_level9, encodings, inflate_capped, resolve, truetype, type1, FilterClass,
+    cffhint, cffmerge, deflate_level9, encodings, inflate_capped, resolve, truetype, type1,
+    FilterClass,
 };
 
 /// Recursion bound for the form/pattern/Type3 walk (depth of nested streams).
@@ -416,6 +417,89 @@ pub(crate) fn plan_type1c_merges(doc: &Document) -> Vec<T1cMergePlan> {
         });
     }
     plans
+}
+
+/// Strip Type2 hints from every `Type1C` font program in the document
+/// (opt-in, under `--strip-hinting`).
+///
+/// Unlike the planners around it this runs *after* the font plans have been
+/// applied, over the document's final `/FontFile3` streams, so it covers
+/// programs this run produced — union merges and Type1 → Type1C conversions —
+/// as well as ones no other pass touched.
+///
+/// It needs no plan and no reference-count analysis because a hint strip is
+/// PDF-side inert: glyph names, glyph order, advance widths, `/Encoding`,
+/// `/Widths` and `/ToUnicode` are all unchanged, so every font dictionary
+/// pointing at a stream — however many there are — keeps resolving each code
+/// to the same outline. What changes is only how a rasterizer grid-fits that
+/// outline at small ppem, which is exactly the consent `--strip-hinting`
+/// already carries.
+///
+/// Per-program fail-safe: [`cffhint::strip_hints`] verifies the rewritten
+/// program traces glyph-for-glyph identically to the original and is strictly
+/// smaller; anything else leaves that stream exactly as it was.
+pub(crate) fn strip_type1c_hints(doc: &mut Document) {
+    if doc.is_encrypted() || pdfa_blocked(doc) {
+        return;
+    }
+    let mut ids: Vec<ObjectId> = doc.objects.keys().copied().collect();
+    ids.sort_unstable();
+    let mut rewrites: Vec<(ObjectId, Vec<u8>)> = Vec::new();
+    for id in ids {
+        let Ok(Object::Stream(stream)) = doc.get_object(id) else {
+            continue;
+        };
+        if !matches!(
+            stream.dict.get(b"Subtype").map(|o| resolve(doc, o)),
+            Ok(Object::Name(n)) if n == b"Type1C"
+        ) {
+            continue;
+        }
+        let Some(bytes) = strict_stream_bytes(doc, stream) else {
+            continue;
+        };
+        // The Private DICT hinting keys (`BlueValues` and friends) describe
+        // nothing once the charstring hints are gone, so they go too.
+        let Some(stripped) = cffhint::strip_hints(&bytes, true) else {
+            continue;
+        };
+        let Some(deflated) = deflate_level9(&stripped) else {
+            continue;
+        };
+        if deflated.len() >= stream.content.len() {
+            continue;
+        }
+        rewrites.push((id, deflated));
+    }
+    for (id, content) in rewrites {
+        if let Ok(Object::Stream(stream)) = doc.get_object_mut(id) {
+            stream
+                .dict
+                .set("Filter", Object::Name(b"FlateDecode".to_vec()));
+            stream.dict.remove(b"DecodeParms");
+            stream.set_content(content);
+        }
+    }
+}
+
+/// True when at least one `Type1C` program in the document has strippable
+/// hints. Read-only; used only to answer "is there any work at all" for a
+/// document nothing else touches. Stops at the first program that strips.
+pub(crate) fn any_type1c_hint_work(doc: &Document) -> bool {
+    if doc.is_encrypted() || pdfa_blocked(doc) {
+        return false;
+    }
+    doc.objects.values().any(|obj| {
+        let Object::Stream(stream) = obj else {
+            return false;
+        };
+        matches!(
+            stream.dict.get(b"Subtype").map(|o| resolve(doc, o)),
+            Ok(Object::Name(n)) if n == b"Type1C"
+        ) && strict_stream_bytes(doc, stream)
+            .and_then(|b| cffhint::strip_hints(&b, true))
+            .is_some()
+    })
 }
 
 /// Apply planned Type1C family merges. Each plan is independent.

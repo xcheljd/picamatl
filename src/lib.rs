@@ -56,6 +56,7 @@
 //!   - Any failure (parse, decode, save) falls back to the original bytes.
 
 mod bitonal;
+mod cffhint;
 mod cffmerge;
 mod encodings;
 mod fonts;
@@ -190,13 +191,29 @@ pub struct OptimizeOptions {
     /// Default: `false` (opt-in for at least one release cycle).
     pub convert_type1: bool,
 
-    /// Strip TrueType hinting from subsetted font programs: the `fpgm`,
-    /// `prep`, and `cvt ` tables plus every per-glyph instruction block.
-    /// Outlines, metrics, and character mappings are untouched, but hinted
-    /// rasterization at small sizes can change (modern viewers largely ignore
-    /// hinting; classic Windows GDI paths do not), so this is NOT covered by
-    /// the pixel-identity contract and is strictly opt-in. Only takes effect
-    /// where `subset_fonts` already rewrites the program. Default: `false`.
+    /// Strip font hinting.
+    ///
+    /// For TrueType (`/FontFile2`) subsets: the `fpgm`, `prep`, and `cvt `
+    /// tables plus every per-glyph instruction block. Only takes effect where
+    /// `subset_fonts` already rewrites the program.
+    ///
+    /// For Type1C / CFF (`/FontFile3`) programs: the Type2 hint operators
+    /// (`hstem`, `vstem`, `hstemhm`, `vstemhm`, `hintmask`, `cntrmask`) and
+    /// their operands, plus the Private DICT hinting parameters
+    /// (`BlueValues`, `StemSnap*`, …) that describe nothing once they are
+    /// gone. This one applies to *every* Type1C program in the document,
+    /// including the ones this run produced by union-merging fragments or
+    /// converting Type1 — a hint strip changes no glyph name, glyph order, or
+    /// advance width, so it is inert to every font dictionary pointing at the
+    /// program. Coordinates are never re-encoded: charstrings are rewritten
+    /// token by token and each glyph's outline and advance are re-verified
+    /// from the emitted bytes.
+    ///
+    /// In both cases outlines, metrics, and character mappings are untouched,
+    /// but hinted rasterization at small sizes can change (modern viewers
+    /// largely ignore hinting; classic Windows GDI paths do not), so this is
+    /// NOT covered by the pixel-identity contract and is strictly opt-in.
+    /// Default: `false`.
     pub strip_hinting: bool,
 
     /// Losslessly recompress bitonal (1-bit) images to CCITT G4: CCITT-stored
@@ -3332,6 +3349,10 @@ fn try_optimize(input: &[u8], options: OptimizeOptions) -> Result<Option<Vec<u8>
         // JPEGs with unoptimized Huffman tables is a real win, not a
         // serialization detail, and must not be declined.
         && !any_jpeg_huffman_work(&doc)
+        // Same story for the opt-in Type1C hint strip: it is real work, and
+        // it is the only thing that happens in a `--strip-hinting` run over a
+        // document whose fonts nothing else qualifies to touch.
+        && !(options.strip_hinting && fonts::any_type1c_hint_work(&doc))
     {
         return Ok(None);
     }
@@ -3453,6 +3474,14 @@ fn try_optimize(input: &[u8], options: OptimizeOptions) -> Result<Option<Vec<u8>
 
     fonts::apply_font_subsets(&mut doc, font_plans);
     fonts::apply_type1c_merges(&mut doc, t1c_merge_plans);
+
+    // Type1C (CFF) hint stripping, under the same `--strip-hinting` consent as
+    // the TrueType path. Runs after the font plans are applied so it also
+    // covers the programs this run just produced — union merges and
+    // Type1 → Type1C conversions — not only the ones nothing else touched.
+    if options.strip_hinting {
+        fonts::strip_type1c_hints(&mut doc);
+    }
 
     // Optionally strip the PDF's structure tree (accessibility metadata). This
     // is what Ghostscript's /ebook and /screen presets do silently: removes

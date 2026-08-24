@@ -37,6 +37,26 @@ and this project adheres to
 
 ### Changed
 
+- **`strip_hinting` (`--strip-hinting`) now covers Type1C (CFF) fonts too.**
+  The flag used to be TrueType-only. It now also removes the Type2 hint
+  operators (`hstem`, `vstem`, `hstemhm`, `vstemhm`, `hintmask`, `cntrmask`)
+  and their operands from every `/FontFile3` `/Subtype /Type1C` program —
+  including ones the same run produced by union-merging fragments or
+  converting Type1 — plus the Private DICT hinting parameters (`BlueValues`,
+  `StemSnap*`, …) that describe nothing once the charstring hints are gone.
+  Charstrings are rewritten token by token: coordinate deltas are spliced
+  through in their original encoding, no outline is re-encoded and no
+  subroutine is inlined or dropped, and each glyph's outline and advance are
+  re-verified from the *emitted* bytes before the program is accepted. Glyph
+  names, glyph order and advance widths never change, so the strip is inert to
+  every font dictionary pointing at the program. Measured over 80 corpus
+  Type1C programs: 77 stripped, 3 declined (they carry no hints), 2,393 glyphs
+  outline-verified, 0 mismatches. With `--strip-hinting --convert-type1`:
+  adobe-spec −22,419 B, irs-1040gi −7,263 B, arxiv-attention −6,167 B
+  (−35,849 B total, of which −3,213 B is the Private DICT keys). Same consent
+  as before — hinted rasterization at small sizes can change — but the flag's
+  scope is wider, so re-read it if you had assumed TrueType-only.
+
 - **Duplicate TrueType subsets now dedup.** After subsetting, several embeds
   of the same subset of the same font differ only in the six-letter `ABCDEF+`
   subset tag inside the `name` table and the `head.checkSumAdjustment` it

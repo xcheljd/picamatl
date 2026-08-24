@@ -1,9 +1,16 @@
 #!/usr/bin/env python3
-"""hunt5 gates for one file: render identity against a reference output,
+"""hunt5 gates for one file: render comparison against a reference output,
 pdftotext equality, second-pass idempotence, and (optionally) a Ghostscript
 nullpage interpretation.
 
-Usage: python3 scripts/h5_gates.py <ref.pdf> <new.pdf> [--gs] [--dpi 72]
+Usage:
+  python3 scripts/h5_gates.py <ref.pdf> <new.pdf> [--gs] [--dpi 72]
+                              [--pass2-flags "--strip-hinting ..."]
+
+The render check reports per-page hash equality *and*, when hashes differ,
+the fraction of differing pixels and the maximum channel delta -- hint
+stripping legitimately changes rasterization, so identity is the gate for the
+lossless passes and magnitude is the report for the opt-in one.
 """
 import hashlib
 import os
@@ -16,6 +23,9 @@ use_gs = "--gs" in sys.argv
 dpi = "72"
 if "--dpi" in sys.argv:
     dpi = sys.argv[sys.argv.index("--dpi") + 1]
+pass2_flags = []
+if "--pass2-flags" in sys.argv:
+    pass2_flags = sys.argv[sys.argv.index("--pass2-flags") + 1].split()
 
 
 def render(path, out_prefix):
@@ -27,10 +37,12 @@ def render(path, out_prefix):
     d = os.path.dirname(out_prefix)
     base = os.path.basename(out_prefix)
     return [
-        hashlib.sha1(open(os.path.join(d, f), "rb").read()).hexdigest()
-        for f in sorted(os.listdir(d))
-        if f.startswith(base)
+        os.path.join(d, f) for f in sorted(os.listdir(d)) if f.startswith(base)
     ]
+
+
+def digest(paths):
+    return [hashlib.sha1(open(p, "rb").read()).hexdigest() for p in paths]
 
 
 def text(path):
@@ -40,20 +52,40 @@ def text(path):
 
 
 with tempfile.TemporaryDirectory() as td:
-    a = render(ref, os.path.join(td, "a"))
-    b = render(new, os.path.join(td, "b"))
+    pa = render(ref, os.path.join(td, "a"))
+    pb = render(new, os.path.join(td, "b"))
+    a, b = digest(pa), digest(pb)
     print(f"render: {len(a)} vs {len(b)} pages, identical = {a == b}")
     if a != b:
-        for i, (x, y) in enumerate(zip(a, b)):
-            if x != y:
-                print(f"  first mismatch on page {i + 1}")
-                break
+        try:
+            from PIL import Image, ImageChops
+
+            worst_frac = worst_max = 0.0
+            differing = 0
+            for x, y, px, py in zip(a, b, pa, pb):
+                if x == y:
+                    continue
+                differing += 1
+                ia = Image.open(px).convert("L")
+                ib = Image.open(py).convert("L")
+                diff = ImageChops.difference(ia, ib)
+                hist = diff.histogram()
+                n = sum(hist)
+                frac = 1.0 - hist[0] / n
+                worst_frac = max(worst_frac, frac)
+                worst_max = max(worst_max, max(i for i, c in enumerate(hist) if c))
+            print(
+                f"  {differing}/{len(a)} pages differ; worst page "
+                f"{worst_frac * 100:.3f}% of pixels, max channel delta {worst_max:.0f}"
+            )
+        except ImportError:
+            print("  (install Pillow for a magnitude report)")
     print(f"pdftotext identical = {text(ref) == text(new)}")
 
     # Second pass: running amatl again must not change the bytes.
     p2 = os.path.join(td, "pass2.pdf")
     subprocess.run(
-        ["./target/release/amatl", *sys.argv[3:][:0], new, "-o", p2],
+        ["./target/release/amatl", *pass2_flags, new, "-o", p2],
         check=True,
         capture_output=True,
     )

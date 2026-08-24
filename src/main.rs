@@ -132,11 +132,12 @@ struct Cli {
     #[arg(long)]
     no_convert_type1: bool,
 
-    /// Strip TrueType hinting from subsetted fonts (rasterization-lossy at
-    /// small sizes; strictly opt-in)
+    /// Strip hinting: TrueType instructions from subsetted fonts, and Type2
+    /// hints from every Type1C (CFF) program (rasterization-lossy at small
+    /// sizes; strictly opt-in)
     #[arg(long, overrides_with = "no_strip_hinting")]
     strip_hinting: bool,
-    /// Keep TrueType hinting in subsetted fonts
+    /// Keep TrueType and Type1C hinting
     #[arg(long)]
     no_strip_hinting: bool,
 

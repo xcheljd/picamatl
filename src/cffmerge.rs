@@ -68,12 +68,12 @@ struct Fragment {
     builtin_empty: bool,
 }
 
-fn be16(d: &[u8], off: usize) -> Option<u16> {
+pub(crate) fn be16(d: &[u8], off: usize) -> Option<u16> {
     Some(u16::from_be_bytes([*d.get(off)?, *d.get(off + 1)?]))
 }
 
 /// Read a CFF INDEX at `pos`; returns (items, next offset).
-fn read_index(data: &[u8], pos: usize) -> Option<(Vec<Vec<u8>>, usize)> {
+pub(crate) fn read_index(data: &[u8], pos: usize) -> Option<(Vec<Vec<u8>>, usize)> {
     let count = usize::from(be16(data, pos)?);
     if count == 0 {
         return Some((Vec::new(), pos + 2));
@@ -109,13 +109,13 @@ fn read_index(data: &[u8], pos: usize) -> Option<(Vec<Vec<u8>>, usize)> {
 
 /// One parsed DICT entry: operator, numeric operands, and the raw byte span
 /// of the operands + operator (for verbatim splicing).
-struct DictEntry {
-    op: u16,
-    operands: Vec<f64>,
-    span: (usize, usize),
+pub(crate) struct DictEntry {
+    pub(crate) op: u16,
+    pub(crate) operands: Vec<f64>,
+    pub(crate) span: (usize, usize),
 }
 
-fn parse_dict(data: &[u8]) -> Option<Vec<DictEntry>> {
+pub(crate) fn parse_dict(data: &[u8]) -> Option<Vec<DictEntry>> {
     let mut out = Vec::new();
     let mut operands: Vec<f64> = Vec::new();
     let mut i = 0usize;
@@ -200,7 +200,7 @@ fn parse_dict(data: &[u8]) -> Option<Vec<DictEntry>> {
     }
 }
 
-fn dict_get(dict: &[DictEntry], op: u16) -> Option<&DictEntry> {
+pub(crate) fn dict_get(dict: &[DictEntry], op: u16) -> Option<&DictEntry> {
     dict.iter().find(|e| e.op == op)
 }
 
