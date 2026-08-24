@@ -347,26 +347,36 @@ pub(crate) fn mask_subset_tags(font: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// Splice `subtables` into `font` as its `cmap`, rebuilding the table
-/// directory, per-table checksums, and `head.checkSumAdjustment`. Replaces
-/// any existing `cmap`. `None` on any structural doubt about the input.
-pub(crate) fn insert_cmap(font: &[u8], subtables: &[CmapSubtable]) -> Option<Vec<u8>> {
+/// An sfnt table: (tag, body).
+type SfntTable = ([u8; 4], Vec<u8>);
+
+/// Read every top-level table out of a single (non-collection) sfnt.
+fn parse_tables(font: &[u8]) -> Option<(u32, Vec<SfntTable>)> {
     let sfnt_version = be32(font, 0)?;
     let count = usize::from(be16(font, 4)?);
-    let mut tables: Vec<([u8; 4], Vec<u8>)> = Vec::with_capacity(count + 1);
+    let mut tables: Vec<SfntTable> = Vec::with_capacity(count + 1);
     for i in 0..count {
         let rec = 12 + i * 16;
         let tag: [u8; 4] = font.get(rec..rec + 4)?.try_into().ok()?;
         let off = be32(font, rec + 8)? as usize;
         let len = be32(font, rec + 12)? as usize;
-        if &tag == b"cmap" {
-            continue;
-        }
         tables.push((tag, font.get(off..off.checked_add(len)?)?.to_vec()));
     }
+    Some((sfnt_version, tables))
+}
+
+/// Splice `subtables` into `font` as its `cmap`, rebuilding the table
+/// directory, per-table checksums, and `head.checkSumAdjustment`. Replaces
+/// any existing `cmap`. `None` on any structural doubt about the input.
+pub(crate) fn insert_cmap(font: &[u8], subtables: &[CmapSubtable]) -> Option<Vec<u8>> {
+    let (sfnt_version, mut tables) = parse_tables(font)?;
+    tables.retain(|(tag, _)| tag != b"cmap");
     tables.push((*b"cmap", build_cmap_table(subtables)?));
     tables.sort_by_key(|(tag, _)| *tag);
+    assemble_sfnt(sfnt_version, tables)
+}
 
+fn assemble_sfnt(sfnt_version: u32, mut tables: Vec<SfntTable>) -> Option<Vec<u8>> {
     let num = tables.len();
     let floor_log2 = usize::BITS - 1 - num.leading_zeros();
     let search_range = 16u16 << floor_log2;
@@ -404,6 +414,165 @@ pub(crate) fn insert_cmap(font: &[u8], subtables: &[CmapSubtable]) -> Option<Vec
     let adjustment = 0xB1B0_AFBAu32.wrapping_sub(table_checksum(&out));
     out[head_offset + 8..head_offset + 12].copy_from_slice(&adjustment.to_be_bytes());
     Some(out)
+}
+
+// ---------------------------------------------------------------------------
+// Hinting removal (opt-in; changes rasterization at small sizes)
+// ---------------------------------------------------------------------------
+
+/// Strip TrueType hinting: drop the `fpgm`/`prep`/`cvt ` tables and every
+/// per-glyph instruction block, rebuilding `glyf`, `loca`, the directory
+/// checksums, and `head.checkSumAdjustment`.
+///
+/// Outlines, metrics, and mappings are untouched, but rasterization at small
+/// sizes can change — callers must gate this behind explicit consent.
+/// Returns `None` on structural doubt *and* when there is nothing to strip
+/// (so the caller keeps the original bytes in both cases, fail-safe).
+pub(crate) fn strip_hinting(font: &[u8]) -> Option<Vec<u8>> {
+    let (sfnt_version, mut tables) = parse_tables(font)?;
+    if sfnt_version != 0x0001_0000 && sfnt_version != u32::from_be_bytes(*b"true") {
+        return None; // only glyf-flavoured sfnts carry TrueType hinting
+    }
+    let get = |t: &[u8; 4]| tables.iter().position(|(tag, _)| tag == t);
+    let had_programs = get(b"fpgm").is_some() || get(b"prep").is_some() || get(b"cvt ").is_some();
+
+    let head_idx = get(b"head")?;
+    let loca_idx = get(b"loca")?;
+    let glyf_idx = get(b"glyf")?;
+    let maxp_idx = get(b"maxp")?;
+    let long_loca = match be16(&tables[head_idx].1, 50)? {
+        0 => false,
+        1 => true,
+        _ => return None,
+    };
+    let num_glyphs = usize::from(be16(&tables[maxp_idx].1, 4)?);
+
+    // Decode loca into byte offsets.
+    let loca = &tables[loca_idx].1;
+    let mut offsets = Vec::with_capacity(num_glyphs + 1);
+    for i in 0..=num_glyphs {
+        offsets.push(if long_loca {
+            be32(loca, i * 4)? as usize
+        } else {
+            usize::from(be16(loca, i * 2)?) * 2
+        });
+    }
+
+    // Rewrite each glyph without its instruction block.
+    let glyf = &tables[glyf_idx].1;
+    let mut new_glyf: Vec<u8> = Vec::with_capacity(glyf.len());
+    let mut new_offsets = Vec::with_capacity(num_glyphs + 1);
+    let mut stripped_any = false;
+    for w in offsets.windows(2) {
+        new_offsets.push(new_glyf.len());
+        let (start, end) = (w[0], w[1]);
+        if start > end {
+            return None;
+        }
+        let glyph = glyf.get(start..end)?;
+        if glyph.is_empty() {
+            continue; // empty glyph stays empty
+        }
+        let before = new_glyf.len();
+        strip_glyph_instructions(glyph, &mut new_glyf)?;
+        stripped_any |= new_glyf.len() - before != glyph.len();
+        // Both loca formats conventionally align glyphs; short loca requires
+        // even offsets.
+        new_glyf.resize(new_glyf.len().next_multiple_of(2), 0);
+    }
+    new_offsets.push(new_glyf.len());
+    if !had_programs && !stripped_any {
+        return None; // nothing to strip; keep the original bytes
+    }
+
+    // Re-encode loca in the original format (offsets only shrank, so a short
+    // loca stays representable; verify anyway).
+    let mut new_loca = Vec::with_capacity(new_offsets.len() * if long_loca { 4 } else { 2 });
+    for &off in &new_offsets {
+        if long_loca {
+            new_loca.extend_from_slice(&u32::try_from(off).ok()?.to_be_bytes());
+        } else {
+            new_loca.extend_from_slice(&u16::try_from(off / 2).ok()?.to_be_bytes());
+        }
+    }
+    tables[glyf_idx].1 = new_glyf;
+    tables[loca_idx].1 = new_loca;
+    // maxp instruction maxima are upper bounds; zero them now that no
+    // instructions remain (version 1.0 layout only).
+    let maxp = &mut tables[maxp_idx].1;
+    if be32(maxp, 0)? == 0x0001_0000 && maxp.len() >= 32 {
+        maxp[24..26].fill(0); // maxSizeOfInstructions
+    }
+    tables.retain(|(tag, _)| tag != b"fpgm" && tag != b"prep" && tag != b"cvt ");
+    assemble_sfnt(sfnt_version, tables)
+}
+
+/// Append `glyph` to `out` with its instruction block removed. Simple glyphs
+/// get `instructionLength = 0`; composite glyphs get WE_HAVE_INSTRUCTIONS
+/// cleared and the trailing block dropped. `None` on any structural doubt.
+fn strip_glyph_instructions(glyph: &[u8], out: &mut Vec<u8>) -> Option<()> {
+    let contours = i16::from_be_bytes([*glyph.first()?, *glyph.get(1)?]);
+    if contours >= 0 {
+        // Simple glyph: header (10) + endPtsOfContours + instructions + rest.
+        let end_pts = 10 + usize::from(contours as u16) * 2;
+        let instr_len = usize::from(be16(glyph, end_pts)?);
+        let rest = glyph.get(end_pts + 2 + instr_len..)?;
+        out.extend_from_slice(glyph.get(..end_pts)?);
+        out.extend_from_slice(&0u16.to_be_bytes());
+        out.extend_from_slice(rest);
+        return Some(());
+    }
+    if contours != -1 {
+        return None;
+    }
+    // Composite glyph: walk the component records.
+    const ARG_1_AND_2_ARE_WORDS: u16 = 0x0001;
+    const WE_HAVE_A_SCALE: u16 = 0x0008;
+    const MORE_COMPONENTS: u16 = 0x0020;
+    const WE_HAVE_AN_X_AND_Y_SCALE: u16 = 0x0040;
+    const WE_HAVE_A_TWO_BY_TWO: u16 = 0x0080;
+    const WE_HAVE_INSTRUCTIONS: u16 = 0x0100;
+
+    let base = out.len();
+    out.extend_from_slice(glyph.get(..10)?);
+    let mut pos = 10usize;
+    let mut have_instructions = false;
+    loop {
+        let flags = be16(glyph, pos)?;
+        have_instructions |= flags & WE_HAVE_INSTRUCTIONS != 0;
+        let mut len = 4 + if flags & ARG_1_AND_2_ARE_WORDS != 0 {
+            4
+        } else {
+            2
+        };
+        if flags & WE_HAVE_A_SCALE != 0 {
+            len += 2;
+        } else if flags & WE_HAVE_AN_X_AND_Y_SCALE != 0 {
+            len += 4;
+        } else if flags & WE_HAVE_A_TWO_BY_TWO != 0 {
+            len += 8;
+        }
+        let record_start = out.len();
+        out.extend_from_slice(glyph.get(pos..pos + len)?);
+        // Clear the instructions flag in the copied record.
+        let cleared = (flags & !WE_HAVE_INSTRUCTIONS).to_be_bytes();
+        out[record_start..record_start + 2].copy_from_slice(&cleared);
+        pos += len;
+        if flags & MORE_COMPONENTS == 0 {
+            break;
+        }
+    }
+    if have_instructions {
+        // Trailing instruction block: length + bytes; validate it fits.
+        let instr_len = usize::from(be16(glyph, pos)?);
+        glyph.get(pos + 2..pos + 2 + instr_len)?;
+    } else if pos != glyph.len() {
+        // Unexpected trailing bytes on a glyph that declared no instructions;
+        // keep them verbatim rather than guess.
+        out.truncate(base);
+        out.extend_from_slice(glyph);
+    }
+    Some(())
 }
 
 #[cfg(test)]
@@ -482,6 +651,39 @@ mod tests {
 
     fn contains_window(haystack: &[u8], needle: &[u8]) -> bool {
         haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    #[test]
+    fn simple_glyph_instructions_are_removed() {
+        // 1 contour, 2 points, 3 instruction bytes, then flags/coords.
+        let mut g = Vec::new();
+        g.extend_from_slice(&1i16.to_be_bytes());
+        g.extend_from_slice(&[0u8; 8]); // bbox
+        g.extend_from_slice(&1u16.to_be_bytes()); // endPts
+        g.extend_from_slice(&3u16.to_be_bytes()); // instructionLength
+        g.extend_from_slice(&[0xB0, 0x01, 0x21]); // instructions
+        g.extend_from_slice(&[0x01, 0x01, 5, 5, 5, 5]); // flags + coords
+        let mut out = Vec::new();
+        strip_glyph_instructions(&g, &mut out).unwrap();
+        assert_eq!(out.len(), g.len() - 3);
+        assert_eq!(&out[10 + 2..10 + 4], &0u16.to_be_bytes());
+        assert_eq!(&out[out.len() - 6..], &[0x01, 0x01, 5, 5, 5, 5]);
+    }
+
+    #[test]
+    fn composite_glyph_instruction_flag_is_cleared() {
+        let mut g = Vec::new();
+        g.extend_from_slice(&(-1i16).to_be_bytes());
+        g.extend_from_slice(&[0u8; 8]); // bbox
+        g.extend_from_slice(&0x0101u16.to_be_bytes()); // WORDS | INSTRUCTIONS
+        g.extend_from_slice(&7u16.to_be_bytes()); // glyphIndex
+        g.extend_from_slice(&[0u8; 4]); // word args
+        g.extend_from_slice(&2u16.to_be_bytes()); // instr length
+        g.extend_from_slice(&[0xB0, 0x00]);
+        let mut out = Vec::new();
+        strip_glyph_instructions(&g, &mut out).unwrap();
+        assert_eq!(out.len(), g.len() - 4);
+        assert_eq!(&out[10..12], &0x0001u16.to_be_bytes());
     }
 
     #[test]

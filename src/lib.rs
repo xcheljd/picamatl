@@ -188,6 +188,15 @@ pub struct OptimizeOptions {
     /// Default: `false` (opt-in for at least one release cycle).
     pub convert_type1: bool,
 
+    /// Strip TrueType hinting from subsetted font programs: the `fpgm`,
+    /// `prep`, and `cvt ` tables plus every per-glyph instruction block.
+    /// Outlines, metrics, and character mappings are untouched, but hinted
+    /// rasterization at small sizes can change (modern viewers largely ignore
+    /// hinting; classic Windows GDI paths do not), so this is NOT covered by
+    /// the pixel-identity contract and is strictly opt-in. Only takes effect
+    /// where `subset_fonts` already rewrites the program. Default: `false`.
+    pub strip_hinting: bool,
+
     /// Losslessly recompress bitonal (1-bit) images to CCITT G4: CCITT-stored
     /// sources (G4 `/K -1`, or EOL-framed G3 `/K 0` with `/EndOfLine true`)
     /// and Flate-stored 1-bit images. Pixels are never resampled and
@@ -275,6 +284,7 @@ impl Default for OptimizeOptions {
             downsample_flate_images: true,
             subset_fonts: true,
             convert_type1: false,
+            strip_hinting: false,
             recompress_bitonal_images: false,
             allow_lossy_reencode: false,
             collapse_gray_images: false,
@@ -351,6 +361,15 @@ impl OptimizeOptions {
     #[must_use]
     pub fn with_convert_type1(mut self, convert: bool) -> Self {
         self.convert_type1 = convert;
+        self
+    }
+
+    /// Set whether subsetted TrueType programs also lose their hinting
+    /// (off by default; not pixel-identical). See
+    /// [`OptimizeOptions::strip_hinting`].
+    #[must_use]
+    pub fn with_strip_hinting(mut self, strip: bool) -> Self {
+        self.strip_hinting = strip;
         self
     }
 
@@ -3239,7 +3258,12 @@ fn try_optimize(input: &[u8], options: OptimizeOptions) -> Result<Option<Vec<u8>
     // see src/fonts.rs for the eligibility posture). Applied further down,
     // after the image replacements.
     let font_plans = if options.subset_fonts || options.convert_type1 {
-        fonts::plan_font_subsets(&doc, options.subset_fonts, options.convert_type1)
+        fonts::plan_font_subsets(
+            &doc,
+            options.subset_fonts,
+            options.convert_type1,
+            options.strip_hinting,
+        )
     } else {
         Vec::new()
     };

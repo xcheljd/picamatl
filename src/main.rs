@@ -34,7 +34,7 @@ fn defaults_blurb() -> String {
          strip-accessibility {}, strip-metadata {},\n  \
          pack-object-streams {},\n  \
          downsample-flate-images {}, subset-fonts {},\n  \
-         convert-type1 {}, recompress-bitonal-images {},\n  \
+         convert-type1 {}, strip-hinting {}, recompress-bitonal-images {},\n  \
          allow-lossy {}, collapse-gray-images {}",
         on_off(d.strip_accessibility),
         on_off(d.strip_metadata),
@@ -42,6 +42,7 @@ fn defaults_blurb() -> String {
         on_off(d.downsample_flate_images),
         on_off(d.subset_fonts),
         on_off(d.convert_type1),
+        on_off(d.strip_hinting),
         on_off(d.recompress_bitonal_images),
         on_off(d.allow_lossy_reencode),
         on_off(d.collapse_gray_images),
@@ -130,6 +131,14 @@ struct Cli {
     /// Leave embedded Type1 fonts untouched
     #[arg(long)]
     no_convert_type1: bool,
+
+    /// Strip TrueType hinting from subsetted fonts (rasterization-lossy at
+    /// small sizes; strictly opt-in)
+    #[arg(long, overrides_with = "no_strip_hinting")]
+    strip_hinting: bool,
+    /// Keep TrueType hinting in subsetted fonts
+    #[arg(long)]
+    no_strip_hinting: bool,
 
     /// Losslessly recompress bitonal (1-bit) images to CCITT G4
     #[arg(long, overrides_with = "no_recompress_bitonal_images")]
@@ -222,6 +231,11 @@ fn options_from(cli: &Cli) -> OptimizeOptions {
             cli.convert_type1,
             cli.no_convert_type1,
             d.convert_type1,
+        ))
+        .with_strip_hinting(resolve(
+            cli.strip_hinting,
+            cli.no_strip_hinting,
+            d.strip_hinting,
         ))
         .with_recompress_bitonal_images(resolve(
             cli.recompress_bitonal_images,

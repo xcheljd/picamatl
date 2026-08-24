@@ -130,6 +130,7 @@ pub(crate) fn plan_font_subsets(
     doc: &Document,
     subset_fonts: bool,
     convert_type1: bool,
+    strip_hinting: bool,
 ) -> Vec<FontPlan> {
     if doc.is_encrypted() || pdfa_blocked(doc) {
         return Vec::new();
@@ -164,7 +165,17 @@ pub(crate) fn plan_font_subsets(
         .used
         .iter()
         .filter(|(id, cids)| !walker.ineligible.contains(id) && !cids.is_empty())
-        .filter_map(|(&id, cids)| plan_one(doc, id, cids, &refcounts, subset_fonts, convert_type1))
+        .filter_map(|(&id, cids)| {
+            plan_one(
+                doc,
+                id,
+                cids,
+                &refcounts,
+                subset_fonts,
+                convert_type1,
+                strip_hinting,
+            )
+        })
         .collect();
     // HashMap iteration order is arbitrary; sort so output is reproducible.
     plans.sort_by_key(FontPlan::font_id);
@@ -173,6 +184,7 @@ pub(crate) fn plan_font_subsets(
 
 /// Dispatch a used font to the planner matching its subtype (each planner
 /// gated by its own option).
+#[allow(clippy::too_many_arguments)]
 fn plan_one(
     doc: &Document,
     id: ObjectId,
@@ -180,14 +192,15 @@ fn plan_one(
     refcounts: &HashMap<ObjectId, usize>,
     subset_fonts: bool,
     convert_type1: bool,
+    strip_hinting: bool,
 ) -> Option<FontPlan> {
     let dict = doc.get_object(id).ok()?.as_dict().ok()?;
     match dict.get(b"Subtype").map(|s| resolve(doc, s)) {
         Ok(Object::Name(n)) if n == b"Type0" && subset_fonts => {
-            plan_one_font(doc, id, codes, refcounts).map(FontPlan::Cid)
+            plan_one_font(doc, id, codes, refcounts, strip_hinting).map(FontPlan::Cid)
         }
         Ok(Object::Name(n)) if n == b"TrueType" && subset_fonts => {
-            plan_one_simple_font(doc, id, codes, refcounts).map(FontPlan::Simple)
+            plan_one_simple_font(doc, id, codes, refcounts, strip_hinting).map(FontPlan::Simple)
         }
         Ok(Object::Name(n)) if n == b"Type1" && convert_type1 => {
             plan_one_type1_font(doc, id, codes, refcounts).map(FontPlan::Type1)
@@ -1108,6 +1121,7 @@ fn plan_one_font(
     type0_id: ObjectId,
     cids: &BTreeSet<u16>,
     refcounts: &HashMap<ObjectId, usize>,
+    strip_hinting: bool,
 ) -> Option<CidFontPlan> {
     let type0 = doc.get_object(type0_id).ok()?.as_dict().ok()?;
 
@@ -1172,6 +1186,11 @@ fn plan_one_font(
     let gid_list: Vec<u16> = gids.iter().copied().collect();
     let remapper = GlyphRemapper::new_from_glyphs_sorted(&gid_list);
     let subset = subsetter::subset(&font_bytes, 0, &remapper).ok()?;
+    let subset = if strip_hinting {
+        truetype::strip_hinting(&subset).unwrap_or(subset)
+    } else {
+        subset
+    };
     // Mask the producer's `name`-table subset tags so two identical subsets
     // of the same font become byte-equal and the stream dedup collapses them.
     let subset = truetype::mask_subset_tags(&subset).unwrap_or(subset);
@@ -1311,6 +1330,7 @@ fn plan_one_simple_font(
     font_id: ObjectId,
     codes: &BTreeSet<u16>,
     refcounts: &HashMap<ObjectId, usize>,
+    strip_hinting: bool,
 ) -> Option<SimpleFontPlan> {
     let font = doc.get_object(font_id).ok()?.as_dict().ok()?;
     // With /Widths present every shown glyph's advance comes from the PDF,
@@ -1430,6 +1450,11 @@ fn plan_one_simple_font(
         });
     }
     let final_font = truetype::insert_cmap(&subset, &new_subtables)?;
+    let final_font = if strip_hinting {
+        truetype::strip_hinting(&final_font).unwrap_or(final_font)
+    } else {
+        final_font
+    };
     // See the CID path: masking the `name`-table subset tags makes identical
     // subsets byte-equal so the stream dedup can share one program.
     let final_font = truetype::mask_subset_tags(&final_font).unwrap_or(final_font);
