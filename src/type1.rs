@@ -1131,7 +1131,7 @@ fn std_name(code: u8) -> Option<&'static [u8]> {
 // Type2 charstring emission
 // ---------------------------------------------------------------------------
 
-fn t2_number(out: &mut Vec<u8>, v: f64) -> Option<()> {
+pub(crate) fn t2_number(out: &mut Vec<u8>, v: f64) -> Option<()> {
     if v.fract() == 0.0 && (-32768.0..=32767.0).contains(&v) {
         let i = v as i32;
         match i {
@@ -1315,7 +1315,7 @@ fn emit_charstring(glyph: &Glyph, default_width: f64, nominal_width: f64) -> Opt
 
 /// CFF INDEX with minimal offset size. An empty INDEX is the 2-byte zero
 /// count.
-fn cff_index(items: &[Vec<u8>]) -> Option<Vec<u8>> {
+pub(crate) fn cff_index(items: &[Vec<u8>]) -> Option<Vec<u8>> {
     if items.is_empty() {
         return Some(vec![0, 0]);
     }
@@ -1409,7 +1409,7 @@ fn dict_real(out: &mut Vec<u8>, v: f64) -> Option<()> {
 }
 
 /// DICT numeric operand: integer form when exact, BCD real otherwise.
-fn dict_number(out: &mut Vec<u8>, v: f64) -> Option<()> {
+pub(crate) fn dict_number(out: &mut Vec<u8>, v: f64) -> Option<()> {
     if v.fract() == 0.0 && (f64::from(i32::MIN)..=f64::from(i32::MAX)).contains(&v) {
         dict_int(out, v as i32);
         Some(())
@@ -1418,7 +1418,7 @@ fn dict_number(out: &mut Vec<u8>, v: f64) -> Option<()> {
     }
 }
 
-fn dict_op(out: &mut Vec<u8>, op: u16) {
+pub(crate) fn dict_op(out: &mut Vec<u8>, op: u16) {
     if op > 0xFF {
         out.push(12);
         out.push((op & 0xFF) as u8);
@@ -1428,7 +1428,7 @@ fn dict_op(out: &mut Vec<u8>, op: u16) {
 }
 
 /// Fixed-width (5-byte) DICT integer, for offsets resolved after layout.
-fn dict_int32(out: &mut Vec<u8>, v: u32) {
+pub(crate) fn dict_int32(out: &mut Vec<u8>, v: u32) {
     out.push(29);
     out.extend_from_slice(&(v as i32).to_be_bytes());
 }

@@ -56,6 +56,7 @@
 //!   - Any failure (parse, decode, save) falls back to the original bytes.
 
 mod bitonal;
+mod cffmerge;
 mod encodings;
 mod fonts;
 mod truetype;
@@ -3268,6 +3269,14 @@ fn try_optimize(input: &[u8], options: OptimizeOptions) -> Result<Option<Vec<u8>
         Vec::new()
     };
 
+    // Plan lossless same-family Type1C union merges (read-only; empty unless
+    // at least one family clears every byte-conservative precondition).
+    let t1c_merge_plans = if options.subset_fonts {
+        fonts::plan_type1c_merges(&doc)
+    } else {
+        Vec::new()
+    };
+
     // Plan lossless bitonal→G4 recompression (read-only; empty when the
     // option is off or nothing qualified). No overlap with `replacements`:
     // the downsample paths require 8-bit samples or DCT payloads, the bitonal
@@ -3435,6 +3444,7 @@ fn try_optimize(input: &[u8], options: OptimizeOptions) -> Result<Option<Vec<u8>
     }
 
     fonts::apply_font_subsets(&mut doc, font_plans);
+    fonts::apply_type1c_merges(&mut doc, t1c_merge_plans);
 
     // Optionally strip the PDF's structure tree (accessibility metadata). This
     // is what Ghostscript's /ebook and /screen presets do silently: removes
