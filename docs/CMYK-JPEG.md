@@ -97,6 +97,27 @@ A legitimate resample-plus-q78 round trip in raw sample space lands in the
 single digits, so 24.0 leaves generous headroom. The ceiling is a backstop; the
 guarantee is structural.
 
+### Dict/payload consistency
+
+A byte-mutation sweep over the CMYK path (`mutated_cmyk_streams_never_corrupt_or_escape`,
+400 deterministic three-byte mutations) found one surviving route to the old
+failure shape: a payload damaged badly enough to defeat the structural frame-header
+walk, while a lenient decoder kept going, would route to the gray/RGB pipeline
+and land three channels back under `/DeviceCMYK`.
+
+`plan_replacement` now cross-checks the component count the dict *declares*
+against the one the frame header *carries*, and declines any mismatch involving
+four components — including the case where the header cannot be read at all
+under a four-component colour space. `colorspace_component_count` counts
+`DeviceCMYK`, `ICCBased` via the profile's own `/N`, `DeviceN` via its name
+array, `Separation`/`Indexed` as 1, and returns `None` (no conclusion) for
+anything else.
+
+The check is deliberately narrowed to mismatches involving four components. A
+grayscale JPEG under `/DeviceRGB` is a long-standing benign shape this pipeline
+already handles, and widening the check would change behaviour on files that
+were never broken.
+
 ### Truncation
 
 libjpeg is deliberately lenient about truncated scans: it fills the missing
@@ -132,6 +153,9 @@ PIL    CMYK per-channel MAD : C 5.60  M 2.05  Y 2.87  K 2.21
 IM     CMYK per-channel MAD : C 5.60  M 2.05  Y 2.87  K 2.21
 djpeg  RGB MAD              : 1.32
 ```
+
+A second pass over the optimized file is byte-identical, so the CMYK path is
+idempotent like the rest of the pipeline.
 
 All well inside ordinary q78 requantization noise, and the two independent CMYK
 decoders agree to the byte on sample polarity (MAD 0.000 between them), which

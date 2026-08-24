@@ -704,6 +704,48 @@ enum FilterClass {
 /// anything else. The exotic classes are recognized-and-declined: they are
 /// never handed to a re-encode path (which has no decoder for them). Both the
 /// scalar-name and one-element-array forms are recognized.
+/// The number of colour components an image dict DECLARES, or `None` when the
+/// colour space is one we cannot count with certainty (an unresolvable
+/// reference, a pattern, a name we do not know).
+///
+/// Used only as a consistency cross-check against the payload's own frame
+/// header — never to decide how to decode anything.
+fn colorspace_component_count(doc: &Document, dict: &lopdf::Dictionary) -> Option<usize> {
+    let cs = resolve(doc, dict.get(b"ColorSpace").ok()?);
+    match cs {
+        Object::Name(n) => match n.as_slice() {
+            b"DeviceGray" | b"CalGray" | b"G" => Some(1),
+            b"DeviceRGB" | b"CalRGB" | b"RGB" => Some(3),
+            b"DeviceCMYK" | b"CMYK" => Some(4),
+            _ => None,
+        },
+        Object::Array(items) => {
+            let Object::Name(family) = resolve(doc, items.first()?) else {
+                return None;
+            };
+            match family.as_slice() {
+                b"CalGray" => Some(1),
+                b"CalRGB" | b"Lab" => Some(3),
+                // The ICC profile's own /N is authoritative for the stream.
+                b"ICCBased" => {
+                    let Object::Stream(profile) = resolve(doc, items.get(1)?) else {
+                        return None;
+                    };
+                    usize::try_from(profile.dict.get(b"N").ok()?.as_i64().ok()?).ok()
+                }
+                // Indexed and Separation are both one sample per pixel.
+                b"Indexed" | b"I" | b"Separation" => Some(1),
+                b"DeviceN" => match resolve(doc, items.get(1)?) {
+                    Object::Array(names) => Some(names.len()),
+                    _ => None,
+                },
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 fn classify_filter(doc: &Document, filter: &Object) -> FilterClass {
     let name = match resolve(doc, filter) {
         Object::Name(n) => n.as_slice(),
@@ -881,6 +923,34 @@ fn plan_replacement(
         FilterClass::Other | FilterClass::CcittOnly | FilterClass::JpxOnly | FilterClass::Jbig2Only
     ) {
         return None;
+    }
+
+    // Dict/payload consistency for four-component JPEGs. The dict says how
+    // many samples a pixel has; the frame header says how many the payload
+    // carries. When those disagree the image is already broken, and any
+    // re-encode picks a side — which is exactly how the pre-0.3.2 CMYK bug
+    // wrote three RGB channels back under an unchanged /DeviceCMYK.
+    //
+    // `jpeg_route` handles the common case, but it reads the frame header,
+    // and a payload damaged badly enough to defeat the structural walk while
+    // a lenient decoder keeps going would slip past it (the mutation sweep in
+    // `mutated_cmyk_streams_never_corrupt_or_escape` finds exactly that).
+    // Hence `actual != Some(4)` rather than `actual == Some(n)`: an
+    // unreadable header under a four-component colour space is a decline.
+    //
+    // Deliberately narrowed to mismatches INVOLVING four components. A
+    // grayscale JPEG under /DeviceRGB is a long-standing, benign shape this
+    // pipeline already handles (`build_pdf_gray_in_rgb`), and widening the
+    // check would change behaviour on files that were never broken.
+    if matches!(class, FilterClass::DctOnly) {
+        let declared = colorspace_component_count(doc, dict);
+        let actual = jpeg_component_count(&stream.content);
+        if declared == Some(4) && actual != Some(4) {
+            return None;
+        }
+        if actual == Some(4) && declared.is_some_and(|d| d != 4) {
+            return None;
+        }
     }
 
     let px_w = dict.get(b"Width").ok().and_then(|o| o.as_i64().ok())? as u32;
@@ -9394,6 +9464,173 @@ mod tests {
         assert!(plan_dct_cmyk(&stream, 78, 320, 240, false).is_some());
         // ...but never upscale.
         assert!(plan_dct_cmyk(&stream, 78, 800, 600, false).is_none());
+    }
+
+    /// The dict/payload consistency guard, from both directions. A dict that
+    /// declares four components over a three-component payload (or the
+    /// reverse) is already broken, and re-encoding it would pick a side.
+    #[test]
+    fn component_count_mismatch_declines() {
+        // Three-component payload under /DeviceCMYK — the exact shape the old
+        // RGB fallback used to CREATE.
+        let rgb = jpeg_fixture("seq_color.jpg");
+        assert_eq!(jpeg_component_count(&rgb), Some(3));
+        let pdf = build_pdf_cmyk(rgb.clone(), 96, 64, 24, 16, None);
+        let out = optimize_with_options(&pdf, OptimizeOptions::default());
+        let (_, content) = only_image_stream(&out);
+        assert_eq!(jpeg_component_count(&content), Some(3), "must stay as found");
+        assert_eq!(
+            jpeg_quant_tables(&rgb),
+            jpeg_quant_tables(&content),
+            "must not be requantized"
+        );
+
+        // And the reverse: a four-component payload under /DeviceRGB.
+        let cmyk = jpeg_fixture("cmyk_plain.jpg");
+        let doc_bytes = {
+            let mut doc = Document::load_mem(&build_pdf_cmyk(
+                cmyk.clone(),
+                96,
+                64,
+                24,
+                16,
+                None,
+            ))
+            .unwrap();
+            let id = *doc
+                .objects
+                .iter()
+                .find(|(_, o)| {
+                    matches!(o, Object::Stream(s)
+                        if matches!(s.dict.get(b"Subtype"), Ok(Object::Name(n)) if n == b"Image"))
+                })
+                .unwrap()
+                .0;
+            if let Ok(Object::Stream(s)) = doc.get_object_mut(id) {
+                s.dict.set("ColorSpace", Object::Name(b"DeviceRGB".to_vec()));
+            }
+            let mut v = Vec::new();
+            doc.save_to(&mut v).unwrap();
+            v
+        };
+        let out = optimize_with_options(&doc_bytes, OptimizeOptions::default());
+        let (_, content) = only_image_stream(&out);
+        assert_eq!(jpeg_component_count(&content), Some(4), "must stay as found");
+        assert_eq!(jpeg_quant_tables(&cmyk), jpeg_quant_tables(&content));
+    }
+
+    /// The declared-component-count reader, over the colour-space shapes a
+    /// four-component JPEG realistically appears under.
+    #[test]
+    fn colorspace_component_counts() {
+        let doc = Document::with_version("1.5");
+        let count = |cs: Object| {
+            let mut d = lopdf::Dictionary::new();
+            d.set("ColorSpace", cs);
+            colorspace_component_count(&doc, &d)
+        };
+        assert_eq!(count(Object::Name(b"DeviceCMYK".to_vec())), Some(4));
+        assert_eq!(count(Object::Name(b"DeviceRGB".to_vec())), Some(3));
+        assert_eq!(count(Object::Name(b"DeviceGray".to_vec())), Some(1));
+        assert_eq!(count(Object::Name(b"Pattern".to_vec())), None);
+        assert_eq!(
+            count(Object::Array(vec![
+                Object::Name(b"DeviceN".to_vec()),
+                Object::Array(vec![
+                    Object::Name(b"C".to_vec()),
+                    Object::Name(b"M".to_vec()),
+                    Object::Name(b"Y".to_vec()),
+                    Object::Name(b"K".to_vec()),
+                ]),
+            ])),
+            Some(4)
+        );
+        assert_eq!(
+            count(Object::Array(vec![
+                Object::Name(b"Separation".to_vec()),
+                Object::Name(b"Spot".to_vec()),
+            ])),
+            Some(1)
+        );
+        // An ICC profile stream's own /N is authoritative.
+        let mut doc2 = Document::with_version("1.5");
+        let icc = doc2.add_object(Stream::new(dictionary! { "N" => 4_i64 }, vec![0u8; 4]));
+        let mut d = lopdf::Dictionary::new();
+        d.set(
+            "ColorSpace",
+            Object::Array(vec![
+                Object::Name(b"ICCBased".to_vec()),
+                Object::Reference(icc),
+            ]),
+        );
+        assert_eq!(colorspace_component_count(&doc2, &d), Some(4));
+        // No /ColorSpace at all: no conclusion either way.
+        assert_eq!(
+            colorspace_component_count(&doc2, &lopdf::Dictionary::new()),
+            None
+        );
+    }
+
+    /// Deterministic byte-mutation sweep over the CMYK path. libjpeg reports
+    /// fatal errors by UNWINDING through C code (mozjpeg's own docs say to
+    /// wrap every call in `catch_unwind`), so the contract that matters for
+    /// untrusted bytes is the one `optimize_with_options` already provides:
+    /// whatever happens inside, the caller gets valid PDF bytes back and the
+    /// image is either untouched or a genuine four-component replacement.
+    #[test]
+    fn mutated_cmyk_streams_never_corrupt_or_escape() {
+        let base = jpeg_fixture("cmyk_plain.jpg");
+        // xorshift, so the sweep is reproducible without a dependency.
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut replaced = 0usize;
+        for _ in 0..400 {
+            let mut data = base.clone();
+            for _ in 0..3 {
+                let at = (next() as usize) % data.len();
+                data[at] ^= (next() % 255) as u8 + 1;
+            }
+            let pdf = build_pdf_cmyk(data.clone(), 96, 64, 24, 16, None);
+            let out = optimize_with_options(&pdf, OptimizeOptions::default());
+            let (dict, content) = only_image_stream(&out);
+            assert!(!content.is_empty());
+            // Geometry in the dict and the payload's own frame header must
+            // never disagree, and a replacement must never drop to three
+            // channels the way the old RGB fallback did.
+            let (w, h) = (
+                dict.get(b"Width").unwrap().as_i64().unwrap(),
+                dict.get(b"Height").unwrap().as_i64().unwrap(),
+            );
+            if content != data {
+                replaced += 1;
+                assert_eq!(
+                    jpeg_component_count(&content),
+                    Some(4),
+                    "a replacement under /DeviceCMYK must stay four-component"
+                );
+                let back = decode_cmyk_jpeg_scaled(&content, 1, 1)
+                    .expect("a replacement must decode as CMYK");
+                assert_eq!((back.source_width as i64, back.source_height as i64), (w, h));
+                assert_eq!(
+                    jpeg_component_count(&content),
+                    Some(4),
+                    "a replacement must stay four-component"
+                );
+                let back = decode_cmyk_jpeg_scaled(&content, 1, 1)
+                    .expect("a replacement must decode as CMYK");
+                assert_eq!((back.source_width as i64, back.source_height as i64), (w, h));
+            } else {
+                assert_eq!((w, h), (96, 64));
+            }
+        }
+        // Sanity: the sweep has to actually exercise the replacement branch,
+        // not just watch 400 declines go by.
+        assert!(replaced > 0, "no mutation reached a replacement");
     }
 
     /// Cross-decoder verification against Pillow and libjpeg-turbo's `djpeg`.

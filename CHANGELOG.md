@@ -28,7 +28,12 @@ and this project adheres to
   the same one. Verification is per-channel (the shared MAD ceiling of 96
   cannot catch a four-channel swap — a C/K swap pools to 29), truncated
   streams are caught structurally rather than trusted to libjpeg's lenient
-  grey-fill "repair", and any `/Decode` array declines the stream.
+  grey-fill "repair", and any `/Decode` array declines the stream. A
+  dict/payload cross-check (found by a byte-mutation sweep) additionally
+  declines any `/DCTDecode` image whose declared colour-space component count
+  disagrees with its frame header where four components are involved —
+  including a frame header too damaged to read under a four-component colour
+  space.
 
   This is not new consent surface: CMYK images take the same default-on
   downsample and requant paths RGB images already took, under the same
