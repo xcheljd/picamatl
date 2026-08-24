@@ -237,6 +237,101 @@ lossless imagery — including line art — and stripping the accessibility tree
 The differentiators are the CTM-aware placement analysis, the fail-safe
 contract, and the license.
 
+### Five-document public corpus — full matrix (2026-08-24, amatl post-progressive-JPEG)
+
+A five-file public corpus covering a 756-page technical spec, an arXiv paper,
+an IRS tax guide (scanned imagery), an SSD framework document, and a tiny
+synthetic file. Ghostscript 10.07.1 at mirrored lossy settings (130 DPI,
+1.15 threshold, DCTEncode QFactor 0.4). All sizes are % of input; lower is
+better. amatl rows are cumulative consent levels:
+
+| Pipeline | adobe-spec | arxiv | irs-1040gi | nist-ssdf | dummy | TOTAL |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| input | 22,491,828 B | 2,233,053 B | 4,434,643 B | 739,891 B | 13,264 B | 29,912,679 B |
+| **amatl lossless** (defaults) | 31.9% | 66.1% | 92.6% | 75.9% | 93.9% | **44.5%** |
+| amatl `--allow-lossy` | 31.9% | 66.1% | 92.6% | 75.9% | 93.9% | 44.5% |
+| + `--strip-accessibility` | 24.1% | 66.1% | 68.5% | 70.0% | 93.9% | **35.0%** |
+| kitchen sink¹ | **19.2%** | **53.1%** | **61.8%** | **47.4%** | **88.6%** | **28.8%** |
+| Ghostscript forced lossy² | 48.8% | 55.5% | 72.2% | 82.1% | 114.1% | 53.6% |
+
+¹ `--allow-lossy --strip-accessibility --strip-metadata --convert-type1
+--strip-hinting --recompress-bitonal-images --collapse-gray-images
+--deflate-backend zopfli`
+² `-dDownsampleColor/GrayImages -d*ImageResolution=130
+-dColorImageFilter=/DCTEncode` with QFactor 0.4.
+
+Reading the matrix honestly:
+
+- **At full throttle amatl wins every file**, including the scanned-tax-guide
+  class where Ghostscript's image crushing previously led — and it grows no
+  file, where pdfwrite inflated the smallest input by 14%. The kitchen-sink
+  run costs ~30× more CPU (zopfli), a deliberate trade under its own flag.
+- **On this corpus `--allow-lossy` alone is a no-op**: none of the five files
+  contain qualifying lossless-Flate photographic images, so the row equals
+  defaults by design — the flag only ever fires on content that matches its
+  heuristic. The NASA report above shows what it does on photo-heavy input.
+- **Where Ghostscript still wins at low consent levels is structural, not a
+  defect:** irs-1040gi's payload is scan raster whose bytes only shrink when
+  pixels are degraded. amatl's lossless row (92.6%) reflects its contract —
+  without consent it leaves those pixels untouched; gs degrades them silently.
+  Once equivalent consent is granted (a11y strip + font/hinting trades),
+  amatl passes gs on the same file (61.8% vs 72.2%). arxiv behaves the same:
+  its figures respond to forced DCT re-encoding until amatl is given the same
+  license.
+- **The progressive-JPEG Huffman pass (this release)** removed the last
+  outright decline in the entropy-recode path: progressive (`SOF2`) streams
+  are now re-tabled like baseline ones, with losslessness proven by an
+  independent in-suite coefficient decoder and jpegtran cross-checks.
+
+### Six-document expanded corpus — industry & edge-case sweep (2026-08-24)
+
+A second corpus targeting document classes absent from the first:
+academic preprint (arXiv 2303.08774), census statistical brief (government
+charts), a CMYK-JPEG edge-case file (from Mozilla's pdf.js test suite), the
+official IRS W-2 fillable form (**XFA/LiveCycle** — see below), the NIST
+SP 800-63B standard, and a Wikipedia article render. Same Ghostscript
+settings as above:
+
+| Pipeline | arxiv-gpt4 | census | cmyk-jpeg | irs-w2 | nist-sp800 | wiki | TOTAL |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| input | 5,245,564 B | 545,684 B | 374,080 B | 2,150,352 B | 1,480,377 B | 2,196,261 B | 11,992,318 B |
+| **amatl lossless** | 39.6% | **52.3%** | 76.7% | 88.4% | **58.6%** | 48.5% | 54.1% |
+| + `--strip-accessibility` | 33.1% | 43.2% | 76.7% | 84.7% | 53.2% | **26.0%** | 45.4% |
+| kitchen sink | 32.2% | **35.9%** | **65.9%** | 82.9% | **39.7%** | **22.8%** | 41.7% |
+| Ghostscript forced lossy | **28.4%** | 60.0% | 4.6%* | **8.8%*** | 70.1% | 37.1% | **32.3%** |
+
+\* Not a fair fight — see below.
+
+Findings from this sweep:
+
+- **The IRS W-2 result exposed amatl's biggest honest gap: XFA forms.**
+  The official W-2 is a LiveCycle/XFA document — 1.58 MB of its bytes are a
+  compressed XML Forms Architecture template that *describes* the form and
+  which Acrobat renders dynamically. Amatl correctly refuses to touch it
+  (rewriting XFA without Adobe's engine is how forms break), so its lossless
+  row sits at 88.4% while Ghostscript reports 8.8%. But gs's number is not
+  compression — it **discards the entire XFA model and re-renders the pages
+  to static content**, destroying the fillable form. Verify before trusting:
+  after pdfwrite, the W-2 still opens at 11 identical-looking pages, but it
+  is no longer a dynamic form. For this class of document the choice is
+  "88% of original, still works" vs "9%, no longer a form" — amatl's answer
+  is by contract, gs's is silent.
+- **cmyk-jpeg is the mirror image:** a 374 KB file whose payload is one large
+  CMYK JPEG. Ghostscript's 4.6% comes from re-compressing that single image
+  into submission; amatl's conservative CMYK fallback path declines it, so
+  65.9% is its floor here. This is the known CMYK limitation documented under
+  Scope — on the roadmap only as a verified-safe decode path.
+- **Everywhere else amatl wins or ties:** census brief (35.9% vs 60.0%) —
+  vector charts plus fonts respond to subsetting and Type1→CFF conversion;
+  NIST SP 800-63B (39.7% vs 70.1%); the Wikipedia render collapses to 22.8%
+  once the accessibility tree (26 points of it) is stripped with consent.
+  Only the academic preprint class stays marginally ahead under Ghostscript
+  (28.4% vs 32.2%), via forced re-encoding of figure imagery.
+- Combined across both corpora, amatl's kitchen-sink configuration beats
+  Ghostscript on **8 of 11 documents**, never grows a file, keeps dates and
+  provenance unless explicitly stripped, and preserves accessibility by
+  default.
+
 ## Why not Ghostscript?
 
 Amatl exists because shelling out to `gs` was evaluated and rejected:
@@ -301,11 +396,11 @@ untouched and the output is always a valid PDF.
 
 ## Maintenance notes & constraints
 
-- **lopdf is pinned at 0.42** (hard ceiling): 0.43 and 0.44 fail to compile
-  against current `time` (their `datetime.rs` calls
-  `FormatItem::StringLiteral`, which no longer exists in `time` 0.3.47 — the
-  error is inside lopdf, not amatl). Re-test the bump when lopdf publishes a
-  fix.
+- **lopdf 0.44 with `default-features = false`** (verified 2026-08-24): the
+  bump from 0.42 dropped lopdf's unneeded datetime backends
+  (`chrono`/`jiff`/`time`) and its `rayon` activation — amatl never parses PDF
+  datetimes (Info-dict date strings pass through as opaque bytes), so none of
+  those features are needed. Output is byte-identical; binary ~71 KB smaller.
 - **Build-time requirements:** mozjpeg compiles libjpeg-turbo, which needs
   NASM and a C compiler at build time (CI uses `ilammy/setup-nasm`). There is
   no native *runtime* dependency.
