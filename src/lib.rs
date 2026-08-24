@@ -3439,7 +3439,40 @@ fn try_optimize(input: &[u8], options: OptimizeOptions) -> Result<Option<Vec<u8>
     // we want strictly clean output for email recipients / strict readers).
     doc.renumber_objects();
 
+    strip_stale_xref_trailer_keys(&mut doc);
+
     save_document(&mut doc, options).map(Some)
+}
+
+/// Drop trailer entries that describe the *input's* cross-reference section.
+///
+/// lopdf seeds `Document::trailer` from the file's last trailer dictionary and
+/// copies whatever survives into the cross-reference stream it synthesizes at
+/// save time. Most xref keys are overwritten there (`/Type`, `/Size`, `/W`,
+/// `/Index`, `/Length`), but `/DecodeParms`, `/Filter`, `/Prev` and `/XRefStm`
+/// are not — they leak through and describe bytes that no longer exist.
+///
+/// This is not hypothetical. `corpus/adobe-spec.pdf` (Distiller 8.1.0) ends in
+/// a *classic* `trailer` dictionary that nonetheless carries a full xref-stream
+/// key set, including `/DecodeParms<</Columns 5/Predictor 12>>`. Carried into
+/// amatl's output that predictor declaration sat on top of the unpredicted
+/// 7-bytes-per-row payload `compress_xref_stream` had just deflated, so every
+/// strict reader failed to decode the table and fell back to reconstruction
+/// (Ghostscript: "The /Prev entry in an XrefStm dictionary did not point to an
+/// XrefStm" / "xref table was repaired").
+///
+/// The writer owns the cross-reference section; nothing the reader saw about
+/// the old one may survive into the new one.
+fn strip_stale_xref_trailer_keys(doc: &mut Document) {
+    for key in [
+        b"DecodeParms".as_slice(),
+        b"Filter",
+        b"Prev",
+        b"XRefStm",
+        b"Length",
+    ] {
+        doc.trailer.remove(key);
+    }
 }
 
 /// Inflation ceiling for the final re-deflate pass. A stream that expands past
@@ -3639,7 +3672,14 @@ fn try_compress_xref_stream(out: &[u8], backend: DeflateBackend) -> Option<Vec<u
     let dict_end = find_sub(out, b">>stream\n", dict_start)? + 2;
     let content_start = dict_end + b"stream\n".len();
     let dict = out.get(dict_start..dict_end)?;
-    if find_sub(dict, b"/Type/XRef", 0).is_none() || find_sub(dict, b"/Filter", 0).is_some() {
+    // A `/DecodeParms` already in the dictionary would be read as describing
+    // the payload this patch is about to install — it does not (the deflate
+    // below applies no predictor), so decline rather than emit a dictionary
+    // that lies about its own stream.
+    if find_sub(dict, b"/Type/XRef", 0).is_none()
+        || find_sub(dict, b"/Filter", 0).is_some()
+        || find_sub(dict, b"/DecodeParms", 0).is_some()
+    {
         return None;
     }
 
@@ -5564,6 +5604,70 @@ mod tests {
                 .unwrap_or_else(|e| panic!("pack={pack}: patched output must load: {e}"));
             assert!(
                 !doc.get_pages().is_empty(),
+                "pack={pack}: pages must survive"
+            );
+        }
+    }
+
+    /// A producer's trailer can carry cross-reference-stream keys that describe
+    /// the *input's* table (`corpus/adobe-spec.pdf` ends in a classic `trailer`
+    /// holding `/DecodeParms<</Columns 5/Predictor 12>>`). lopdf copies the
+    /// trailer into the xref stream it synthesizes, so those keys would sit on
+    /// top of amatl's freshly deflated, unpredicted payload and make every
+    /// strict reader repair the file. None may survive.
+    #[test]
+    fn stale_xref_keys_in_the_input_trailer_do_not_reach_the_output() {
+        // Every key the strip covers must go, whatever the input put there.
+        let mut doc = Document::load_mem(&build_pdf_duplicate_images(6, 400)).unwrap();
+        for key in ["DecodeParms", "Filter", "Prev", "XRefStm", "Length"] {
+            doc.trailer.set(key, 16i64);
+        }
+        strip_stale_xref_trailer_keys(&mut doc);
+        for key in [b"DecodeParms".as_slice(), b"Filter", b"Prev", b"XRefStm"] {
+            assert!(
+                doc.trailer.get(key).is_err(),
+                "{} must not survive in the trailer",
+                String::from_utf8_lossy(key)
+            );
+        }
+
+        // End to end, with the shape adobe-spec.pdf actually ships: a stale
+        // predictor declaration. It is inert in the staged input (no /Filter
+        // there), and must stay out of the output, where a /Filter IS added.
+        let mut doc = Document::load_mem(&build_pdf_duplicate_images(6, 400)).unwrap();
+        doc.trailer.set(
+            "DecodeParms",
+            dictionary! { "Columns" => 5, "Predictor" => 12 },
+        );
+        let mut staged: Vec<u8> = Vec::new();
+        doc.save_to(&mut staged).unwrap();
+        assert!(
+            find_sub(&staged, b"/Predictor", 0).is_some(),
+            "premise: the staged input must actually carry the stale key"
+        );
+
+        for pack in [true, false] {
+            let opts = OptimizeOptions::default().with_pack_object_streams(pack);
+            let out = optimize_with_options(&staged, opts);
+            let header = xref_object_header(&out);
+            let shown = String::from_utf8_lossy(&header).to_string();
+            for key in [b"/DecodeParms".as_slice(), b"/Prev", b"/XRefStm"] {
+                assert!(
+                    find_sub(&header, key, 0).is_none(),
+                    "pack={pack}: stale {} leaked into the xref stream: {shown}",
+                    String::from_utf8_lossy(key)
+                );
+            }
+            // The dictionary must describe the payload it actually ships: one
+            // /Filter (ours) and a table that reads back.
+            assert!(
+                find_sub(&header, b"/Filter/FlateDecode", 0).is_some(),
+                "pack={pack}: xref stream must be deflated, got {shown}"
+            );
+            let reloaded = Document::load_mem(&out)
+                .unwrap_or_else(|e| panic!("pack={pack}: output must load: {e}"));
+            assert!(
+                !reloaded.get_pages().is_empty(),
                 "pack={pack}: pages must survive"
             );
         }
