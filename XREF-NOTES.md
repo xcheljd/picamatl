@@ -31,4 +31,20 @@ GATES (pdftoppm -r 72, cmp/magick AE vs corpus/adobe-spec.pdf):
   page 752: 195 px diff — byte-for-byte same residual as main-adobe.pdf,
             i.e. caused by another optimizer pass, NOT the xref bug.
 Committed on fix/xref-prev. Upstream-worthy: lopdf writer.rs should widen W or
-assert index < 65536.
+assert index < 65536. Issue drafted (not filed) in docs/upstream-lopdf-u16.md.
+
+## RENDER RESIDUAL RESOLVED (follow-up run 2026-08-23)
+The 21 differing pages (211 311-315 543-545 548 553 554 644 742-744 746
+749-752) had two causes, found by flag/code bisection at 72 dpi:
+
+1. DPI downsampling (19-20 pages) — BY DESIGN. `--target-dpi 0` renders all 21
+   pages byte-identical to the original; `--no-downsample-flate-images` alone
+   does not, so it is the DCT path resampling over-resolution images.
+2. `dedup_decoded_streams` (pages 749 and 752) — A REAL BUG, now fixed. It
+   bucketed on the inflated payload ALONE, ignoring the stream dict, so
+   same-payload/different-dict images merged and the lowest-id dict won.
+   Five bad merges in this file: 65x66 <- 66x65 (transposed), and three pairs
+   whose /Indexed palette object differed (68189 vs 68192, 68191 vs 68193,
+   68330 vs 68327) — the page 752 overprint figure's overlap lost its dark
+   olive blend. Fix: key on (decoded bytes, dict minus /Length). Cost +1,248 B
+   on this file, 0 B on the other three corpora.

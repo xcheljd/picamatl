@@ -223,6 +223,29 @@ bytes" property. Pinned by
 
 ### Fixed
 
+- **The decoded-payload stream dedup no longer over-merges.**
+  `dedup_decoded_streams` keyed only on the inflated bytes, so two streams
+  with the same payload but *different dictionaries* collapsed into one and
+  the lowest-id dictionary silently won. On the 756-page Adobe PDF 1.7 spec
+  this merged five image pairs that must stay distinct: two with transposed
+  dimensions (65x66 vs 66x65 over identical index bytes) and three sharing
+  index bytes under different `/Indexed` palette objects — which recolored
+  the overprint illustration on page 752, among others. The key is now
+  (decoded bytes, dictionary minus `/Length`); `/Length` stays out because
+  differing stored lengths are exactly what this pass exists to collapse.
+  Measured cost: +1,248 B on the Adobe spec, 0 B on the IRS, arXiv, and NIST
+  corpora. With downsampling disabled, all 21 previously-differing spec pages
+  now render byte-identical to the original at 72 dpi.
+
+- **`--deflate-backend zopfli` re-deflates every `ObjStm`.** Capping objects
+  per stream at 65,535 made large files emit more than one object stream, and
+  the zopfli patch declined outright on anything but a lone `ObjStm` — so the
+  payloads stayed zlib (Adobe spec 6,461,220 -> 6,918,902 B; IRS 3,805,245 ->
+  4,090,288 B). Every `ObjStm` is now patched, strictly last-to-first so each
+  patch only shifts bytes after the streams still to come; every existing
+  guard is retained per stream and applied independently. Adobe spec
+  6,454,219 B, IRS 3,803,479 B — both below the old single-stream figures.
+
 - **Requantization is now exactly idempotent.** `plan_dct_requant` declines a
   candidate whose JPEG quantization tables are byte-identical to the
   source's: same tables mean the payload is already at the configured

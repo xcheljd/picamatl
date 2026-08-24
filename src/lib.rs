@@ -2540,23 +2540,31 @@ fn dedup_objects(doc: &mut Document) -> bool {
 /// decoded bytes a viewer actually consumes are identical. Down the pipeline
 /// those N copies collapse to one object, removing every duplicate's bytes.
 ///
-/// Why this is lossless: the only observable effect of an embedded font or
-/// image stream is its decoded bytes. Two streams with identical decoded
-/// payloads render identically and extract identically; merging merely changes
-/// which object a reference points at. The canonical stream keeps its own
-/// decoded payload (by construction equal) and its `/Length1/2/3`/color-space
-/// properties (equal, since they are properties of the same payload), so no
-/// descriptor or content ever reads contradictory metadata.
+/// Why this is lossless: for two streams with the same decoded payload AND the
+/// same dictionary, the only observable effect is that decoded payload — they
+/// render identically and extract identically, so merging merely changes which
+/// object a reference points at.
+///
+/// The dictionary is part of the key, minus `/Length` (which is a property of
+/// the *stored* bytes, and differing `/Length` is the whole point of this
+/// pass). Decoded bytes alone are NOT a render equivalence: the same payload
+/// under a different dictionary is a different image. On the 756-page Adobe
+/// spec, keying on the payload alone merged five image pairs that must stay
+/// distinct — two with transposed dimensions (65x66 vs 66x65, identical index
+/// bytes), and three sharing index bytes under *different* `/Indexed` palette
+/// objects, which silently recolored the overprint figure on page 752.
 ///
 /// Fail-safe: only scalar `FlateDecode` with no `/DecodeParms` is considered
 /// (the shape whose decode is a pure byte-for-byte inflate, so decoded
 /// equality is exactly the equivalence a viewer renders); any inflate error,
-/// oversize output, or unsupported shape is skipped. The merge is
-/// keyed on the full decoded bytes (not a hash), so a collision cannot cause a
-/// false merge.
+/// oversize output, or unsupported shape is skipped. The merge is keyed on the
+/// full decoded bytes (not a hash), so a collision cannot cause a false merge.
+/// Dictionaries are compared by their `Debug` rendering, matching
+/// [`dedup_objects`]' conservative stance: differing key order or differing
+/// spelling of an equivalent value simply declines the merge.
 fn dedup_decoded_streams(doc: &mut Document) -> bool {
-    // decoded-payload -> object ids carrying it.
-    let mut buckets: HashMap<Vec<u8>, Vec<ObjectId>> = HashMap::new();
+    // (decoded payload, dict minus /Length) -> object ids carrying it.
+    let mut buckets: HashMap<(Vec<u8>, String), Vec<ObjectId>> = HashMap::new();
     for (&id, obj) in doc.objects.iter() {
         if let Object::Stream(s) = obj {
             // DecodeParms imply a non-trivial decode (PNG/tiff predictors)
@@ -2573,7 +2581,12 @@ fn dedup_decoded_streams(doc: &mut Document) -> bool {
                 continue;
             }
             if let Some(decoded) = inflate_capped(&s.content, MAX_REDEFLATE_BYTES) {
-                buckets.entry(decoded).or_default().push(id);
+                let mut dict = s.dict.clone();
+                dict.remove(b"Length");
+                buckets
+                    .entry((decoded, format!("{dict:?}")))
+                    .or_default()
+                    .push(id);
             }
         }
     }
@@ -6326,6 +6339,71 @@ mod tests {
             s.content.push(0x00);
         }
         assert!(!dedup_streams(&mut doc), "differing bytes must not merge");
+    }
+
+    /// The decoded-payload dedup must key on the dictionary too. Identical
+    /// index/sample bytes under a different `/Width`-`/Height` (or a different
+    /// `/Indexed` palette) are a DIFFERENT image; merging them silently
+    /// transposed and recolored figures in the Adobe PDF spec (page 752's
+    /// overprint illustration among them).
+    #[test]
+    fn decoded_dedup_respects_the_dictionary() {
+        // A 6x4 gray raster: the same 24 sample bytes also describe a 4x6 one.
+        let plain: Vec<u8> = (0..24u8).collect();
+        // Independently deflated bytes for the two copies — the case this pass
+        // exists for: same payload, same dict, different /Length and content.
+        let deflate_at = |level: u32| {
+            use std::io::Write;
+            let mut enc =
+                flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::new(level));
+            enc.write_all(&plain).unwrap();
+            enc.finish().unwrap()
+        };
+        let mut doc = Document::with_version("1.5");
+        let ids: Vec<ObjectId> = [9, 1]
+            .into_iter()
+            .map(|level| {
+                let content = deflate_at(level);
+                doc.add_object(Stream::new(
+                    dictionary! {
+                        "Type" => "XObject", "Subtype" => "Image",
+                        "Width" => 6i64, "Height" => 4i64,
+                        "ColorSpace" => "DeviceGray", "BitsPerComponent" => 8,
+                        "Filter" => "FlateDecode",
+                    },
+                    content,
+                ))
+            })
+            .collect();
+        assert_ne!(
+            match doc.get_object(ids[0]) {
+                Ok(Object::Stream(s)) => s.content.clone(),
+                _ => unreachable!(),
+            },
+            match doc.get_object(ids[1]) {
+                Ok(Object::Stream(s)) => s.content.clone(),
+                _ => unreachable!(),
+            },
+            "the fixture must differ in its STORED bytes, else dedup_streams would do"
+        );
+        let mut same = doc.clone();
+        assert!(
+            dedup_decoded_streams(&mut same),
+            "same payload + same dict must merge even when the stored bytes differ"
+        );
+
+        // Now transpose the second image's dimensions. The decoded bytes are
+        // untouched, so a payload-only key would still merge — it must not.
+        if let Ok(Object::Stream(s)) = doc.get_object_mut(ids[1]) {
+            let w = s.dict.get(b"Width").unwrap().as_i64().unwrap();
+            let h = s.dict.get(b"Height").unwrap().as_i64().unwrap();
+            s.dict.set("Width", h + 1);
+            s.dict.set("Height", w);
+        }
+        assert!(
+            !dedup_decoded_streams(&mut doc),
+            "identical payload under a different dictionary must NOT merge"
+        );
     }
 
     #[test]
