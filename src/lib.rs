@@ -59,6 +59,7 @@ mod bitonal;
 mod cffmerge;
 mod encodings;
 mod fonts;
+mod jpeghuff;
 mod truetype;
 mod type1;
 
@@ -3324,6 +3325,13 @@ fn try_optimize(input: &[u8], options: OptimizeOptions) -> Result<Option<Vec<u8>
         && !merged_decoded
         && !minified
         && !gray_work
+        // Evaluated last, and only for a document with no other work: the
+        // probe redoes the entropy analysis `reoptimize_jpeg_streams` will
+        // do at the end, so short-circuiting keeps it off the common path.
+        // It has to be asked, though — a PDF whose only win is pass-through
+        // JPEGs with unoptimized Huffman tables is a real win, not a
+        // serialization detail, and must not be declined.
+        && !any_jpeg_huffman_work(&doc)
     {
         return Ok(None);
     }
@@ -3502,6 +3510,13 @@ fn try_optimize(input: &[u8], options: OptimizeOptions) -> Result<Option<Vec<u8>
     doc.prune_objects();
     doc.compress();
 
+    // Rebuild the Huffman tables of every JPEG payload from its own symbol
+    // statistics. Strictly lossless (the DCT coefficients never move; see
+    // src/jpeghuff.rs), so it needs no consent flag and runs unconditionally.
+    // Placed here, after every image decision, for the same reason as the
+    // re-deflate below: it is a pure re-serialization of bytes already chosen.
+    reoptimize_jpeg_streams(&mut doc);
+
     // Last planning-free pass: re-deflate every already-Flate stream with the
     // configured backend (zlib level 9, or zopfli when opted in).
     // Runs after EVERY other decision (images, fonts, bitonal, lossy, dedup,
@@ -3575,6 +3590,68 @@ const MAX_REDEFLATE_BYTES: usize = 128 * 1024 * 1024;
 /// Declined wholesale for encrypted documents (stream bytes are ciphertext),
 /// PDF/A-declared documents, and signed documents — a signature's byte range
 /// covers offsets this pass would move.
+/// True when at least one raw `/DCTDecode` payload has Huffman tables worth
+/// rebuilding. Read-only; used only to answer "is there any work at all" for
+/// a document nothing else touches (see `try_optimize`). Stops at the first
+/// stream that improves.
+fn any_jpeg_huffman_work(doc: &Document) -> bool {
+    doc.objects.values().any(|obj| {
+        let Object::Stream(stream) = obj else {
+            return false;
+        };
+        let Ok(filter) = stream.dict.get(b"Filter") else {
+            return false;
+        };
+        matches!(classify_filter(doc, filter), FilterClass::DctOnly)
+            && jpeghuff::optimize(&stream.content).is_some()
+    })
+}
+
+/// Re-optimize the Huffman tables of every raw `/DCTDecode` payload in the
+/// document.
+///
+/// This is the JPEG analogue of [`redeflate_flate_streams`]: an entropy-coding
+/// improvement over bytes whose *content* is already decided. It is strictly
+/// lossless — [`jpeghuff::optimize`] never touches a DCT coefficient and
+/// verifies its own output decodes back to the identical token sequence — so
+/// unlike the image paths it needs no pixel contract and no opt-in.
+///
+/// Streams amatl re-encoded itself carry mozjpeg's already-optimal tables and
+/// simply decline (nothing is smaller). The headroom is in the JPEGs the image
+/// path passes through untouched: CMYK/Separation payloads, and any image
+/// whose effective DPI is already at target.
+fn reoptimize_jpeg_streams(doc: &mut Document) {
+    if doc.is_encrypted() || fonts::pdfa_blocked(doc) || signature_present(doc) {
+        return;
+    }
+
+    // Collect first (classification resolves references against the immutable
+    // document), then do the entropy work off-document, in parallel.
+    let candidates: Vec<(ObjectId, Vec<u8>)> = doc
+        .objects
+        .iter()
+        .filter_map(|(&id, obj)| {
+            let Object::Stream(stream) = obj else {
+                return None;
+            };
+            let filter = stream.dict.get(b"Filter").ok()?;
+            matches!(classify_filter(doc, filter), FilterClass::DctOnly)
+                .then(|| (id, stream.content.clone()))
+        })
+        .collect();
+
+    let shrunk: Vec<(ObjectId, Vec<u8>)> = candidates
+        .into_par_iter()
+        .filter_map(|(id, content)| jpeghuff::optimize(&content).map(|out| (id, out)))
+        .collect();
+
+    for (id, content) in shrunk {
+        if let Ok(Object::Stream(stream)) = doc.get_object_mut(id) {
+            stream.set_content(content); // keeps /Length in sync
+        }
+    }
+}
+
 fn redeflate_flate_streams(doc: &mut Document, backend: DeflateBackend) {
     if doc.is_encrypted() || fonts::pdfa_blocked(doc) || signature_present(doc) {
         return;
@@ -6986,6 +7063,95 @@ mod tests {
         );
     }
 
+    /// A pass-through JPEG — one the image path never re-encodes — must still
+    /// come out with rebuilt Huffman tables: strictly smaller bytes that decode
+    /// to exactly the same pixels. The `image` crate's encoder emits the fixed
+    /// T.81 Annex K tables, which is the real-world shape this pass targets.
+    #[test]
+    fn pass_through_jpeg_gets_optimized_huffman_tables() {
+        // Big enough that the entropy saving clears the cost of carrying the
+        // rebuilt tables; a smooth ramp keeps the coefficient alphabet small,
+        // so the flat Annex K tables are a long way from this image's own
+        // statistics.
+        let mut img = image::RgbImage::new(256, 256);
+        for (x, y, pixel) in img.enumerate_pixels_mut() {
+            *pixel = image::Rgb([x as u8, y as u8, 128]);
+        }
+        let mut jpeg: Vec<u8> = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 90)
+            .encode_image(&img)
+            .unwrap();
+
+        let mut doc = Document::with_version("1.5");
+        // Never painted by the content stream, so no planner touches it; the
+        // only pass that can change these bytes is the Huffman re-optimization.
+        let img_id = doc.add_object(Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Image",
+                "Width" => 256_i64,
+                "Height" => 256_i64,
+                "ColorSpace" => "DeviceRGB",
+                "BitsPerComponent" => 8_i64,
+                "Filter" => "DCTDecode",
+            },
+            jpeg.clone(),
+        ));
+        let content = Content {
+            operations: vec![Operation::new("q", vec![]), Operation::new("Q", vec![])],
+        };
+        let c1 = doc.add_object(Stream::new(dictionary! {}, content.encode().unwrap()));
+        let pages_id = doc.new_object_id();
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "Contents" => c1,
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Resources" => dictionary! { "XObject" => dictionary! { "Im0" => img_id } },
+        });
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => vec![page_id.into()],
+                "Count" => 1,
+            }),
+        );
+        let catalog_id = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+        doc.trailer.set("Root", catalog_id);
+        let mut pdf: Vec<u8> = Vec::new();
+        doc.save_to(&mut pdf).unwrap();
+
+        let out = optimize(&pdf);
+        let doc = Document::load_mem(&out).unwrap();
+        let payload = doc
+            .objects
+            .values()
+            .find_map(|o| match o {
+                Object::Stream(s)
+                    if matches!(s.dict.get(b"Filter"), Ok(Object::Name(n)) if n == b"DCTDecode") =>
+                {
+                    Some(s.content.clone())
+                }
+                _ => None,
+            })
+            .expect("the JPEG must still be there");
+        assert!(
+            payload.len() < jpeg.len(),
+            "Huffman re-optimization must shrink the pass-through JPEG: {} vs {}",
+            payload.len(),
+            jpeg.len()
+        );
+        let before = image::load_from_memory_with_format(&jpeg, image::ImageFormat::Jpeg).unwrap();
+        let after =
+            image::load_from_memory_with_format(&payload, image::ImageFormat::Jpeg).unwrap();
+        assert_eq!(
+            before.to_rgb8().into_raw(),
+            after.to_rgb8().into_raw(),
+            "the rebuild must be pixel-identical"
+        );
+    }
+
     #[test]
     fn dedup_keeps_distinct_objects() {
         // Same shape, but the two dictionaries differ by one value. They must NOT
@@ -7210,6 +7376,11 @@ mod tests {
         image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, jpeg_quality)
             .encode_image(&img)
             .unwrap();
+        // The `image` crate ships the fixed T.81 Annex K Huffman tables, which
+        // the (lossless, unconditional) re-optimization pass would rebuild.
+        // Fixture JPEGs come in with optimal tables already so the skip tests
+        // below can still assert exact byte-for-byte passthrough.
+        let jpeg = jpeghuff::optimize(&jpeg).unwrap_or(jpeg);
         let mask_payload = deflate_level9(&flate_pixels(px, px, 1)).unwrap();
 
         let mut doc = Document::with_version("1.5");

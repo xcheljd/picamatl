@@ -10,6 +10,23 @@ and this project adheres to
 
 ### Added
 
+- **JPEG Huffman-table re-optimization, on by default, strictly lossless.**
+  Every raw `/DCTDecode` payload now has its Huffman tables rebuilt from its
+  own symbol statistics — the pure-Rust equivalent of `jpegtran -optimize`.
+  DCT coefficients are never decoded, dequantized, or re-quantized: only the
+  entropy coding of an unchanged symbol sequence changes, and the pass
+  verifies that by decoding its own output back and requiring the identical
+  token sequence. Nothing else in the JPEG moves (`APPn`, `COM`, `DQT`,
+  `SOF`, `DRI` and the `SOS` headers are copied verbatim, restart markers
+  keep their MCU boundaries). Because it is bit-exact it needs no consent
+  flag. The headroom is in JPEGs the image path passes through untouched —
+  above all CMYK/Separation payloads it declines to re-encode:
+  irs-1040gi 4,158,663 → 4,104,994 (−53,669 B, −1.3%). Streams amatl
+  re-encoded itself carry mozjpeg's already-optimal tables and decline.
+  Scope is baseline/extended sequential Huffman frames at 8-bit precision;
+  progressive, arithmetic-coded, and hierarchical frames decline and ship
+  byte-identical.
+
 - **`strip_metadata` (`--strip-metadata`), opt-in, off by default.** Removes
   every `/Metadata` (XMP) entry. Producers that stamp a full packet on each
   page and XObject spend a double-digit share of the file on data no viewer
