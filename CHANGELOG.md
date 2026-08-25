@@ -23,6 +23,19 @@ and this project adheres to
 
 ### Changed
 
+- **Type1 → Type1C conversion now plans per `/FontDescriptor`, not per font
+  dictionary.** Producers routinely point several font dictionaries — one
+  program, several `/Encoding` variants — at a single descriptor, and the
+  "referenced exactly once" soundness test then failed for all of them:
+  `corpus-expanded/arxiv-diffusion.pdf` shipped **all** 331,824 B of its font
+  bytes unconverted. The group is planned as a unit — every reference to the
+  descriptor must be one of the font dictionaries whose usage the walk
+  attributed, the members must agree on their base name, and their glyph sets
+  union into one conversion — so the guarantee is unchanged while the blocked
+  case now converts. Worth **316,418 B** on arxiv-diffusion and **55,738 B**
+  on arxiv-gpt4; 125 pages verified pixel-identical at 72 dpi, pdftotext
+  identical.
+
 - **The signature guard on the three entropy-level passes is gone.**
   `redeflate_flate_streams`, `reoptimize_jpeg_streams` and
   `minify_content_streams` used to decline any document carrying a `/Sig`
