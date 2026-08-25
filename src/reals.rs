@@ -72,6 +72,16 @@ impl RealLiterals {
     /// lopdf's shortest `f32` print of a captured value and differs from the
     /// input's own text for it.
     fn replacement(&self, printed: &[u8]) -> Option<&[u8]> {
+        // Integer-valued reals print without a fraction — lopdf writes
+        // `Real(1.0)` as `1`, indistinguishable from `Integer(1)`. Restoring
+        // there would rewrite every `/Length 1`, `/Count 1` and `/Size 1` in
+        // the file into a real, so a literal that rounds to a whole number
+        // (`0.999999999` -> `1`) is simply left rounded. The value it would
+        // move is a billionth of a unit; the damage would be a broken
+        // document.
+        if !printed.contains(&b'.') {
+            return None;
+        }
         let text = std::str::from_utf8(printed).ok()?;
         let value: f32 = text.parse().ok()?;
         if !value.is_finite() {
@@ -977,6 +987,20 @@ mod tests {
             "classic xref table"
         );
         assert_eq!(captured(&out), captured(&input));
+    }
+
+    /// `0.999999999` is a real that lopdf prints back as `1`. Restoring it
+    /// would turn every integer `1` in the output — `/Length`, `/Count`,
+    /// `/Size` — into a real, for a billionth of a unit of accuracy.
+    #[test]
+    fn never_turns_an_integer_back_into_a_real() {
+        let literals = capture(b"<</A 0.999999999>>");
+        assert!(!literals.is_empty(), "the literal is captured");
+        assert_eq!(literals.replacement(b"1"), None);
+        assert_eq!(
+            restore(b"<</Length 1/Count 1>>".to_vec(), &literals),
+            b"<</Length 1/Count 1>>".to_vec()
+        );
     }
 
     /// Restoring puts the input's own literals in the output, so the output
