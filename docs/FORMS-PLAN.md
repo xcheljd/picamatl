@@ -228,6 +228,25 @@ and 150 dpi, grayscale, anti-aliasing off). On a flatten-*only* run
 comparison is about flattening and nothing else) all 11 pages of `irs-w2.pdf`
 and all 9 pages of `census-brief.pdf` are pixel-identical to the input.
 
+That measurement has since been re-run under the harsher oracle the
+`flatten_render_moves_no_subpixel_*` tests use — poppler, anti-aliasing **on**,
+comparing every subpixel rather than every pixel — and it holds: across the
+whole corpus, flatten-only output is bit-identical to the input at both 100 and
+150 dpi, on every page of every file that has a form. Anti-aliasing off is the
+weaker check of the two; it only sees a geometry change once an edge crosses a
+pixel centre. Offsetting the burn `cm` by 0.02 pt fails both, by 0.005 pt only
+the anti-aliased one, by 0.001 pt neither.
+
+Two corpus files *do* render differently, and neither has a form: `wiki-pdf.pdf`
+(27 of 28 pages) and `wiki-cmyk-topic.pdf` (8 of 10). The cause is not
+flattening — the flag is inert on both, D2 — and it is not any opt-in pass; it
+reproduces with every flag off. It is `lopdf`'s `Object::Real(f32)` rewriting
+`/MediaBox [0 0 595.91998 841.91998]` as `595.92 x 841.92`, which moves the
+origin of the page-to-device transform by 2e-5 pt and re-grid-fits every glyph
+on the page. Restoring only those four literals takes both files to 0 differing
+pages. See `docs/upstream-lopdf-f32-reals.md`; there is no fix available
+downstream, because the digits are gone by the time `Document::load` returns.
+
 `census-brief.pdf` gains a small win (a vestigial `/AcroForm` whose `/DR` font
 resources become unreferenced). Every other corpus file is untouched: no
 `/AcroForm`, D2.
@@ -250,6 +269,7 @@ resources become unreferenced). Every other corpus file is untouched: no
   declines.
 * **Ink equality is asserted by construction, and verified by rendering.** The
   burned stream is the original appearance object, unmodified, under the
-  spec's own placement matrix; `tests/forms_render.rs` additionally renders the
-  original (with annotations) and the flattened output through Ghostscript and
-  compares the pages pixel for pixel.
+  spec's own placement matrix; `tests/forms_flatten.rs` additionally renders the
+  original (with annotations) and the flattened output — through Ghostscript
+  with anti-aliasing off, and through poppler with it on — and compares the
+  pages subpixel for subpixel.
