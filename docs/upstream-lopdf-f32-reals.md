@@ -66,9 +66,27 @@ dpi. Across 11 corpus documents / 267 pages, the two files whose
 `/MediaBox` literals cannot survive an `f32` round trip are exactly the
 two files that render differently. No other object needed touching.
 
-`/Rect` on link annotations and `/W` on CID fonts drift the same way in
-the same files; those did not happen to move a pixel here, but `/BBox`,
-`/Matrix`, `/Decode` and `/FontMatrix` are all the same shape of value.
+`/MediaBox` is not the bulk of it, only the visible part. A census of
+every real literal in amatl's 16-file corpus — counting the ones whose
+value changes across an `f32` round trip — puts page boxes eighth by
+frequency:
+
+| key | drifting literals | example |
+| --- | ---: | --- |
+| `/Rect` (annotations) | 1646 | `686.66998` -> `686.67` |
+| `/XYZ` (destinations) | 314 | `841.91998` -> `841.92` |
+| `/BBox` (form XObjects) | 261 | `411.41309` -> `411.4131` |
+| `/W` (CID widths) | 125 | `666.99219` -> `666.9922` |
+| `/MediaBox` | 76 | `595.91998` -> `595.92` |
+| `/FontBBox` | 26 | `-543.94531` -> `-543.9453` |
+| `/Bounds` (stitching functions) | 9 | `.155000001` -> `0.155` |
+| `/CapHeight`, `/Ascent`, `/Descent`, `/StemV` | 6 each | `891.11328` -> `891.1133` |
+| `/Domain` | 2 | `1.01095223` -> `1.0109522` |
+
+Four of the sixteen documents carry any at all, and those four carry
+between 24 and 1678 each. `/BBox` clips a form, `/W` sets a glyph
+advance and `/Bounds` a gradient stop, so page boxes are simply the key
+whose drift is easiest to *see*, not the only one that matters.
 
 Note that Ghostscript does **not** show this: it rounds the page box to
 whole device pixels before fitting anything to the grid (it reports a
@@ -93,8 +111,18 @@ Alternatives that are not really alternatives:
   change to the object model than widening the float.
 
 The information is destroyed at parse time, so there is no fix available
-to a downstream caller: by the time `Document::load` returns, the digits
-are gone.
+*inside the object model*: by the time `Document::load` returns, the digits
+are gone, and no `Object` variant can hold `841.91998` to put them back.
+
+A caller that still has the input bytes can work around it outside the
+model, which is what amatl now does (`src/reals.rs`): read the literals
+from the raw input before the parse, and splice them back into the saved
+file afterwards, keyed by the `f32` bit pattern lopdf will hold. That
+means reaching through the deflated `ObjStm` payload the page
+dictionaries are packed into — rewriting its offset header, `/First` and
+`/Length` — and then every byte offset in the cross-reference section.
+It works, and it is a lot of machinery to carry for a one-word change to
+an enum.
 
 ### Why amatl cares
 
@@ -107,6 +135,5 @@ print a shorter decimal that maps to the same f32 but a different f64."
 That defence cannot extend to object dictionaries, where amatl never sees
 the original bytes.
 
-Until this is fixed upstream, documents whose page boxes carry 8-digit
-reals render with sub-pixel differences. `docs/FORMS-PLAN.md` records
-which corpus files are affected.
+Until this is fixed upstream, amatl carries `src/reals.rs` to undo it.
+`docs/FORMS-PLAN.md` records which corpus files are affected.
