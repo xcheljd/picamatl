@@ -314,18 +314,8 @@ which re-encode all lossless imagery (including line art), rewrite fonts, and
 strip the structure tree — trades amatl declines by contract even under
 `--allow-lossy`.
 
-On a real-world retail promotion flyer (1,376 KB, image-heavy, ~2,000
-structure-tree objects) — **from a private corpus, not redistributable**:
-
-| Pipeline | Size | Reduction | `qpdf --check` | Accessibility |
-| --- | ---: | ---: | --- | --- |
-| amatl, library defaults (no strip) | 821 KB | 40% | clean | preserved |
-| amatl, strip + pack | 572 KB | 59% | clean | stripped |
-| Ghostscript 130 DPI / QFactor 0.4 | 530 KB | 62% | clean | stripped |
-
-Amatl matches or beats Ghostscript on image payload at matched intent (on
-NASA defaults it is 5.6% smaller overall). The differentiators are the
-CTM-aware placement analysis, the fail-safe contract, and the license.
+The differentiators are the CTM-aware placement analysis, the fail-safe
+contract, and the license.
 
 ### Five-document public corpus — full matrix (2026-08-24, amatl post-progressive-JPEG)
 
