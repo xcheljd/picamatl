@@ -10,6 +10,34 @@ and this project adheres to
 
 ### Added
 
+- **`--flatten-forms` (`OptimizeOptions::flatten_forms`, off by default)** —
+  flattens interactive forms: every widget annotation's appearance stream is
+  painted into its page's content stream under the ISO 32000-1 12.5.5
+  `/BBox` → `/Rect` mapping, and then `/AcroForm`, the field tree, the XFA
+  packet set and every `/Widget` annotation are removed (`/Link` and markup
+  annotations are not form machinery and are never touched). This is where
+  Ghostscript's huge lead on form-heavy files came from — `pdfwrite` deletes
+  the form layer unconditionally, which on a *filled* form deletes the entered
+  values too. amatl instead declines the entire document unless every field's
+  value is provably preserved: either the appearance stream that *shows* it
+  becomes page content, or the field has nothing to lose (`/V` absent, empty,
+  or a button `/Off`). Dynamic XFA forms (`/NeedsRendering true`) always
+  decline — their pages are a placeholder built from an XML template at view
+  time. So do XFA data the AcroForm does not mirror, `/NeedAppearances true`
+  over a filled form, a value with no appearance to burn, a hidden field
+  carrying data, a signature field holding a signature, an optional-content
+  widget, and page content that is not `q`/`Q` balanced; the 13 decline rules
+  are tabulated in `docs/FORMS-PLAN.md`. Measured on
+  `corpus-expanded/irs-w2.pdf` (official IRS Form W-2, a *static* XFA form
+  whose 568 widgets draw no ink and whose XFA packets are 1,583,884 B of the
+  2,150,352 B file): **1,392,531 B → 250,229 B**, 64.8% of input down to 11.6%.
+  All 11 pages render pixel-identical to the original at 150 dpi, as do all 9
+  pages of `census-brief.pdf`; the flag is byte-for-byte inert on the 14 corpus
+  files with no `/AcroForm`. Opt-in permanently: the output is no longer a form
+  — it cannot be filled in, exported, or signed.
+
+### Added
+
 - **`--strip-private-data` (`OptimizeOptions::strip_private_data`, off by
   default)** — removes every `/PieceInfo` page-piece dictionary, where an
   authoring application keeps its own private copy of the artwork beside the

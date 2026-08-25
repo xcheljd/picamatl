@@ -76,7 +76,10 @@ fn push_raw_bit(run: &mut Vec<Token>, bit: u32) {
             return;
         }
     }
-    run.push(Token::Raw { bits: bit, nbits: 1 });
+    run.push(Token::Raw {
+        bits: bit,
+        nbits: 1,
+    });
 }
 
 /// A frame component as declared in `SOF`.
@@ -951,14 +954,8 @@ fn parse(data: &[u8]) -> Option<Parsed> {
                 }
                 let mut blocks = Vec::with_capacity(nf);
                 for c in &comps {
-                    let bw = ceil_div(
-                        ceil_div(usize::from(x) * usize::from(c.h), hmax)?,
-                        8,
-                    )?;
-                    let bh = ceil_div(
-                        ceil_div(usize::from(y) * usize::from(c.v), vmax)?,
-                        8,
-                    )?;
+                    let bw = ceil_div(ceil_div(usize::from(x) * usize::from(c.h), hmax)?, 8)?;
+                    let bh = ceil_div(ceil_div(usize::from(y) * usize::from(c.v), vmax)?, 8)?;
                     blocks.push(bw.checked_mul(bh)?);
                 }
                 let progressive = m == 0xC2;
@@ -1038,10 +1035,7 @@ fn rebuild(p: &Parsed) -> Option<Vec<u8>> {
 
 /// The rebuild, parameterized by table generator so tests can substitute a
 /// deliberately bad one.
-fn rebuild_with(
-    p: &Parsed,
-    gen: fn(&[u64; 256]) -> Option<EncodeTable>,
-) -> Option<Vec<u8>> {
+fn rebuild_with(p: &Parsed, gen: fn(&[u64; 256]) -> Option<EncodeTable>) -> Option<Vec<u8>> {
     let mut out: Vec<u8> = Vec::new();
     let mut in_effect: [TableState; 8] = Default::default();
     let mut next_scan = 0usize;
@@ -1106,8 +1100,8 @@ mod tests {
     /// Fixtures live at `fixtures/jpeg`; regenerate with
     /// `python3 fixtures/jpeg/generate.py`.
     fn fixture(name: &str) -> Vec<u8> {
-        let path = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/jpeg"))
-            .join(name);
+        let path =
+            std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/jpeg")).join(name);
         std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
     }
 
@@ -1278,7 +1272,11 @@ mod tests {
                         }
                         let mut b = 0usize;
                         for (k, &(idx, td, ta)) in sel.iter().enumerate() {
-                            let n = if ns == 1 { 1 } else { comps[idx].h * comps[idx].v };
+                            let n = if ns == 1 {
+                                1
+                            } else {
+                                comps[idx].h * comps[idx].v
+                            };
                             let _ = k;
                             for _ in 0..n {
                                 let (ci, bi) = blocks[b];
@@ -1358,7 +1356,8 @@ mod tests {
                 blk[k] = extend(r.bits(sz).unwrap(), sz) << al;
                 k += 1;
             } else if run != 15 {
-                *eobrun = (1u32 << run) + u32::from(r.bits(u8::try_from(run).unwrap()).unwrap()) - 1;
+                *eobrun =
+                    (1u32 << run) + u32::from(r.bits(u8::try_from(run).unwrap()).unwrap()) - 1;
                 return;
             } else {
                 k += 16;
@@ -1388,8 +1387,8 @@ mod tests {
                     assert_eq!(sz, 1, "refinement magnitude must be 1");
                     newval = if r.bit().unwrap() != 0 { p1 } else { m1 };
                 } else if run != 15 {
-                    *eobrun = (1u32 << run)
-                        + u32::from(r.bits(u8::try_from(run).unwrap()).unwrap());
+                    *eobrun =
+                        (1u32 << run) + u32::from(r.bits(u8::try_from(run).unwrap()).unwrap());
                     break;
                 }
                 while k <= se {
@@ -1605,7 +1604,7 @@ mod tests {
             let orig = fixture(name);
             // Both the fixture as shipped and a deliberately de-optimized
             // copy of it, so the optimizer is exercised on a stream it will
-                // actually accept.
+            // actually accept.
             let flat = deoptimize(&orig);
             let before = decode_coefficients(&orig);
             assert_eq!(before, decode_coefficients(&flat), "{name}: de-optimize");
@@ -1638,7 +1637,12 @@ mod tests {
         for name in FIXTURES {
             let flat = deoptimize(&fixture(name));
             let out = optimize(&flat).unwrap();
-            assert!(out.len() < flat.len(), "{name}: {} vs {}", out.len(), flat.len());
+            assert!(
+                out.len() < flat.len(),
+                "{name}: {} vs {}",
+                out.len(),
+                flat.len()
+            );
         }
     }
 
@@ -1650,7 +1654,10 @@ mod tests {
         for name in FIXTURES {
             let flat = deoptimize(&fixture(name));
             let once = optimize(&flat).unwrap();
-            assert!(optimize(&once).is_none(), "{name}: second pass must decline");
+            assert!(
+                optimize(&once).is_none(),
+                "{name}: second pass must decline"
+            );
         }
     }
 

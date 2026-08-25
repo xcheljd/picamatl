@@ -60,6 +60,7 @@ mod cffhint;
 mod cffmerge;
 mod encodings;
 mod fonts;
+mod forms;
 mod jpeghuff;
 mod truetype;
 mod type1;
@@ -274,6 +275,33 @@ pub struct OptimizeOptions {
     /// when the gray stream is strictly smaller. Default: `false`.
     pub collapse_gray_images: bool,
 
+    /// Flatten interactive forms: paint every widget annotation's appearance
+    /// stream into its page's content stream at the position ISO 32000-1
+    /// 12.5.5 places it, then remove the whole form layer — `/AcroForm`, the
+    /// field tree, the XFA packet set (template, datasets, and the rest), and
+    /// every `/Widget` annotation. Non-widget annotations (`/Link`, markup,
+    /// popups) are not form machinery and are never touched.
+    ///
+    /// This is a **semantic** change, which is why it is opt-in: the output is
+    /// no longer a form. It cannot be filled in, exported, or signed. What it
+    /// is not, and will never be, is a silent loss of entered data. A field's
+    /// value survives only if the appearance stream that *shows* it becomes
+    /// page content, or if the field has no value to lose (`/V` absent, empty,
+    /// or a button's `/Off`); anything else declines the entire document and
+    /// the run proceeds byte-for-byte as if the flag were off. Dynamic XFA
+    /// forms (`/NeedsRendering true`) always decline — their pages are a
+    /// placeholder the reader builds from the XFA template, and amatl does not
+    /// render XFA. XFA data that the AcroForm field tree does not mirror
+    /// declines. So does a value with no appearance to burn, a hidden field
+    /// carrying data, `/NeedAppearances true` over a filled form, a signature
+    /// field holding a signature, and an optional-content widget. The full
+    /// decline table is `docs/FORMS-PLAN.md`.
+    ///
+    /// The win is the removed machinery: `corpus-expanded/irs-w2.pdf` spends
+    /// 1.58 MB of its 2.15 MB on an XFA packet set whose AcroForm layer draws
+    /// no ink at all. Default: `false`.
+    pub flatten_forms: bool,
+
     /// Deflate implementation for the final serialization passes: the
     /// whole-document re-deflate (`redeflate_flate_streams`) and the
     /// cross-reference stream. [`DeflateBackend::Zopfli`] spends ~30× the CPU
@@ -320,6 +348,7 @@ impl Default for OptimizeOptions {
             recompress_bitonal_images: false,
             allow_lossy_reencode: false,
             collapse_gray_images: false,
+            flatten_forms: false,
             deflate_backend: DeflateBackend::Zlib,
         }
     }
@@ -435,6 +464,14 @@ impl OptimizeOptions {
     #[must_use]
     pub fn with_collapse_gray_images(mut self, collapse: bool) -> Self {
         self.collapse_gray_images = collapse;
+        self
+    }
+
+    /// Enable/disable interactive-form flattening (off by default). See
+    /// [`OptimizeOptions::flatten_forms`].
+    #[must_use]
+    pub fn with_flatten_forms(mut self, flatten: bool) -> Self {
+        self.flatten_forms = flatten;
         self
     }
 
@@ -578,7 +615,10 @@ fn page_resources(doc: &Document, page_id: ObjectId) -> Option<&lopdf::Dictionar
 const MAX_FORM_DEPTH: usize = 12;
 
 /// The `/XObject` sub-dictionary of a resource dictionary, resolved.
-fn xobject_map(doc: &Document, resources: Option<&lopdf::Dictionary>) -> HashMap<Vec<u8>, ObjectId> {
+fn xobject_map(
+    doc: &Document,
+    resources: Option<&lopdf::Dictionary>,
+) -> HashMap<Vec<u8>, ObjectId> {
     let mut map = HashMap::new();
     let Some(resources) = resources else {
         return map;
@@ -3868,6 +3908,22 @@ fn try_optimize(input: &[u8], options: OptimizeOptions) -> Result<Option<Vec<u8>
     // pass can undo the other's merges, so both run and both count as work.
     let merged_decoded = dedup_decoded_streams(&mut doc);
 
+    // Opt-in form flattening, BEFORE every other planner: the appearance
+    // streams it moves into page content must then be minified, re-deflated
+    // and (if they carry images) planned like any other page content, and the
+    // XFA / field-tree objects it orphans must already be unreferenced when
+    // `prune_objects()` runs. A `None` plan is a decline — the document is
+    // optimized exactly as it would have been with the flag off. Counts as
+    // work: dropping a megabyte of XFA is the whole point.
+    let flattened = options.flatten_forms
+        && match forms::plan_flatten(&doc) {
+            Some(plan) => {
+                forms::apply_flatten(&mut doc, plan);
+                true
+            }
+            None => false,
+        };
+
     // Minify page/Form content streams before anything parses them: the
     // planners below then read the same (verified-equivalent) operations from
     // smaller bytes. Counts as work — a file whose only win is a genuinely
@@ -3955,6 +4011,7 @@ fn try_optimize(input: &[u8], options: OptimizeOptions) -> Result<Option<Vec<u8>
         && !merged_streams
         && !merged_decoded
         && !minified
+        && !flattened
         && !gray_work
         // Evaluated last, and only for a document with no other work: the
         // probe redoes the entropy analysis `reoptimize_jpeg_streams` will
@@ -7344,6 +7401,11 @@ mod tests {
             "RGB→Gray collapse rewrites /ColorSpace, so it is opt-in \
              (same posture as bitonal G4)"
         );
+        assert!(
+            !d.flatten_forms,
+            "form flattening is a semantic change (the output is no longer a \
+             form) and must stay opt-in"
+        );
     }
 
     #[test]
@@ -7357,7 +7419,8 @@ mod tests {
             .with_downsample_flate_images(false)
             .with_subset_fonts(true)
             .with_recompress_bitonal_images(true)
-            .with_allow_lossy_reencode(true);
+            .with_allow_lossy_reencode(true)
+            .with_flatten_forms(true);
         assert_eq!(o.target_dpi, 96.0);
         assert_eq!(o.jpeg_quality, 60);
         assert_eq!(o.dpi_margin, 1.5);
@@ -7367,6 +7430,7 @@ mod tests {
         assert!(o.subset_fonts);
         assert!(o.recompress_bitonal_images);
         assert!(o.allow_lossy_reencode);
+        assert!(o.flatten_forms);
     }
 
     #[test]
@@ -7679,7 +7743,9 @@ mod tests {
         let page_id = doc.get_pages().values().copied().next().unwrap();
         // Incompressible payload, so its removal cannot be confused with a
         // deflate improvement elsewhere.
-        let private: Vec<u8> = (0..8192u32).map(|i| (i.wrapping_mul(2654435761) >> 24) as u8).collect();
+        let private: Vec<u8> = (0..8192u32)
+            .map(|i| (i.wrapping_mul(2654435761) >> 24) as u8)
+            .collect();
         let blob = doc.add_object(Stream::new(dictionary! {}, private));
         let piece = dictionary! {
             "Illustrator" => dictionary! {
@@ -9208,15 +9274,19 @@ mod tests {
     /// `cargo run --release --example gen_cmyk_ycck -- \
     ///      fixtures/jpeg/cmyk_plain.jpg fixtures/jpeg/cmyk_ycck.jpg`.
     fn jpeg_fixture(name: &str) -> Vec<u8> {
-        let path = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/jpeg"))
-            .join(name);
+        let path =
+            std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/jpeg")).join(name);
         std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
     }
 
     /// Mean absolute difference between two equal-length sample buffers.
     fn sample_mad(a: &[u8], b: &[u8]) -> f64 {
         assert_eq!(a.len(), b.len(), "buffers must be the same length");
-        let sad: u64 = a.iter().zip(b).map(|(x, y)| u64::from(x.abs_diff(*y))).sum();
+        let sad: u64 = a
+            .iter()
+            .zip(b)
+            .map(|(x, y)| u64::from(x.abs_diff(*y)))
+            .sum();
         sad as f64 / a.len() as f64
     }
 
@@ -9317,9 +9387,16 @@ mod tests {
         assert_eq!(jpeg_route(&jpeg_fixture("cmyk_large.jpg")), JpegRoute::Cmyk);
         for rgb in ["seq_color.jpg", "prog_color.jpg", "prog_color444.jpg"] {
             assert_eq!(jpeg_component_count(&jpeg_fixture(rgb)), Some(3), "{rgb}");
-            assert_eq!(jpeg_route(&jpeg_fixture(rgb)), JpegRoute::GrayOrRgb, "{rgb}");
+            assert_eq!(
+                jpeg_route(&jpeg_fixture(rgb)),
+                JpegRoute::GrayOrRgb,
+                "{rgb}"
+            );
         }
-        assert_eq!(jpeg_component_count(&jpeg_fixture("prog_gray.jpg")), Some(1));
+        assert_eq!(
+            jpeg_component_count(&jpeg_fixture("prog_gray.jpg")),
+            Some(1)
+        );
         assert_eq!(
             jpeg_route(&jpeg_fixture("prog_gray.jpg")),
             JpegRoute::GrayOrRgb
@@ -9378,7 +9455,11 @@ mod tests {
                 // or rotated channel would be 85+.
                 assert!(mad < 12.0, "{name} channel {c} MAD {mad}");
             }
-            assert!(cmyk_decode_back_matches(&out, &src, CMYK_DECODE_BACK_MAX_MAD));
+            assert!(cmyk_decode_back_matches(
+                &out,
+                &src,
+                CMYK_DECODE_BACK_MAX_MAD
+            ));
         }
     }
 
@@ -9407,7 +9488,11 @@ mod tests {
     fn cmyk_verification_rejects_inverted_and_rotated_channels() {
         let src = decode_cmyk_jpeg_scaled(&jpeg_fixture("cmyk_plain.jpg"), 96, 64).unwrap();
         let out = encode_cmyk_jpeg(&src, 78).expect("encode");
-        assert!(cmyk_decode_back_matches(&out, &src, CMYK_DECODE_BACK_MAX_MAD));
+        assert!(cmyk_decode_back_matches(
+            &out,
+            &src,
+            CMYK_DECODE_BACK_MAX_MAD
+        ));
 
         let inverted = CmykImage {
             data: src.data.iter().map(|b| 255 - b).collect(),
@@ -9540,10 +9625,7 @@ mod tests {
         // structural check above.
         assert!(decode_cmyk_jpeg_scaled(&truncated, 260, 195).is_some());
 
-        let stream = Stream::new(
-            dictionary! { "Filter" => "DCTDecode" },
-            truncated.clone(),
-        );
+        let stream = Stream::new(dictionary! { "Filter" => "DCTDecode" }, truncated.clone());
         assert!(plan_dct_cmyk(&stream, 78, 260, 195, false).is_none());
 
         let pdf = build_pdf_cmyk(truncated.clone(), 640, 480, 144, 108, None);
@@ -9676,7 +9758,11 @@ mod tests {
         let pdf = build_pdf_cmyk(rgb.clone(), 96, 64, 24, 16, None);
         let out = optimize_with_options(&pdf, OptimizeOptions::default());
         let (_, content) = only_image_stream(&out);
-        assert_eq!(jpeg_component_count(&content), Some(3), "must stay as found");
+        assert_eq!(
+            jpeg_component_count(&content),
+            Some(3),
+            "must stay as found"
+        );
         assert_eq!(
             jpeg_quant_tables(&rgb),
             jpeg_quant_tables(&content),
@@ -9686,15 +9772,8 @@ mod tests {
         // And the reverse: a four-component payload under /DeviceRGB.
         let cmyk = jpeg_fixture("cmyk_plain.jpg");
         let doc_bytes = {
-            let mut doc = Document::load_mem(&build_pdf_cmyk(
-                cmyk.clone(),
-                96,
-                64,
-                24,
-                16,
-                None,
-            ))
-            .unwrap();
+            let mut doc =
+                Document::load_mem(&build_pdf_cmyk(cmyk.clone(), 96, 64, 24, 16, None)).unwrap();
             let id = *doc
                 .objects
                 .iter()
@@ -9705,7 +9784,8 @@ mod tests {
                 .unwrap()
                 .0;
             if let Ok(Object::Stream(s)) = doc.get_object_mut(id) {
-                s.dict.set("ColorSpace", Object::Name(b"DeviceRGB".to_vec()));
+                s.dict
+                    .set("ColorSpace", Object::Name(b"DeviceRGB".to_vec()));
             }
             let mut v = Vec::new();
             doc.save_to(&mut v).unwrap();
@@ -9713,7 +9793,11 @@ mod tests {
         };
         let out = optimize_with_options(&doc_bytes, OptimizeOptions::default());
         let (_, content) = only_image_stream(&out);
-        assert_eq!(jpeg_component_count(&content), Some(4), "must stay as found");
+        assert_eq!(
+            jpeg_component_count(&content),
+            Some(4),
+            "must stay as found"
+        );
         assert_eq!(jpeg_quant_tables(&cmyk), jpeg_quant_tables(&content));
     }
 
@@ -9813,7 +9897,10 @@ mod tests {
                 );
                 let back = decode_cmyk_jpeg_scaled(&content, 1, 1)
                     .expect("a replacement must decode as CMYK");
-                assert_eq!((back.source_width as i64, back.source_height as i64), (w, h));
+                assert_eq!(
+                    (back.source_width as i64, back.source_height as i64),
+                    (w, h)
+                );
                 assert_eq!(
                     jpeg_component_count(&content),
                     Some(4),
@@ -9821,7 +9908,10 @@ mod tests {
                 );
                 let back = decode_cmyk_jpeg_scaled(&content, 1, 1)
                     .expect("a replacement must decode as CMYK");
-                assert_eq!((back.source_width as i64, back.source_height as i64), (w, h));
+                assert_eq!(
+                    (back.source_width as i64, back.source_height as i64),
+                    (w, h)
+                );
             } else {
                 assert_eq!((w, h), (96, 64));
             }
