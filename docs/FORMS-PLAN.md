@@ -105,8 +105,8 @@ document is optimized exactly as it would have been without the flag:
 | D11 | a field with a non-empty value that has no widgets at all, or none on any page | the same gate as D9 reaching the case where there was never anything to burn |
 | D12 | a widget to burn whose `/AP` stream has no `/BBox`, a degenerate `/BBox`/`/Rect`, or a non-invertible `/Matrix` | the 12.5.5 mapping is undefined |
 | D13 | a page whose content cannot be parsed, contains an inline image (`BI`), is not `q`/`Q` balanced, or ends inside an unclosed text object (`BT` with no `ET`) | see [Content-stream splicing](#content-stream-splicing) |
-| D15 | a widget to burn whose appearance stream has no `/Resources` and whose operators name one (`Tf`, `Do`, `gs`, `sh`, `BDC`, a non-device `cs`/`CS`, a pattern `scn`) | it was resolving those names against `/AcroForm /DR`, which this pass deletes. Same silent-`Do` failure mode as D14 |
 | D14 | a page to burn into whose `/Resources` or `/Resources /XObject` does not resolve to a dictionary | the burn names would have nowhere to bind, and a `Do` on an undefined name is skipped *silently* — the one way a value could disappear without the document declining |
+| D15 | a widget to burn whose appearance stream has no `/Resources` and whose operators name one (`Tf`, `Do`, `gs`, `sh`, `BDC`, a non-device `cs`/`CS`, a pattern `scn`) | it was resolving those names against `/AcroForm /DR`, which this pass deletes. Same silent-`Do` failure mode as D14 |
 
 Degenerate is not "small": a zero-width or zero-height `/Rect` or transformed
 `/BBox` is what D12 rejects.
