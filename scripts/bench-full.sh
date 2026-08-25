@@ -33,8 +33,8 @@ fi
 echo "== amatl kitchen sink =="
 for f in "${files[@]}"; do
   name=$(basename "$f" .pdf)
-  "$bin" --allow-lossy --strip-accessibility --strip-metadata --convert-type1 \
-    --strip-hinting --recompress-bitonal-images --collapse-gray-images \
+  "$bin" --allow-lossy --strip-accessibility --strip-metadata --strip-private-data \
+    --convert-type1 --strip-hinting --recompress-bitonal-images --collapse-gray-images \
     --deflate-backend zopfli -o "$out/kitchen/$name.pdf" "$f" >/dev/null 2>&1
   echo "  $name: $?"
 done

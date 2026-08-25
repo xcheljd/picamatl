@@ -574,10 +574,13 @@ fn page_resources(doc: &Document, page_id: ObjectId) -> Option<&lopdf::Dictionar
     None
 }
 
-/// Map of image-XObject resource names to their object id for one page.
-fn page_image_names(doc: &Document, page_id: ObjectId) -> HashMap<Vec<u8>, ObjectId> {
+/// Depth bound for nested Form XObjects during placement collection.
+const MAX_FORM_DEPTH: usize = 12;
+
+/// The `/XObject` sub-dictionary of a resource dictionary, resolved.
+fn xobject_map(doc: &Document, resources: Option<&lopdf::Dictionary>) -> HashMap<Vec<u8>, ObjectId> {
     let mut map = HashMap::new();
-    let Some(resources) = page_resources(doc, page_id) else {
+    let Some(resources) = resources else {
         return map;
     };
     let Ok(xobjects) = resources.get(b"XObject").map(|x| resolve(doc, x)) else {
@@ -597,57 +600,138 @@ fn page_image_names(doc: &Document, page_id: ObjectId) -> HashMap<Vec<u8>, Objec
 /// Largest on-page rendered size (in points) for each image object id, across
 /// every placement on every page. We size to the largest use so a shared image
 /// is never under-resolved.
+///
+/// Placements inside Form XObjects count: a producer that wraps its page in a
+/// form (Illustrator, LaTeX `\includegraphics`, IRS's XFA-rendered forms) used
+/// to hide every image it draws from this scan, and an image with no recorded
+/// placement is never downsampled. On `corpus/irs-1040gi.pdf` that hid a
+/// 5120x3413 scan drawn at 405 effective DPI — 1.45 MB, half the optimized
+/// file — behind one form.
+///
+/// Failing to see a placement is safe (the image is left alone); *under*-
+/// stating one is not, so anything unparseable simply contributes no
+/// placement, and a form's `/BBox` clip is deliberately ignored — clipping can
+/// only ever make the visible area smaller than what we record.
 fn collect_placements(doc: &Document) -> HashMap<ObjectId, (f32, f32)> {
     let mut sizes: HashMap<ObjectId, (f32, f32)> = HashMap::new();
 
     for (_, page_id) in doc.get_pages() {
-        let names = page_image_names(doc, page_id);
-        if names.is_empty() {
-            continue;
-        }
+        let resources = page_resources(doc, page_id);
         let content_bytes = doc.get_page_content(page_id);
-        let Ok(content) = Content::decode(&content_bytes) else {
-            continue;
-        };
-
-        let mut ctm = Mat::IDENTITY;
-        let mut stack: Vec<Mat> = Vec::new();
-
-        for op in content.operations {
-            match op.operator.as_str() {
-                "q" => stack.push(ctm),
-                "Q" => {
-                    if let Some(prev) = stack.pop() {
-                        ctm = prev;
-                    }
-                }
-                "cm" if op.operands.len() == 6 => {
-                    let m = Mat {
-                        a: num(&op.operands[0]),
-                        b: num(&op.operands[1]),
-                        c: num(&op.operands[2]),
-                        d: num(&op.operands[3]),
-                        e: num(&op.operands[4]),
-                        f: num(&op.operands[5]),
-                    };
-                    ctm = m.concat(ctm);
-                }
-                "Do" => {
-                    if let Some(Object::Name(name)) = op.operands.first() {
-                        if let Some(id) = names.get(name) {
-                            let (w, h) = (ctm.rendered_width(), ctm.rendered_height());
-                            let entry = sizes.entry(*id).or_insert((0.0, 0.0));
-                            entry.0 = entry.0.max(w);
-                            entry.1 = entry.1.max(h);
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
+        let mut path: Vec<ObjectId> = Vec::new();
+        walk_placements(
+            doc,
+            &content_bytes,
+            resources,
+            Mat::IDENTITY,
+            &mut sizes,
+            &mut path,
+        );
     }
 
     sizes
+}
+
+/// Walk one content stream's operators in its resource context, recording
+/// image placements and recursing into the Form XObjects it draws.
+fn walk_placements(
+    doc: &Document,
+    content_bytes: &[u8],
+    resources: Option<&lopdf::Dictionary>,
+    initial_ctm: Mat,
+    sizes: &mut HashMap<ObjectId, (f32, f32)>,
+    path: &mut Vec<ObjectId>,
+) {
+    let names = xobject_map(doc, resources);
+    if names.is_empty() {
+        return;
+    }
+    let Ok(content) = Content::decode(content_bytes) else {
+        return;
+    };
+
+    let mut ctm = initial_ctm;
+    let mut stack: Vec<Mat> = Vec::new();
+
+    for op in content.operations {
+        match op.operator.as_str() {
+            "q" => stack.push(ctm),
+            "Q" => {
+                if let Some(prev) = stack.pop() {
+                    ctm = prev;
+                }
+            }
+            "cm" if op.operands.len() == 6 => {
+                let m = Mat {
+                    a: num(&op.operands[0]),
+                    b: num(&op.operands[1]),
+                    c: num(&op.operands[2]),
+                    d: num(&op.operands[3]),
+                    e: num(&op.operands[4]),
+                    f: num(&op.operands[5]),
+                };
+                ctm = m.concat(ctm);
+            }
+            "Do" => {
+                let Some(Object::Name(name)) = op.operands.first() else {
+                    continue;
+                };
+                let Some(&id) = names.get(name) else { continue };
+                let Ok(Object::Stream(stream)) = doc.get_object(id) else {
+                    continue;
+                };
+                match stream.dict.get(b"Subtype").map(|s| resolve(doc, s)) {
+                    Ok(Object::Name(n)) if n == b"Image" => {
+                        let (w, h) = (ctm.rendered_width(), ctm.rendered_height());
+                        let entry = sizes.entry(id).or_insert((0.0, 0.0));
+                        entry.0 = entry.0.max(w);
+                        entry.1 = entry.1.max(h);
+                    }
+                    Ok(Object::Name(n)) if n == b"Form" => {
+                        // Cycle guard and depth bound: a malformed form
+                        // reachable from itself must not loop.
+                        if path.contains(&id) || path.len() >= MAX_FORM_DEPTH {
+                            continue;
+                        }
+                        let form_ctm = match stream.dict.get(b"Matrix").map(|m| resolve(doc, m)) {
+                            Ok(Object::Array(items)) if items.len() == 6 => Mat {
+                                a: num(&items[0]),
+                                b: num(&items[1]),
+                                c: num(&items[2]),
+                                d: num(&items[3]),
+                                e: num(&items[4]),
+                                f: num(&items[5]),
+                            }
+                            .concat(ctm),
+                            // No /Matrix means the identity; anything else is
+                            // unreadable, and guessing a scale here could
+                            // UNDER-state the placement. Skip the form.
+                            Err(_) | Ok(Object::Null) => ctm,
+                            _ => continue,
+                        };
+                        // A form without its own /Resources inherits the
+                        // context it is drawn in (ISO 32000-1 8.10.2).
+                        let own = match stream.dict.get(b"Resources").map(|r| resolve(doc, r)) {
+                            Ok(Object::Dictionary(_)) => {
+                                resolve(doc, stream.dict.get(b"Resources").unwrap())
+                                    .as_dict()
+                                    .ok()
+                            }
+                            _ => resources,
+                        };
+                        let Some(bytes) = content_stream_plain(doc, stream) else {
+                            continue;
+                        };
+                        path.push(id);
+                        walk_placements(doc, &bytes, own, form_ctm, sizes, path);
+                        path.pop();
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Dictionary edits that accompany a replacement's new stream bytes, beyond
