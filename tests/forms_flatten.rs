@@ -987,6 +987,133 @@ fn render(gs: &str, pdf: &std::path::Path, out: &std::path::Path) -> Vec<u8> {
     std::fs::read(out).expect("gs wrote a raster")
 }
 
+// -- multi-page and inherited resources ------------------------------------
+
+/// Two pages, a filled widget on each, and **no** `/Resources` on either page
+/// — they inherit one dictionary from the `/Pages` node. Exercises the shared
+/// `q` stream, globally-unique burn names in a shared resource dictionary, and
+/// per-page splicing.
+fn build_two_pages() -> Vec<u8> {
+    let mut doc = Document::with_version("1.7");
+    let pages_id = doc.new_object_id();
+    let font_id = doc.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "Type1",
+        "BaseFont" => "Helvetica",
+        "Encoding" => "WinAnsiEncoding",
+    });
+
+    let mut page_ids = Vec::new();
+    let mut fields = Vec::new();
+    for (index, label) in ["Ada Lovelace", "Grace Hopper"].iter().enumerate() {
+        let ap = appearance(&mut doc, font_id, 160.0, 14.0, label);
+        let widget = doc.add_object(dictionary! {
+            "Type" => "Annot",
+            "Subtype" => "Widget",
+            "FT" => "Tx",
+            "T" => utf16(&format!("name{index}")),
+            "V" => utf16(label),
+            "F" => 4,
+            "Rect" => vec![72.into(), 700.into(), 232.into(), 714.into()],
+            "AP" => dictionary! { "N" => ap },
+        });
+        fields.push(Object::Reference(widget));
+        let content = doc.add_object(Stream::new(
+            dictionary! {},
+            format!("q 0 g BT /Helv 12 Tf 40 740 Td (Page {index}) Tj ET Q\n").into_bytes(),
+        ));
+        page_ids.push(Object::Reference(doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "Contents" => content,
+            "Annots" => vec![Object::Reference(widget)],
+        })));
+    }
+
+    doc.set_object(
+        pages_id,
+        dictionary! {
+            "Type" => "Pages",
+            "Kids" => page_ids,
+            "Count" => 2,
+            // Inherited by both pages, and shared: the burn names must not
+            // collide across pages.
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Resources" => dictionary! { "Font" => dictionary! { "Helv" => font_id } },
+        },
+    );
+    let catalog_id = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+        "AcroForm" => dictionary! { "Fields" => fields },
+    });
+    doc.trailer.set("Root", catalog_id);
+    doc.compress();
+
+    let mut out = Vec::new();
+    doc.save_to(&mut out).unwrap();
+    out
+}
+
+#[test]
+fn burns_on_several_pages_sharing_one_inherited_resource_dictionary() {
+    let out = optimize_with_options(&build_two_pages(), flatten());
+    let view = View::of(&out);
+    assert!(!view.catalog().has(b"AcroForm"));
+
+    let pages: Vec<ObjectId> = view.0.get_pages().values().copied().collect();
+    assert_eq!(pages.len(), 2);
+    let mut painted_labels = Vec::new();
+    for (index, &page_id) in pages.iter().enumerate() {
+        let content = view.0.get_page_content(page_id);
+        assert!(
+            contains(&content, format!("(Page {index}) Tj").as_bytes()),
+            "page {index} keeps its own drawing"
+        );
+        let names: Vec<Vec<u8>> = Content::decode(&content)
+            .unwrap()
+            .operations
+            .iter()
+            .filter(|op| op.operator == "Do")
+            .map(|op| op.operands[0].as_name().unwrap().to_vec())
+            .collect();
+        assert_eq!(names.len(), 1, "one burn per page");
+
+        // The name resolves through the INHERITED resource dictionary.
+        let page = view.0.get_object(page_id).unwrap().as_dict().unwrap();
+        assert!(
+            !page.has(b"Resources"),
+            "the page must still inherit its resources, not gain a private copy"
+        );
+        let parent = match page.get(b"Parent").unwrap() {
+            Object::Reference(id) => view.0.get_object(*id).unwrap().as_dict().unwrap(),
+            other => other.as_dict().unwrap(),
+        };
+        let resources = match parent.get(b"Resources").unwrap() {
+            Object::Reference(id) => view.0.get_object(*id).unwrap(),
+            other => other,
+        };
+        let xobjects = match resources.as_dict().unwrap().get(b"XObject").unwrap() {
+            Object::Reference(id) => view.0.get_object(*id).unwrap(),
+            other => other,
+        };
+        let target = match xobjects.as_dict().unwrap().get(&names[0]).unwrap() {
+            Object::Reference(id) => view.0.get_object(*id).unwrap(),
+            other => other,
+        };
+        let Object::Stream(stream) = target else {
+            panic!("a burn must resolve to a stream");
+        };
+        painted_labels.push(stream.decompressed_content().unwrap());
+    }
+    assert!(
+        painted_labels[0] != painted_labels[1],
+        "distinct burn targets"
+    );
+    assert!(contains(&painted_labels[0], b"Ada Lovelace"));
+    assert!(contains(&painted_labels[1], b"Grace Hopper"));
+}
+
 // -- committed fixtures -----------------------------------------------------
 
 /// Writes the redistributable fixtures used by `scripts/forms-verify.py` and
