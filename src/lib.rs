@@ -1459,20 +1459,33 @@ fn decode_jpeg(data: &[u8], target_w: u32, target_h: u32) -> Option<(DynamicImag
     Some((decoded, is_gray))
 }
 
-/// True when a raster of `width * height * components` bytes is small enough
-/// to materialize. Mirrors [`MAX_FLATE_PIXEL_BYTES`] — the same 256 MiB
-/// ceiling the Flate path applies before inflating, for the same reason.
+/// True when a raster of `width * height * channels` bytes is small enough to
+/// materialize. Mirrors [`MAX_FLATE_PIXEL_BYTES`] — the same 256 MiB ceiling
+/// the Flate path applies before inflating, for the same reason, and shared by
+/// every decoder that allocates from numbers a file told it (JPEG frame
+/// headers, JPEG2000 codestream headers).
 ///
-/// A zero component count is treated as 4 (the largest this crate ever
-/// decodes) rather than as "free": a frame header claiming zero components is
-/// already nonsense, and pricing it at zero would wave it straight through.
+/// Overflowing the multiplication is itself a decline: a raster whose size
+/// does not fit in a u64 is not one we are going to decode.
+fn raster_within_budget(width: u64, height: u64, channels: u64) -> bool {
+    width
+        .checked_mul(height)
+        .and_then(|px| px.checked_mul(channels))
+        .is_some_and(|bytes| bytes <= MAX_FLATE_PIXEL_BYTES)
+}
+
+/// [`raster_within_budget`] for a JPEG frame header.
+///
+/// A zero component count is priced as 4 (the widest this crate ever decodes)
+/// rather than as free: a frame header claiming zero components is already
+/// nonsense, and pricing it at zero would wave it straight through.
 fn jpeg_decode_within_budget(width: u16, height: u16, components: u8) -> bool {
     let channels = if components == 0 {
         4u64
     } else {
         u64::from(components)
     };
-    u64::from(width) * u64::from(height) * channels <= MAX_FLATE_PIXEL_BYTES
+    raster_within_budget(u64::from(width), u64::from(height), channels)
 }
 
 /// Phase 5 D-M1: dimension-preserving JPEG requantization for a base image
@@ -2612,10 +2625,7 @@ fn scaled_decode_within_budget(
 ) -> bool {
     let scaled_w = (full_w as u64 * numerator as u64).div_ceil(8);
     let scaled_h = (full_h as u64 * numerator as u64).div_ceil(8);
-    scaled_w
-        .checked_mul(scaled_h)
-        .and_then(|px| px.checked_mul(channels))
-        .is_some_and(|bytes| bytes <= MAX_FLATE_PIXEL_BYTES)
+    raster_within_budget(scaled_w, scaled_h, channels)
 }
 
 fn decode_jpeg_scaled(data: &[u8], target_w: u32, target_h: u32) -> Option<(DynamicImage, bool)> {
@@ -3189,10 +3199,7 @@ fn plan_jpx_conversions(doc: &Document, options: OptimizeOptions) -> Vec<JpxConv
         // kill no `catch_unwind` can contain. Same 256 MiB ceiling the Flate
         // and DCT paths apply, for the same reason. The length check below
         // stays: it catches a codestream that lied the other way.
-        let priced = u64::from(w)
-            .checked_mul(u64::from(h))
-            .and_then(|px| px.checked_mul(channels as u64));
-        if !priced.is_some_and(|bytes| bytes <= MAX_FLATE_PIXEL_BYTES) {
+        if !raster_within_budget(u64::from(w), u64::from(h), channels as u64) {
             continue;
         }
         let Ok(pixels) = jpx.decode() else {
@@ -10105,5 +10112,292 @@ print("djpeg sizes", len(ra), len(rb))
             .status()
             .expect("run python3");
         assert!(status.success(), "cross-decoder check failed");
+    }
+
+    // -----------------------------------------------------------------------
+    // Decompression-bomb guards.
+    //
+    // Every decoder this crate reaches for allocates `w * h * channels` from
+    // numbers the FILE supplied. A few dozen crafted bytes can therefore ask
+    // for gigabytes, and an allocation failure in Rust is an abort — a process
+    // kill, not a panic, so the `catch_unwind` that contains every other kind
+    // of decoder misbehaviour cannot contain it. These pin the ceilings.
+    // -----------------------------------------------------------------------
+
+    /// A JPEG that is a few dozen bytes and declares a `w` x `h` frame: SOI,
+    /// an optional Adobe APP14 (which makes libjpeg read four components as
+    /// CMYK), SOF0, SOS, a scrap of entropy data, EOI. Structurally valid
+    /// enough for a decoder to believe the geometry; nowhere near enough data
+    /// to fill it.
+    fn bomb_jpeg(w: u16, h: u16, comps: u8, adobe: bool) -> Vec<u8> {
+        let mut v = vec![0xFF, 0xD8];
+        if adobe {
+            v.extend_from_slice(&[0xFF, 0xEE, 0x00, 0x0E]);
+            v.extend_from_slice(b"Adobe");
+            // version(2) flags0(2) flags1(2) transform(1) = the 12-byte
+            // payload the declared length above promises.
+            v.extend_from_slice(&[0, 100, 0, 0, 0, 0, 0]);
+        }
+        let ncomp = comps as usize;
+        v.extend_from_slice(&[0xFF, 0xC0]);
+        v.extend_from_slice(&((8 + 3 * ncomp) as u16).to_be_bytes());
+        v.push(8); // sample precision
+        v.extend_from_slice(&h.to_be_bytes());
+        v.extend_from_slice(&w.to_be_bytes());
+        v.push(comps);
+        for c in 0..comps {
+            v.extend_from_slice(&[c + 1, 0x11, 0]);
+        }
+        v.extend_from_slice(&[0xFF, 0xDA]);
+        v.extend_from_slice(&((6 + 2 * ncomp) as u16).to_be_bytes());
+        v.push(comps);
+        for c in 0..comps {
+            v.extend_from_slice(&[c + 1, 0x00]);
+        }
+        v.extend_from_slice(&[0x00, 0x3F, 0x00]);
+        v.extend_from_slice(&[0x12, 0x34, 0x56, 0x78]);
+        v.extend_from_slice(&[0xFF, 0xD9]);
+        v
+    }
+
+    #[test]
+    fn jpeg_frame_info_reads_the_declared_geometry() {
+        let f = jpeg_frame_info(&bomb_jpeg(60000, 40000, 3, false)).expect("frame parses");
+        assert_eq!((f.width, f.height, f.components), (60000, 40000, 3));
+        // The component-count wrapper still answers what it always did.
+        assert_eq!(jpeg_component_count(&bomb_jpeg(8, 8, 4, true)), Some(4));
+        assert_eq!(jpeg_component_count(b"not a jpeg"), None);
+    }
+
+    #[test]
+    fn the_raster_budget_mirrors_the_flate_ceiling() {
+        // Exactly at the ceiling is fine; one byte over is not.
+        assert!(raster_within_budget(MAX_FLATE_PIXEL_BYTES, 1, 1));
+        assert!(!raster_within_budget(MAX_FLATE_PIXEL_BYTES + 1, 1, 1));
+        // An ordinary page image is nowhere near it.
+        assert!(raster_within_budget(2000, 2000, 3));
+        // 60000 x 60000 RGB is 10 GB.
+        assert!(!raster_within_budget(60000, 60000, 3));
+        // Overflow declines rather than wrapping into a small number.
+        assert!(!raster_within_budget(u64::MAX, u64::MAX, 4));
+        // A frame header claiming zero components is priced as four, not free.
+        assert!(!jpeg_decode_within_budget(u16::MAX, u16::MAX, 0));
+        assert!(jpeg_decode_within_budget(1000, 1000, 3));
+    }
+
+    /// The window the full-decode fallback opens: `decode_jpeg_scaled`
+    /// declines CMYK cleanly (it will not hand-roll the colour conversion), so
+    /// the bytes go on to the general-purpose decoder, which would otherwise
+    /// allocate straight from the frame header. This is the path a `/SMask`
+    /// stream takes, and the one a crafted PDF would aim at.
+    ///
+    /// Honest about what this pins: the `image` version in use carries its own
+    /// (larger, ~512 MiB) default allocation limit, so today it would refuse
+    /// the first case on its own. Ours is the ceiling that does not move when
+    /// a dependency's default does — the second case sits between the two, and
+    /// only our budget rules it out.
+    #[test]
+    fn decode_jpeg_declines_a_bomb_before_the_fallback_allocates() {
+        for (w, h) in [(60000, 60000), (10000, 9000)] {
+            let bomb = bomb_jpeg(w, h, 4, true);
+            assert!(
+                decode_jpeg_scaled(&bomb, 100, 100).is_none(),
+                "{w}x{h}: the CMYK scaled path declines, opening the fallback"
+            );
+            assert!(
+                !jpeg_decode_within_budget(w, h, 4),
+                "{w}x{h}: must be priced out of the fallback"
+            );
+            assert!(
+                decode_jpeg(&bomb, 100, 100).is_none(),
+                "{w}x{h}: the fallback must decline, not try to hold the frame"
+            );
+        }
+        // The control: the same shape at a size a real page produces is NOT
+        // priced out — the guard rules out bombs, not CMYK.
+        assert!(jpeg_decode_within_budget(2000, 1500, 4));
+    }
+
+    /// End to end: a page whose image is a decompression bomb comes back as
+    /// the input bytes. What is really being pinned is that the process is
+    /// still alive to return them.
+    #[test]
+    fn a_decompression_bomb_jpeg_returns_the_input_bytes() {
+        for (label, comps, cs) in [("rgb", 3u8, "DeviceRGB"), ("cmyk", 4, "DeviceCMYK")] {
+            let mut doc = Document::with_version("1.5");
+            let img_id = doc.add_object(Stream::new(
+                dictionary! {
+                    "Type" => "XObject",
+                    "Subtype" => "Image",
+                    "Width" => 60000_i64,
+                    "Height" => 60000_i64,
+                    "ColorSpace" => cs,
+                    "BitsPerComponent" => 8_i64,
+                    "Filter" => "DCTDecode",
+                },
+                bomb_jpeg(60000, 60000, comps, comps == 4),
+            ));
+            let pdf = wrap_image_pdf(&mut doc, img_id, 72);
+            let out = optimize_with_options(&pdf, OptimizeOptions::default());
+            assert_eq!(out, pdf, "{label} bomb must leave the file untouched");
+        }
+    }
+
+    /// A bare JPEG2000 codestream (SOC/SIZ/COD/QCD/SOT/SOD/EOC) declaring
+    /// `w` x `h` in `comps` 8-bit components. Header-valid, content-free.
+    fn bomb_jpx(w: u32, h: u32, comps: u16) -> Vec<u8> {
+        let mut v = vec![0xFF, 0x4F]; // SOC
+        v.extend_from_slice(&[0xFF, 0x51]); // SIZ
+        v.extend_from_slice(&(38u16 + 3 * comps).to_be_bytes());
+        v.extend_from_slice(&0u16.to_be_bytes()); // Rsiz
+        v.extend_from_slice(&w.to_be_bytes()); // Xsiz
+        v.extend_from_slice(&h.to_be_bytes()); // Ysiz
+        v.extend_from_slice(&0u32.to_be_bytes()); // XOsiz
+        v.extend_from_slice(&0u32.to_be_bytes()); // YOsiz
+        v.extend_from_slice(&w.to_be_bytes()); // XTsiz (one tile)
+        v.extend_from_slice(&h.to_be_bytes()); // YTsiz
+        v.extend_from_slice(&0u32.to_be_bytes()); // XTOsiz
+        v.extend_from_slice(&0u32.to_be_bytes()); // YTOsiz
+        v.extend_from_slice(&comps.to_be_bytes()); // Csiz
+        for _ in 0..comps {
+            v.extend_from_slice(&[7, 1, 1]); // 8-bit unsigned, no subsampling
+        }
+        // COD: no precincts, LRCP, 1 layer, 5 decomposition levels, 5/3.
+        v.extend_from_slice(&[
+            0xFF, 0x52, 0x00, 0x0C, 0x00, 0x00, 0x00, 0x01, 0x00, 0x05, 0x04, 0x04, 0x00, 0x01,
+        ]);
+        // QCD: 2 guard bits, no quantization, 3 * 5 + 1 subbands.
+        v.extend_from_slice(&[0xFF, 0x5C, 0x00, 0x13, 0x40]);
+        v.extend_from_slice(&[0x40u8; 16]);
+        // SOT / SOD / EOC.
+        v.extend_from_slice(&[
+            0xFF, 0x90, 0x00, 0x0A, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0E, 0x00, 0x01,
+        ]);
+        v.extend_from_slice(&[0xFF, 0x93, 0x00, 0x00]);
+        v.extend_from_slice(&[0xFF, 0xD9]);
+        v
+    }
+
+    /// The JPX→JPEG conversion is opt-in, but consent to a lossy re-encode is
+    /// not consent to allocate 10 GB from a header. The codestream below is
+    /// header-valid — `JpxImage::new` accepts it and reports its geometry —
+    /// so nothing before the size check would have turned it away.
+    #[test]
+    fn an_oversized_jpx_declines_under_allow_lossy() {
+        let mut doc = Document::with_version("1.6");
+        let payload = bomb_jpx(60000, 60000, 3);
+        let img_id = doc.add_object(Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Image",
+                "Width" => 60000_i64,
+                "Height" => 60000_i64,
+                "BitsPerComponent" => 8_i64,
+                "Filter" => "JPXDecode",
+            },
+            payload.clone(),
+        ));
+        let pdf = wrap_image_pdf(&mut doc, img_id, 72);
+
+        let options = OptimizeOptions {
+            allow_lossy_reencode: true,
+            ..OptimizeOptions::default()
+        };
+        let doc = Document::load_mem(&pdf).unwrap();
+        assert!(
+            plan_jpx_conversions(&doc, options).is_empty(),
+            "a 10 GB raster must be priced out before decode()"
+        );
+
+        // And end to end: the payload survives the run byte for byte.
+        let out = optimize_with_options(&pdf, options);
+        let survived = Document::load_mem(&out).unwrap().objects.values().any(|o| {
+            matches!(o, Object::Stream(s)
+                if matches!(s.dict.get(b"Filter"), Ok(Object::Name(n)) if n == b"JPXDecode")
+                    && s.content == payload)
+        });
+        assert!(survived, "the JPX stream must come through untouched");
+    }
+
+    /// The `/SMask` invariant `plan_replacement` relies on: a mask that fails
+    /// eligibility takes the WHOLE pair out of consideration, so the code
+    /// downstream never sees `smask_present` without an id. Pinned here
+    /// because the two live sixty lines apart.
+    #[test]
+    fn an_ineligible_smask_takes_the_whole_pair_out() {
+        type Mutate<'a> = &'a dyn Fn(&mut lopdf::Dictionary);
+        let mutations: [(&str, Mutate); 4] = [
+            // A stencil mask, not a soft mask.
+            ("ImageMask", &|d| d.set("ImageMask", Object::Boolean(true))),
+            // Not 8-bit gray samples.
+            ("BitsPerComponent 1", &|d| {
+                d.set("BitsPerComponent", Object::Integer(1))
+            }),
+            ("ColorSpace DeviceRGB", &|d| {
+                d.set("ColorSpace", Object::Name(b"DeviceRGB".to_vec()))
+            }),
+            // A /Decode array remaps the mask's samples.
+            ("Decode array", &|d| {
+                d.set("Decode", vec![Object::Integer(1), Object::Integer(0)])
+            }),
+        ];
+        for (label, mutate) in mutations {
+            let pdf = build_pdf_smask_ext(600, 72, 92, |_| {}, mutate);
+            let doc = Document::load_mem(&pdf).unwrap();
+            for (&id, obj) in doc.objects.iter() {
+                let Object::Stream(s) = obj else { continue };
+                if s.dict.get(b"SMask").is_err() {
+                    continue;
+                }
+                assert!(
+                    plan_replacement(&doc, id, (72.0, 72.0), OptimizeOptions::default()).is_none(),
+                    "{label}: an ineligible mask must decline the pair"
+                );
+            }
+            let out = optimize_with_options(&pdf, OptimizeOptions::default());
+            assert_eq!(out, pdf, "{label}: the file must be untouched");
+        }
+    }
+
+    /// Rogue placement geometry declines instead of collapsing to a 1px
+    /// target (NaN) or saturating to a 4-billion-pixel one (+inf).
+    #[test]
+    fn non_finite_placement_geometry_declines() {
+        let pdf = build_pdf(600, 72);
+        let doc = Document::load_mem(&pdf).unwrap();
+        let id = doc
+            .objects
+            .iter()
+            .find(|(_, o)| {
+                matches!(o, Object::Stream(s)
+                    if matches!(s.dict.get(b"Subtype"), Ok(Object::Name(n)) if n == b"Image"))
+            })
+            .map(|(&id, _)| id)
+            .expect("the fixture has one image");
+
+        // The control: an ordinary placement of this fixture is planned.
+        assert!(
+            plan_replacement(&doc, id, (72.0, 72.0), OptimizeOptions::default()).is_some(),
+            "control: a sane placement is still planned"
+        );
+        for (label, rendered) in [
+            ("NaN", (f32::NAN, 72.0)),
+            ("+inf", (f32::INFINITY, 72.0)),
+            ("-inf", (f32::NEG_INFINITY, 72.0)),
+            ("NaN height", (72.0, f32::NAN)),
+        ] {
+            assert!(
+                plan_replacement(&doc, id, rendered, OptimizeOptions::default()).is_none(),
+                "{label} placement must decline"
+            );
+        }
+        // A non-finite target DPI is the same story from the other side.
+        for dpi in [f32::NAN, f32::INFINITY] {
+            let options = OptimizeOptions {
+                target_dpi: dpi,
+                ..OptimizeOptions::default()
+            };
+            assert!(plan_replacement(&doc, id, (72.0, 72.0), options).is_none());
+        }
     }
 }

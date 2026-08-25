@@ -1673,3 +1673,358 @@ pub(crate) fn convert_to_cff(
     out.extend_from_slice(&private);
     Some(out)
 }
+
+// ---------------------------------------------------------------------------
+// Charstring-interpreter tests.
+//
+// These drive `interpret_glyph` on hand-built charstrings rather than on a
+// parsed font program, because the two constructs that carry the most decline
+// branches — `callothersubr` (flex, hint replacement) and `seac` (accent
+// composition) — are exactly the ones real corpus fonts exercise least. Every
+// case below pins a specific `None`: for a converter whose contract is
+// "convert or leave the font alone", a missed decline is a corrupt glyph.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Charstring builder. Numbers always take the 5-byte 255 form — the
+    /// interpreter's other three number encodings are covered by real fonts;
+    /// what these tests are after is the operators.
+    #[derive(Default)]
+    struct Cs(Vec<u8>);
+
+    impl Cs {
+        fn n(mut self, v: i32) -> Self {
+            self.0.push(255);
+            self.0.extend_from_slice(&v.to_be_bytes());
+            self
+        }
+        fn op(mut self, bytes: &[u8]) -> Self {
+            self.0.extend_from_slice(bytes);
+            self
+        }
+        /// `sbx wx hsbw`
+        fn hsbw(self, sbx: i32, wx: i32) -> Self {
+            self.n(sbx).n(wx).op(&[13])
+        }
+        fn rmoveto(self, dx: i32, dy: i32) -> Self {
+            self.n(dx).n(dy).op(&[21])
+        }
+        fn rlineto(self, dx: i32, dy: i32) -> Self {
+            self.n(dx).n(dy).op(&[5])
+        }
+        /// `args... n othersubr callothersubr`
+        fn othersubr(mut self, args: &[i32], othersubr: i32) -> Self {
+            for a in args {
+                self = self.n(*a);
+            }
+            self.n(args.len() as i32).n(othersubr).op(&[12, 16])
+        }
+        fn endchar(self) -> Vec<u8> {
+            self.op(&[14]).0
+        }
+    }
+
+    /// A font carrying exactly the named charstrings and no subrs.
+    fn font(glyphs: &[(&str, Vec<u8>)]) -> Type1Font {
+        Type1Font {
+            font_name: b"Test".to_vec(),
+            font_matrix: [0.001, 0.0, 0.0, 0.001, 0.0, 0.0],
+            font_bbox: [0.0, 0.0, 1000.0, 1000.0],
+            paint_type: 0.0,
+            encoding: vec![None; 256],
+            charstrings: glyphs
+                .iter()
+                .map(|(name, cs)| (name.as_bytes().to_vec(), cs.clone()))
+                .collect(),
+            subrs: Vec::new(),
+            private: PrivateHints::default(),
+        }
+    }
+
+    /// The seven `rmoveto`s a flex sequence collects, each bracketed by
+    /// OtherSubr 2. `points` is truncated to whatever the caller wants, so a
+    /// test can hand the interpreter a short flex.
+    fn flex_points(mut cs: Cs, points: &[(i32, i32)]) -> Cs {
+        for (dx, dy) in points {
+            cs = cs.rmoveto(*dx, *dy).othersubr(&[], 2);
+        }
+        cs
+    }
+
+    const SEVEN: [(i32, i32); 7] = [
+        (10, 0),
+        (20, 10),
+        (20, 10),
+        (20, 0),
+        (20, -10),
+        (20, -10),
+        (10, 0),
+    ];
+
+    /// The whole flex protocol, in the reduced 3-argument form dvips-embedded
+    /// fonts use: two curves come out, and nothing is left half-open.
+    #[test]
+    fn othersubr_zero_folds_a_flex_into_two_curves() {
+        let glyph = Cs::default()
+            .hsbw(0, 500)
+            .rmoveto(100, 100)
+            .othersubr(&[], 1);
+        let glyph = flex_points(glyph, &SEVEN)
+            .othersubr(&[50, 240, 100], 0)
+            .op(&[12, 17]) // pop
+            .op(&[12, 17]) // pop
+            .op(&[12, 33]) // setcurrentpoint
+            .endchar();
+        let f = font(&[("a", glyph)]);
+        let g = interpret_glyph(&f, b"a", true).expect("flex glyph interprets");
+        let ops: Vec<&PathOp> = g.segments.iter().flat_map(|s| s.ops.iter()).collect();
+        assert_eq!(ops.len(), 3, "moveto + two flex curves");
+        assert!(matches!(ops[0], PathOp::Move(..)));
+        // p[0] is the reference point; its delta folds into the first
+        // curve's first control point (10 + 20, 0 + 10).
+        assert!(matches!(ops[1], PathOp::Curve(a, b, ..) if *a == 30.0 && *b == 10.0));
+        assert!(matches!(ops[2], PathOp::Curve(..)));
+    }
+
+    /// The 17-argument Adobe form is accepted on the same terms.
+    #[test]
+    fn othersubr_zero_accepts_the_seventeen_argument_form() {
+        let glyph = Cs::default()
+            .hsbw(0, 500)
+            .rmoveto(100, 100)
+            .othersubr(&[], 1);
+        let glyph = flex_points(glyph, &SEVEN)
+            .othersubr(&[0; 17], 0)
+            .op(&[12, 17])
+            .op(&[12, 17])
+            .op(&[12, 33])
+            .endchar();
+        let f = font(&[("a", glyph)]);
+        assert!(interpret_glyph(&f, b"a", true).is_some());
+    }
+
+    /// Every way the flex protocol can arrive malformed. Each one is a
+    /// decline, never a guess at what the producer meant.
+    #[test]
+    fn malformed_flex_declines() {
+        // Fewer than seven collected points.
+        let short = flex_points(
+            Cs::default().hsbw(0, 500).rmoveto(100, 100).othersubr(&[], 1),
+            &SEVEN[..5],
+        )
+        .othersubr(&[50, 240, 100], 0)
+        .endchar();
+
+        // OtherSubr 0 with no OtherSubr 1 to open the flex.
+        let unopened = Cs::default()
+            .hsbw(0, 500)
+            .rmoveto(100, 100)
+            .othersubr(&[50, 240, 100], 0)
+            .endchar();
+
+        // An argument count the protocol does not define.
+        let wrong_argc = flex_points(
+            Cs::default().hsbw(0, 500).rmoveto(100, 100).othersubr(&[], 1),
+            &SEVEN,
+        )
+        .othersubr(&[50, 240], 0)
+        .endchar();
+
+        // OtherSubr 1 twice: a nested flex is not a shape we model.
+        let nested = flex_points(
+            Cs::default().hsbw(0, 500).rmoveto(100, 100).othersubr(&[], 1),
+            &SEVEN[..1],
+        )
+        .othersubr(&[], 1)
+        .endchar();
+
+        // OtherSubr 1 before the path is open (no current point to flex from).
+        let no_current_point = Cs::default().hsbw(0, 500).othersubr(&[], 1).endchar();
+
+        // OtherSubr 2 outside a flex.
+        let stray_two = Cs::default()
+            .hsbw(0, 500)
+            .rmoveto(100, 100)
+            .othersubr(&[], 2)
+            .endchar();
+
+        // A flex that never closes: `interpret_glyph` catches this after exec.
+        let unterminated = flex_points(
+            Cs::default().hsbw(0, 500).rmoveto(100, 100).othersubr(&[], 1),
+            &SEVEN,
+        )
+        .endchar();
+
+        // An OtherSubr this interpreter does not implement. Declining rather
+        // than ignoring is the point: an unknown OtherSubr can move the pen.
+        let unknown = Cs::default()
+            .hsbw(0, 500)
+            .rmoveto(100, 100)
+            .othersubr(&[1], 14)
+            .endchar();
+
+        // Hint replacement with the wrong argument count.
+        let bad_hint_replace = Cs::default()
+            .hsbw(0, 500)
+            .rmoveto(100, 100)
+            .othersubr(&[1, 2], 3)
+            .endchar();
+
+        for (label, cs) in [
+            ("short flex", short),
+            ("unopened flex", unopened),
+            ("wrong argc", wrong_argc),
+            ("nested flex", nested),
+            ("no current point", no_current_point),
+            ("stray othersubr 2", stray_two),
+            ("unterminated flex", unterminated),
+            ("unknown othersubr", unknown),
+            ("bad hint replace", bad_hint_replace),
+        ] {
+            let f = font(&[("a", cs)]);
+            assert!(
+                interpret_glyph(&f, b"a", true).is_none(),
+                "{label} must decline"
+            );
+        }
+    }
+
+    /// `pop` with nothing on the PostScript stack has no value to produce.
+    #[test]
+    fn pop_without_a_pending_othersubr_result_declines() {
+        let cs = Cs::default().hsbw(0, 500).op(&[12, 17]).endchar();
+        let f = font(&[("a", cs)]);
+        assert!(interpret_glyph(&f, b"a", true).is_none());
+    }
+
+    /// `asb adx ady bchar achar seac` — the accent's outline is appended to
+    /// the base's, re-based so the two land in one contour list.
+    fn seac_glyph(asb: i32, adx: i32, ady: i32, bchar: i32, achar: i32) -> Vec<u8> {
+        Cs::default()
+            .hsbw(0, 500)
+            .n(asb)
+            .n(adx)
+            .n(ady)
+            .n(bchar)
+            .n(achar)
+            .op(&[12, 6])
+            .endchar()
+    }
+
+    fn outline(name: &str) -> (&str, Vec<u8>) {
+        (
+            name,
+            Cs::default()
+                .hsbw(0, 500)
+                .rmoveto(50, 0)
+                .rlineto(100, 0)
+                .rlineto(0, 100)
+                .endchar(),
+        )
+    }
+
+    #[test]
+    fn seac_composes_base_and_accent() {
+        let f = font(&[
+            ("Aacute", seac_glyph(0, 100, 200, 65, 194)),
+            outline("A"),
+            outline("acute"),
+        ]);
+        let g = interpret_glyph(&f, b"Aacute", true).expect("composite interprets");
+        let ops: Vec<&PathOp> = g.segments.iter().flat_map(|s| s.ops.iter()).collect();
+        // Both components' three ops, in one segment, with no stems (the
+        // components' hints are only valid in their own frames).
+        assert_eq!(ops.len(), 6);
+        assert_eq!(g.segments.len(), 1);
+        assert!(g.stems.is_empty());
+        assert!(g.seac.is_none());
+    }
+
+    /// Every seac decline. The dangerous one is the last: a composite that
+    /// silently dropped its accent would render as a bare base letter.
+    #[test]
+    fn malformed_seac_declines() {
+        let blank = Cs::default().hsbw(0, 500).endchar();
+
+        for (label, f) in [
+            // bchar has no StandardEncoding name (code 0 is unassigned).
+            (
+                "unnamed bchar",
+                font(&[
+                    ("g", seac_glyph(0, 0, 0, 0, 194)),
+                    outline("A"),
+                    outline("acute"),
+                ]),
+            ),
+            // achar names a glyph the font does not carry.
+            (
+                "missing accent",
+                font(&[("g", seac_glyph(0, 0, 0, 65, 194)), outline("A")]),
+            ),
+            // The base is present but the accent draws nothing: the result
+            // would be a base letter wearing no accent.
+            (
+                "empty accent",
+                font(&[
+                    ("g", seac_glyph(0, 0, 0, 65, 194)),
+                    outline("A"),
+                    ("acute", blank.clone()),
+                ]),
+            ),
+            // A component that is itself a composite: not recursed into.
+            (
+                "nested composite",
+                font(&[
+                    ("g", seac_glyph(0, 0, 0, 65, 194)),
+                    ("A", seac_glyph(0, 0, 0, 65, 200)),
+                    outline("acute"),
+                    outline("dieresis"),
+                ]),
+            ),
+        ] {
+            assert!(
+                interpret_glyph(&f, b"g", true).is_none(),
+                "{label} must decline"
+            );
+        }
+
+        // seac after the path has already been opened: not the conforming
+        // `sb w hsbw asb adx ady bchar achar seac` shape.
+        let after_path = Cs::default()
+            .hsbw(0, 500)
+            .rmoveto(10, 10)
+            .n(0)
+            .n(0)
+            .n(0)
+            .n(65)
+            .n(194)
+            .op(&[12, 6])
+            .endchar();
+        let f = font(&[
+            ("g", after_path),
+            outline("A"),
+            outline("acute"),
+        ]);
+        assert!(interpret_glyph(&f, b"g", true).is_none(), "seac after path");
+
+        // A composite reached as a seac component (`allow_seac == false`).
+        let f = font(&[
+            ("g", seac_glyph(0, 0, 0, 65, 194)),
+            outline("A"),
+            outline("acute"),
+        ]);
+        assert!(
+            interpret_glyph(&f, b"g", false).is_none(),
+            "composite as a component"
+        );
+    }
+
+    /// A charstring that never declares its width has no glyph to emit.
+    #[test]
+    fn a_charstring_without_hsbw_declines() {
+        let f = font(&[("a", Cs::default().rmoveto(10, 10).endchar())]);
+        assert!(interpret_glyph(&f, b"a", true).is_none());
+    }
+}
