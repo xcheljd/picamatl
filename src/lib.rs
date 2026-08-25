@@ -60,6 +60,7 @@ mod cffhint;
 mod cffmerge;
 mod encodings;
 mod fonts;
+mod forms;
 mod jpeghuff;
 mod truetype;
 mod type1;
@@ -274,6 +275,33 @@ pub struct OptimizeOptions {
     /// when the gray stream is strictly smaller. Default: `false`.
     pub collapse_gray_images: bool,
 
+    /// Flatten interactive forms: paint every widget annotation's appearance
+    /// stream into its page's content stream at the position ISO 32000-1
+    /// 12.5.5 places it, then remove the whole form layer — `/AcroForm`, the
+    /// field tree, the XFA packet set (template, datasets, and the rest), and
+    /// every `/Widget` annotation. Non-widget annotations (`/Link`, markup,
+    /// popups) are not form machinery and are never touched.
+    ///
+    /// This is a **semantic** change, which is why it is opt-in: the output is
+    /// no longer a form. It cannot be filled in, exported, or signed. What it
+    /// is not, and will never be, is a silent loss of entered data. A field's
+    /// value survives only if the appearance stream that *shows* it becomes
+    /// page content, or if the field has no value to lose (`/V` absent, empty,
+    /// or a button's `/Off`); anything else declines the entire document and
+    /// the run proceeds byte-for-byte as if the flag were off. Dynamic XFA
+    /// forms (`/NeedsRendering true`) always decline — their pages are a
+    /// placeholder the reader builds from the XFA template, and amatl does not
+    /// render XFA. XFA data that the AcroForm field tree does not mirror
+    /// declines. So does a value with no appearance to burn, a hidden field
+    /// carrying data, `/NeedAppearances true` over a filled form, a signature
+    /// field holding a signature, and an optional-content widget. The full
+    /// decline table is `docs/FORMS-PLAN.md`.
+    ///
+    /// The win is the removed machinery: `corpus-expanded/irs-w2.pdf` spends
+    /// 1.58 MB of its 2.15 MB on an XFA packet set whose AcroForm layer draws
+    /// no ink at all. Default: `false`.
+    pub flatten_forms: bool,
+
     /// Deflate implementation for the final serialization passes: the
     /// whole-document re-deflate (`redeflate_flate_streams`) and the
     /// cross-reference stream. [`DeflateBackend::Zopfli`] spends ~30× the CPU
@@ -320,6 +348,7 @@ impl Default for OptimizeOptions {
             recompress_bitonal_images: false,
             allow_lossy_reencode: false,
             collapse_gray_images: false,
+            flatten_forms: false,
             deflate_backend: DeflateBackend::Zlib,
         }
     }
@@ -435,6 +464,14 @@ impl OptimizeOptions {
     #[must_use]
     pub fn with_collapse_gray_images(mut self, collapse: bool) -> Self {
         self.collapse_gray_images = collapse;
+        self
+    }
+
+    /// Enable/disable interactive-form flattening (off by default). See
+    /// [`OptimizeOptions::flatten_forms`].
+    #[must_use]
+    pub fn with_flatten_forms(mut self, flatten: bool) -> Self {
+        self.flatten_forms = flatten;
         self
     }
 
@@ -3868,6 +3905,22 @@ fn try_optimize(input: &[u8], options: OptimizeOptions) -> Result<Option<Vec<u8>
     // pass can undo the other's merges, so both run and both count as work.
     let merged_decoded = dedup_decoded_streams(&mut doc);
 
+    // Opt-in form flattening, BEFORE every other planner: the appearance
+    // streams it moves into page content must then be minified, re-deflated
+    // and (if they carry images) planned like any other page content, and the
+    // XFA / field-tree objects it orphans must already be unreferenced when
+    // `prune_objects()` runs. A `None` plan is a decline — the document is
+    // optimized exactly as it would have been with the flag off. Counts as
+    // work: dropping a megabyte of XFA is the whole point.
+    let flattened = options.flatten_forms
+        && match forms::plan_flatten(&doc) {
+            Some(plan) => {
+                forms::apply_flatten(&mut doc, plan);
+                true
+            }
+            None => false,
+        };
+
     // Minify page/Form content streams before anything parses them: the
     // planners below then read the same (verified-equivalent) operations from
     // smaller bytes. Counts as work — a file whose only win is a genuinely
@@ -3955,6 +4008,7 @@ fn try_optimize(input: &[u8], options: OptimizeOptions) -> Result<Option<Vec<u8>
         && !merged_streams
         && !merged_decoded
         && !minified
+        && !flattened
         && !gray_work
         // Evaluated last, and only for a document with no other work: the
         // probe redoes the entropy analysis `reoptimize_jpeg_streams` will

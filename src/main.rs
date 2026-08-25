@@ -36,7 +36,8 @@ fn defaults_blurb() -> String {
          pack-object-streams {},\n  \
          downsample-flate-images {}, subset-fonts {},\n  \
          convert-type1 {}, strip-hinting {}, recompress-bitonal-images {},\n  \
-         allow-lossy {}, collapse-gray-images {}",
+         allow-lossy {}, collapse-gray-images {},\n  \
+         flatten-forms {}",
         on_off(d.strip_accessibility),
         on_off(d.strip_metadata),
         on_off(d.strip_private_data),
@@ -48,6 +49,7 @@ fn defaults_blurb() -> String {
         on_off(d.recompress_bitonal_images),
         on_off(d.allow_lossy_reencode),
         on_off(d.collapse_gray_images),
+        on_off(d.flatten_forms),
     )
 }
 
@@ -174,6 +176,16 @@ struct Cli {
     #[arg(long)]
     no_collapse_gray_images: bool,
 
+    /// Flatten interactive forms: paint widget appearances into the page and
+    /// remove /AcroForm, the field tree, XFA and every widget annotation.
+    /// Declines any document where a field value could not be preserved
+    /// (semantic change; strictly opt-in)
+    #[arg(long, overrides_with = "no_flatten_forms")]
+    flatten_forms: bool,
+    /// Leave interactive forms untouched
+    #[arg(long)]
+    no_flatten_forms: bool,
+
     /// Deflate backend for the final re-deflate and xref-stream passes:
     /// zopfli is ~30x the CPU for a few percent smaller output
     #[arg(long, value_enum, value_name = "BACKEND")]
@@ -267,6 +279,11 @@ fn options_from(cli: &Cli) -> OptimizeOptions {
             cli.collapse_gray_images,
             cli.no_collapse_gray_images,
             d.collapse_gray_images,
+        ))
+        .with_flatten_forms(resolve(
+            cli.flatten_forms,
+            cli.no_flatten_forms,
+            d.flatten_forms,
         ))
         .with_deflate_backend(
             cli.deflate_backend
