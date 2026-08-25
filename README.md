@@ -69,6 +69,18 @@ parser becomes the same graceful fallback as an ordinary error) and pinned by
 regression tests for the three failure shapes: panic, degenerate input, and
 parse error. Amatl is safe to run on untrusted input in an automated pipeline.
 
+**Numbers keep the value they had in the input.** The PDF library amatl
+builds on stores every real as an `f32`, which silently shortens any literal
+needing more than ~7 significant digits — `/MediaBox [0 0 595.91998
+841.91998]`, LibreOffice's ordinary A4, would come back out as `595.92
+841.92`. A viewer parses reals as doubles and grid-fits the whole page against
+its box, so that 2e-5 pt is enough to move text by a pixel. amatl reads the
+input's own literals before the parse and splices them back into the saved
+file (`src/reals.rs`), for every real in the document rather than page boxes
+alone: 27 of 28 pages of the LibreOffice document in the corpus rendered
+differently before, and 0 of 28 do now. Where the input spells one value two
+ways, amatl leaves the number as-is rather than pick.
+
 **Digital signatures do not survive optimization.** Every amatl run
 re-serializes the whole document, so a `/ByteRange` digest — which pins file
 offsets — is invalid in the output. This has always been true (font

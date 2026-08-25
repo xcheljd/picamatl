@@ -8,6 +8,36 @@ and this project adheres to
 
 ## [Unreleased]
 
+### Fixed
+
+- **Real literals a viewer can see no longer change value.** lopdf holds every
+  PDF real as an `f32` (`Object::Real(f32)`) and prints it back with Rust's
+  shortest `f32`-round-tripping decimal, so a literal needing more than ~7
+  significant digits came out of a save as a *different number*:
+  `/MediaBox [0 0 595.91998 841.91998]` — LibreOffice's ordinary A4 — became
+  `595.92 841.92`. Viewers parse reals as doubles, and `/MediaBox` is the
+  origin of the page-to-device transform, so that 2e-5 pt shift re-grid-fits
+  every glyph on the page: on `corpus-expanded/wiki-pdf.pdf` **27 of 28 pages**
+  rendered differently after a lossless run (poppler, 100 and 150 dpi), and 8
+  of 10 on `wiki-cmyk-topic.pdf`. Both are now **0 of 28** and **0 of 10**,
+  subpixel-identical.
+
+  The digits are destroyed at parse time, so the fix cannot live in the object
+  model: `src/reals.rs` reads the input's own literals out of the raw bytes
+  before the parse, and splices them back into the saved file afterwards —
+  through the deflated `ObjStm` payload and its offset header where the page
+  dictionaries end up, and through the cross-reference section (stream or
+  classic table) that the length change invalidates. It is keyed by *value*
+  rather than by dictionary key, so it covers every real in the document:
+  `/Rect`, `/XYZ` destinations, `/BBox`, `/W` (CID widths), `/MediaBox`,
+  `/FontBBox`, `/Bounds`, `/Domain`. Every replacement has the same `f32` bits
+  as what it replaces — nothing that reads the file as an `f32`, lopdf
+  included, sees any change — and a value spelled two ways in one input, or
+  whose shortened form also occurs there literally, is declined rather than
+  guessed. A document with no such literal is byte-identical to before (12 of
+  the 16 corpus files); the other four grow by 13 to 194 bytes, or shrink.
+  `docs/upstream-lopdf-f32-reals.md` has the upstream report.
+
 ### Added
 
 - **`--flatten-forms` (`OptimizeOptions::flatten_forms`, off by default)** —

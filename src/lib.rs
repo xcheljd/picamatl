@@ -62,6 +62,7 @@ mod encodings;
 mod fonts;
 mod forms;
 mod jpeghuff;
+mod reals;
 mod truetype;
 mod type1;
 
@@ -3871,6 +3872,12 @@ fn dedup_streams(doc: &mut Document) -> bool {
 /// hand back the original bytes without anyone allocating a throwaway copy of
 /// them. `Ok(Some(bytes))` is a real, rewritten document.
 fn try_optimize(input: &[u8], options: OptimizeOptions) -> Result<Option<Vec<u8>>, lopdf::Error> {
+    // Read the input's own real literals BEFORE lopdf parses them into f32s
+    // that cannot hold their digits. Empty for the overwhelming majority of
+    // documents, in which case the restoration pass at save time is a no-op
+    // and the output is byte-identical to what it would be without it. See
+    // src/reals.rs.
+    let literals = reals::capture(input);
     let mut doc = Document::load_mem(input)?;
 
     // Fail-safe: if any page's /Contents cannot be resolved to stream objects
@@ -4251,7 +4258,7 @@ fn try_optimize(input: &[u8], options: OptimizeOptions) -> Result<Option<Vec<u8>
 
     strip_stale_xref_trailer_keys(&mut doc);
 
-    save_document(&mut doc, options).map(Some)
+    save_document(&mut doc, options, &literals).map(Some)
 }
 
 /// Drop trailer entries that describe the *input's* cross-reference section.
@@ -4446,7 +4453,11 @@ fn replan_deflate(content: &[u8], backend: DeflateBackend) -> Option<Vec<u8>> {
 /// `options.pack_object_streams` is true. The packed path produces smaller
 /// output for object-heavy documents but is more complex; the classic path is
 /// the always-available fallback and matches what lopdf ships.
-fn save_document(doc: &mut Document, options: OptimizeOptions) -> Result<Vec<u8>, lopdf::Error> {
+fn save_document(
+    doc: &mut Document,
+    options: OptimizeOptions,
+    literals: &reals::RealLiterals,
+) -> Result<Vec<u8>, lopdf::Error> {
     let out = if options.pack_object_streams {
         pack_and_save(doc)?
     } else {
@@ -4454,6 +4465,10 @@ fn save_document(doc: &mut Document, options: OptimizeOptions) -> Result<Vec<u8>
         doc.save_to(&mut out)?;
         out
     };
+    // Put back every real literal lopdf's f32 object model rounded off, while
+    // the cross-reference section this shifts is still uncompressed. A no-op
+    // unless the input actually carried a literal f32 cannot hold.
+    let out = reals::restore(out, literals);
     // The zopfli backend can re-deflate the ObjStm the writer just emitted
     // (lopdf deflates it internally at zlib level 9, out of reach of the
     // final re-deflate pass). Must run BEFORE the xref compression below:
