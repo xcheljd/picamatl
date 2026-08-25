@@ -751,3 +751,249 @@ fn is_delimiter(byte: u8) -> bool {
             b'(' | b')' | b'<' | b'>' | b'[' | b']' | b'{' | b'}' | b'/' | b'%'
         )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lopdf::{dictionary, Object, Stream};
+
+    /// The `f32` lopdf ends up holding for a literal. Spelling these out as
+    /// float literals would trip `clippy::excessive_precision` — which is the
+    /// whole bug, stated by the lint.
+    fn as_f32(literal: &str) -> f32 {
+        literal.parse().unwrap()
+    }
+
+    fn captured(input: &[u8]) -> Vec<(f32, String)> {
+        let mut out: Vec<(f32, String)> = capture(input)
+            .exact
+            .iter()
+            .map(|(bits, text)| {
+                (
+                    f32::from_bits(*bits),
+                    String::from_utf8_lossy(text).into_owned(),
+                )
+            })
+            .collect();
+        out.sort_by(|a, b| a.1.cmp(&b.1));
+        out
+    }
+
+    #[test]
+    fn captures_only_the_literals_f32_cannot_hold() {
+        // 595.91998 needs eight significant digits; 595.92, 0.5 and the
+        // integers are all exactly what lopdf would write back.
+        let input = b"<</MediaBox[0 0 595.91998 841.92]/Width 612/Alpha 0.5>>";
+        assert_eq!(
+            captured(input),
+            vec![(as_f32("595.91998"), "595.91998".to_string())]
+        );
+    }
+
+    #[test]
+    fn declines_a_value_two_literals_share() {
+        // Both spell the same f32, so there is no single right answer for the
+        // occurrences lopdf will shorten to `595.92`.
+        let same_f32 = b"<</A 595.91998/B 595.919983>>";
+        assert!(capture(same_f32).is_empty());
+    }
+
+    #[test]
+    fn declines_a_value_whose_shortened_form_also_occurs() {
+        // Restoring 841.91998 here would also rewrite the document's own
+        // literal 841.92, which is a different number that lopdf round-trips.
+        let both = b"<</A 841.91998>><</B 841.92>>";
+        assert!(capture(both).is_empty());
+    }
+
+    #[test]
+    fn does_not_read_numbers_out_of_strings_comments_or_streams() {
+        // pdfTeX's /PTEX.Fullbanner is the real-world case: a string whose
+        // text contains `3.14159265`.
+        let string = b"<</PTEX.Fullbanner(This is pdfTeX, Version 3.14159265-2.6)>>";
+        assert!(capture(string).is_empty());
+        let comment = b"% 595.91998 is not an object\n<</Width 612>>";
+        assert!(capture(comment).is_empty());
+        let hex = b"<</A<595.91998>>>";
+        assert!(capture(hex).is_empty());
+        let stream = b"<</Length 12>>stream\n595.91998 x\nendstream";
+        assert!(capture(stream).is_empty());
+    }
+
+    /// A one-page document whose `/MediaBox` carries LibreOffice's A4, written
+    /// through lopdf and then spliced back to the literals lopdf cannot hold.
+    ///
+    /// The placeholders are chosen so that lopdf prints them at exactly the
+    /// width of the literals that replace them: the splice is byte-for-byte
+    /// length-preserving, so the cross-reference table stays valid.
+    /// LibreOffice's A4 page box, `[0 0 595.91998 841.91998]`.
+    fn a4_fixture() -> Vec<u8> {
+        undrift(&a4_placeholders())
+    }
+
+    /// The same document written with a classic `xref` table instead of a
+    /// cross-reference stream. lopdf carries the input's cross-reference kind
+    /// through a load/save, so this is what a file from a PDF 1.4 producer
+    /// looks like on the way out.
+    fn a4_fixture_classic_xref() -> Vec<u8> {
+        let mut doc = lopdf::Document::load_mem(&a4_placeholders()).unwrap();
+        doc.reference_table.cross_reference_type = lopdf::xref::XrefType::CrossReferenceTable;
+        let mut bytes: Vec<u8> = Vec::new();
+        doc.save_to(&mut bytes).unwrap();
+        undrift(&bytes)
+    }
+
+    /// Swap the round-trip-safe placeholders for the literals lopdf's `f32`
+    /// cannot hold. Both replacements are the same width as what they replace,
+    /// so every byte offset in the file stays valid.
+    fn undrift(bytes: &[u8]) -> Vec<u8> {
+        let bytes = splice(bytes, format!("{PLACEHOLDER_W}").as_bytes(), b"595.91998");
+        splice(&bytes, format!("{PLACEHOLDER_H}").as_bytes(), b"841.91998")
+    }
+
+    /// Chosen so lopdf prints them at exactly the width of the literals that
+    /// replace them, and so it prints them back unchanged (nothing to capture
+    /// until `undrift` runs).
+    const PLACEHOLDER_W: f32 = 1007.1234;
+    const PLACEHOLDER_H: f32 = 1014.2468;
+
+    fn a4_placeholders() -> Vec<u8> {
+        let (width, height) = (PLACEHOLDER_W, PLACEHOLDER_H);
+        assert_eq!(
+            (format!("{width}").len(), format!("{height}").len()),
+            (9, 9),
+            "same-width splice"
+        );
+
+        let mut doc = lopdf::Document::with_version("1.5");
+        let pages_id = doc.new_object_id();
+        // Two pages carrying byte-identical content streams, so the document
+        // has real work for amatl to do: without a win it hands the input
+        // straight back and there is nothing to restore into.
+        let body = b"BT /F1 12 Tf 72 720 Td (hello) Tj ET\n".repeat(200);
+        let kids: Vec<Object> = (0..2)
+            .map(|_| {
+                let content = doc.add_object(Stream::new(dictionary! {}, body.clone()));
+                doc.add_object(dictionary! {
+                    "Type" => "Page",
+                    "Parent" => pages_id,
+                    "Contents" => content,
+                })
+                .into()
+            })
+            .collect();
+        // The page box sits on the page *tree* node, inherited by both pages
+        // — the shape a producer uses for a uniform document, and one more
+        // reason a restoration keyed by dictionary key would have to know
+        // about `/Parent`.
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => kids,
+                "Count" => 2,
+                "MediaBox" => vec![
+                    Object::Integer(0),
+                    Object::Integer(0),
+                    Object::Real(width),
+                    Object::Real(height),
+                ],
+            }),
+        );
+        let catalog = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+        doc.trailer.set("Root", catalog);
+
+        let mut bytes: Vec<u8> = Vec::new();
+        doc.save_to(&mut bytes).unwrap();
+        bytes
+    }
+
+    /// Byte-for-byte replacement of one equal-length token. The saved PDF is
+    /// not UTF-8 (binary header comment, binary cross-reference stream), so
+    /// this works on bytes.
+    fn splice(data: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {
+        assert_eq!(from.len(), to.len(), "length-preserving splice");
+        let at = find_sub(data, from, 0).expect("placeholder is in the file");
+        let mut out = data.to_vec();
+        out[at..at + to.len()].copy_from_slice(to);
+        out
+    }
+
+    #[test]
+    fn the_fixture_really_does_carry_undrifted_literals() {
+        assert_eq!(
+            captured(&a4_fixture()),
+            vec![
+                (as_f32("595.91998"), "595.91998".to_string()),
+                (as_f32("841.91998"), "841.91998".to_string()),
+            ]
+        );
+    }
+
+    /// The packed save path: the page dictionary is inside a deflated
+    /// `ObjStm`, so restoring reaches through the object stream's payload,
+    /// offset header, `/Length`, `/First` and the cross-reference stream.
+    #[test]
+    fn restores_a_page_box_packed_into_an_object_stream() {
+        let input = a4_fixture();
+        let out = crate::optimize(&input);
+        assert!(find_sub(&out, b"/Type/ObjStm", 0).is_some(), "packed path");
+        assert_eq!(captured(&out), captured(&input));
+    }
+
+    /// The unpacked save path: plain object bodies and a classic `xref` table
+    /// of fixed-width offsets.
+    #[test]
+    fn restores_a_page_box_in_a_plain_object_body() {
+        let input = a4_fixture();
+        let out = crate::optimize_with_options(
+            &input,
+            crate::OptimizeOptions::default().with_pack_object_streams(false),
+        );
+        assert!(find_sub(&out, b"595.91998", 0).is_some(), "plain literal");
+        assert_eq!(captured(&out), captured(&input));
+    }
+
+    /// A PDF 1.4 document saves with a classic `xref` table — fixed-width
+    /// offset rows rather than a cross-reference stream — which is the other
+    /// half of `repair_offsets`.
+    #[test]
+    fn restores_a_page_box_under_a_classic_xref_table() {
+        let input = a4_fixture_classic_xref();
+        let out = crate::optimize_with_options(
+            &input,
+            crate::OptimizeOptions::default().with_pack_object_streams(false),
+        );
+        assert!(
+            find_sub(&out, b"\ntrailer", 0).is_some(),
+            "classic xref table"
+        );
+        assert_eq!(captured(&out), captured(&input));
+    }
+
+    /// Restoring puts the input's own literals in the output, so the output
+    /// is a document that drifts too — and a second run has to reach exactly
+    /// the same fixed point rather than oscillating between the two spellings.
+    #[test]
+    fn restoring_keeps_the_pipeline_idempotent() {
+        let once = crate::optimize(&a4_fixture());
+        let twice = crate::optimize(&once);
+        assert_eq!(once, twice);
+    }
+
+    /// The whole pass is keyed on the input's literals, so a document with
+    /// none of them comes out exactly as it did before this existed. This is
+    /// what makes the pass byte-invisible to the 12 of 16 corpus documents
+    /// that carry no drifting real.
+    #[test]
+    fn a_document_with_nothing_to_restore_is_byte_identical() {
+        // The fixture *without* the splice: lopdf prints these two literals
+        // back exactly, so there is nothing to capture and nothing to patch.
+        let undrifted = a4_placeholders();
+        let literals = capture(&undrifted);
+        assert!(literals.is_empty());
+
+        let out = crate::optimize(&undrifted);
+        assert_eq!(restore(out.clone(), &literals), out);
+    }
+}
