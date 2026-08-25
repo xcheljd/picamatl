@@ -1811,7 +1811,10 @@ mod tests {
     fn malformed_flex_declines() {
         // Fewer than seven collected points.
         let short = flex_points(
-            Cs::default().hsbw(0, 500).rmoveto(100, 100).othersubr(&[], 1),
+            Cs::default()
+                .hsbw(0, 500)
+                .rmoveto(100, 100)
+                .othersubr(&[], 1),
             &SEVEN[..5],
         )
         .othersubr(&[50, 240, 100], 0)
@@ -1826,7 +1829,10 @@ mod tests {
 
         // An argument count the protocol does not define.
         let wrong_argc = flex_points(
-            Cs::default().hsbw(0, 500).rmoveto(100, 100).othersubr(&[], 1),
+            Cs::default()
+                .hsbw(0, 500)
+                .rmoveto(100, 100)
+                .othersubr(&[], 1),
             &SEVEN,
         )
         .othersubr(&[50, 240], 0)
@@ -1834,7 +1840,10 @@ mod tests {
 
         // OtherSubr 1 twice: a nested flex is not a shape we model.
         let nested = flex_points(
-            Cs::default().hsbw(0, 500).rmoveto(100, 100).othersubr(&[], 1),
+            Cs::default()
+                .hsbw(0, 500)
+                .rmoveto(100, 100)
+                .othersubr(&[], 1),
             &SEVEN[..1],
         )
         .othersubr(&[], 1)
@@ -1852,7 +1861,10 @@ mod tests {
 
         // A flex that never closes: `interpret_glyph` catches this after exec.
         let unterminated = flex_points(
-            Cs::default().hsbw(0, 500).rmoveto(100, 100).othersubr(&[], 1),
+            Cs::default()
+                .hsbw(0, 500)
+                .rmoveto(100, 100)
+                .othersubr(&[], 1),
             &SEVEN,
         )
         .endchar();
@@ -2002,11 +2014,7 @@ mod tests {
             .n(194)
             .op(&[12, 6])
             .endchar();
-        let f = font(&[
-            ("g", after_path),
-            outline("A"),
-            outline("acute"),
-        ]);
+        let f = font(&[("g", after_path), outline("A"), outline("acute")]);
         assert!(interpret_glyph(&f, b"g", true).is_none(), "seac after path");
 
         // A composite reached as a seac component (`allow_seac == false`).

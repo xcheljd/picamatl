@@ -2617,12 +2617,7 @@ fn dct_scale_numerator(full_w: usize, full_h: usize, target_w: u32, target_h: u3
 /// inside the [`MAX_FLATE_PIXEL_BYTES`] budget. The scaled path is bounded by
 /// the target geometry in the ordinary case, but its floor is 1/8 of the
 /// source, and 1/8 of a bomb is still a bomb.
-fn scaled_decode_within_budget(
-    full_w: usize,
-    full_h: usize,
-    numerator: u8,
-    channels: u64,
-) -> bool {
+fn scaled_decode_within_budget(full_w: usize, full_h: usize, numerator: u8, channels: u64) -> bool {
     let scaled_w = (full_w as u64 * numerator as u64).div_ceil(8);
     let scaled_h = (full_h as u64 * numerator as u64).div_ceil(8);
     raster_within_budget(scaled_w, scaled_h, channels)
@@ -4475,8 +4470,8 @@ fn reoptimize_jpeg_streams(doc: &mut Document) -> bool {
     for (id, content) in shrunk {
         if let Ok(Object::Stream(stream)) = doc.get_object_mut(id) {
             stream.set_content(content); // keeps /Length in sync
-            // Counted only when a stream really was rewritten: an id that no
-            // longer resolves is not work done.
+                                         // Counted only when a stream really was rewritten: an id that no
+                                         // longer resolves is not work done.
             changed = true;
         }
     }
