@@ -1673,5 +1673,3 @@ pub(crate) fn convert_to_cff(
     out.extend_from_slice(&private);
     Some(out)
 }
-
-

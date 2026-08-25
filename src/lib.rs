@@ -615,7 +615,10 @@ fn page_resources(doc: &Document, page_id: ObjectId) -> Option<&lopdf::Dictionar
 const MAX_FORM_DEPTH: usize = 12;
 
 /// The `/XObject` sub-dictionary of a resource dictionary, resolved.
-fn xobject_map(doc: &Document, resources: Option<&lopdf::Dictionary>) -> HashMap<Vec<u8>, ObjectId> {
+fn xobject_map(
+    doc: &Document,
+    resources: Option<&lopdf::Dictionary>,
+) -> HashMap<Vec<u8>, ObjectId> {
     let mut map = HashMap::new();
     let Some(resources) = resources else {
         return map;
@@ -7398,6 +7401,11 @@ mod tests {
             "RGB→Gray collapse rewrites /ColorSpace, so it is opt-in \
              (same posture as bitonal G4)"
         );
+        assert!(
+            !d.flatten_forms,
+            "form flattening is a semantic change (the output is no longer a \
+             form) and must stay opt-in"
+        );
     }
 
     #[test]
@@ -7411,7 +7419,8 @@ mod tests {
             .with_downsample_flate_images(false)
             .with_subset_fonts(true)
             .with_recompress_bitonal_images(true)
-            .with_allow_lossy_reencode(true);
+            .with_allow_lossy_reencode(true)
+            .with_flatten_forms(true);
         assert_eq!(o.target_dpi, 96.0);
         assert_eq!(o.jpeg_quality, 60);
         assert_eq!(o.dpi_margin, 1.5);
@@ -7421,6 +7430,7 @@ mod tests {
         assert!(o.subset_fonts);
         assert!(o.recompress_bitonal_images);
         assert!(o.allow_lossy_reencode);
+        assert!(o.flatten_forms);
     }
 
     #[test]
@@ -7733,7 +7743,9 @@ mod tests {
         let page_id = doc.get_pages().values().copied().next().unwrap();
         // Incompressible payload, so its removal cannot be confused with a
         // deflate improvement elsewhere.
-        let private: Vec<u8> = (0..8192u32).map(|i| (i.wrapping_mul(2654435761) >> 24) as u8).collect();
+        let private: Vec<u8> = (0..8192u32)
+            .map(|i| (i.wrapping_mul(2654435761) >> 24) as u8)
+            .collect();
         let blob = doc.add_object(Stream::new(dictionary! {}, private));
         let piece = dictionary! {
             "Illustrator" => dictionary! {
@@ -9262,15 +9274,19 @@ mod tests {
     /// `cargo run --release --example gen_cmyk_ycck -- \
     ///      fixtures/jpeg/cmyk_plain.jpg fixtures/jpeg/cmyk_ycck.jpg`.
     fn jpeg_fixture(name: &str) -> Vec<u8> {
-        let path = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/jpeg"))
-            .join(name);
+        let path =
+            std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/jpeg")).join(name);
         std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
     }
 
     /// Mean absolute difference between two equal-length sample buffers.
     fn sample_mad(a: &[u8], b: &[u8]) -> f64 {
         assert_eq!(a.len(), b.len(), "buffers must be the same length");
-        let sad: u64 = a.iter().zip(b).map(|(x, y)| u64::from(x.abs_diff(*y))).sum();
+        let sad: u64 = a
+            .iter()
+            .zip(b)
+            .map(|(x, y)| u64::from(x.abs_diff(*y)))
+            .sum();
         sad as f64 / a.len() as f64
     }
 
@@ -9371,9 +9387,16 @@ mod tests {
         assert_eq!(jpeg_route(&jpeg_fixture("cmyk_large.jpg")), JpegRoute::Cmyk);
         for rgb in ["seq_color.jpg", "prog_color.jpg", "prog_color444.jpg"] {
             assert_eq!(jpeg_component_count(&jpeg_fixture(rgb)), Some(3), "{rgb}");
-            assert_eq!(jpeg_route(&jpeg_fixture(rgb)), JpegRoute::GrayOrRgb, "{rgb}");
+            assert_eq!(
+                jpeg_route(&jpeg_fixture(rgb)),
+                JpegRoute::GrayOrRgb,
+                "{rgb}"
+            );
         }
-        assert_eq!(jpeg_component_count(&jpeg_fixture("prog_gray.jpg")), Some(1));
+        assert_eq!(
+            jpeg_component_count(&jpeg_fixture("prog_gray.jpg")),
+            Some(1)
+        );
         assert_eq!(
             jpeg_route(&jpeg_fixture("prog_gray.jpg")),
             JpegRoute::GrayOrRgb
@@ -9432,7 +9455,11 @@ mod tests {
                 // or rotated channel would be 85+.
                 assert!(mad < 12.0, "{name} channel {c} MAD {mad}");
             }
-            assert!(cmyk_decode_back_matches(&out, &src, CMYK_DECODE_BACK_MAX_MAD));
+            assert!(cmyk_decode_back_matches(
+                &out,
+                &src,
+                CMYK_DECODE_BACK_MAX_MAD
+            ));
         }
     }
 
@@ -9461,7 +9488,11 @@ mod tests {
     fn cmyk_verification_rejects_inverted_and_rotated_channels() {
         let src = decode_cmyk_jpeg_scaled(&jpeg_fixture("cmyk_plain.jpg"), 96, 64).unwrap();
         let out = encode_cmyk_jpeg(&src, 78).expect("encode");
-        assert!(cmyk_decode_back_matches(&out, &src, CMYK_DECODE_BACK_MAX_MAD));
+        assert!(cmyk_decode_back_matches(
+            &out,
+            &src,
+            CMYK_DECODE_BACK_MAX_MAD
+        ));
 
         let inverted = CmykImage {
             data: src.data.iter().map(|b| 255 - b).collect(),
@@ -9594,10 +9625,7 @@ mod tests {
         // structural check above.
         assert!(decode_cmyk_jpeg_scaled(&truncated, 260, 195).is_some());
 
-        let stream = Stream::new(
-            dictionary! { "Filter" => "DCTDecode" },
-            truncated.clone(),
-        );
+        let stream = Stream::new(dictionary! { "Filter" => "DCTDecode" }, truncated.clone());
         assert!(plan_dct_cmyk(&stream, 78, 260, 195, false).is_none());
 
         let pdf = build_pdf_cmyk(truncated.clone(), 640, 480, 144, 108, None);
@@ -9730,7 +9758,11 @@ mod tests {
         let pdf = build_pdf_cmyk(rgb.clone(), 96, 64, 24, 16, None);
         let out = optimize_with_options(&pdf, OptimizeOptions::default());
         let (_, content) = only_image_stream(&out);
-        assert_eq!(jpeg_component_count(&content), Some(3), "must stay as found");
+        assert_eq!(
+            jpeg_component_count(&content),
+            Some(3),
+            "must stay as found"
+        );
         assert_eq!(
             jpeg_quant_tables(&rgb),
             jpeg_quant_tables(&content),
@@ -9740,15 +9772,8 @@ mod tests {
         // And the reverse: a four-component payload under /DeviceRGB.
         let cmyk = jpeg_fixture("cmyk_plain.jpg");
         let doc_bytes = {
-            let mut doc = Document::load_mem(&build_pdf_cmyk(
-                cmyk.clone(),
-                96,
-                64,
-                24,
-                16,
-                None,
-            ))
-            .unwrap();
+            let mut doc =
+                Document::load_mem(&build_pdf_cmyk(cmyk.clone(), 96, 64, 24, 16, None)).unwrap();
             let id = *doc
                 .objects
                 .iter()
@@ -9759,7 +9784,8 @@ mod tests {
                 .unwrap()
                 .0;
             if let Ok(Object::Stream(s)) = doc.get_object_mut(id) {
-                s.dict.set("ColorSpace", Object::Name(b"DeviceRGB".to_vec()));
+                s.dict
+                    .set("ColorSpace", Object::Name(b"DeviceRGB".to_vec()));
             }
             let mut v = Vec::new();
             doc.save_to(&mut v).unwrap();
@@ -9767,7 +9793,11 @@ mod tests {
         };
         let out = optimize_with_options(&doc_bytes, OptimizeOptions::default());
         let (_, content) = only_image_stream(&out);
-        assert_eq!(jpeg_component_count(&content), Some(4), "must stay as found");
+        assert_eq!(
+            jpeg_component_count(&content),
+            Some(4),
+            "must stay as found"
+        );
         assert_eq!(jpeg_quant_tables(&cmyk), jpeg_quant_tables(&content));
     }
 
@@ -9867,7 +9897,10 @@ mod tests {
                 );
                 let back = decode_cmyk_jpeg_scaled(&content, 1, 1)
                     .expect("a replacement must decode as CMYK");
-                assert_eq!((back.source_width as i64, back.source_height as i64), (w, h));
+                assert_eq!(
+                    (back.source_width as i64, back.source_height as i64),
+                    (w, h)
+                );
                 assert_eq!(
                     jpeg_component_count(&content),
                     Some(4),
@@ -9875,7 +9908,10 @@ mod tests {
                 );
                 let back = decode_cmyk_jpeg_scaled(&content, 1, 1)
                     .expect("a replacement must decode as CMYK");
-                assert_eq!((back.source_width as i64, back.source_height as i64), (w, h));
+                assert_eq!(
+                    (back.source_width as i64, back.source_height as i64),
+                    (w, h)
+                );
             } else {
                 assert_eq!((w, h), (96, 64));
             }

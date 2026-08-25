@@ -94,7 +94,7 @@ pub(crate) fn plan_flatten(doc: &Document) -> Option<FlattenPlan> {
     if let Ok(fields) = acroform.get(b"Fields") {
         let fields = resolve(doc, fields).as_array().ok()?;
         for field in fields {
-            walk_field(doc, field, None, None, 0, &mut scan)?;
+            walk_field(doc, field, None, None, None, 0, &mut scan)?;
         }
     }
 
@@ -112,14 +112,11 @@ pub(crate) fn plan_flatten(doc: &Document) -> Option<FlattenPlan> {
         check_xfa_mirrored(doc, resolve(doc, xfa), &scan)?;
     }
 
-    // D11 — a field that holds a value must have a widget on a page, or the
-    // value has nowhere to be preserved.
-    if scan.valued_leaf_without_widget {
-        return None;
-    }
-    let mut unplaced_valued = scan.valued_widgets.clone();
-
     let mut pages = Vec::new();
+    // Widgets that end up painting their appearance into a page, and the
+    // single-widget "fields" a page shows that `/Fields` never mentioned.
+    let mut burned: HashSet<ObjectId> = HashSet::new();
+    let mut orphan_valued: Vec<ObjectId> = Vec::new();
     let mut removed_widgets = HashSet::new();
     let mut next_name = 0usize;
 
@@ -148,7 +145,6 @@ pub(crate) fn plan_flatten(doc: &Document) -> Option<FlattenPlan> {
                 return None;
             };
             let annot_id = *annot_id;
-            unplaced_valued.remove(&annot_id);
 
             // D7 — optional content makes visibility conditional; painting it
             // into the page would make it unconditional.
@@ -156,14 +152,14 @@ pub(crate) fn plan_flatten(doc: &Document) -> Option<FlattenPlan> {
                 return None;
             }
 
-            // The widget's effective value: inherited down the field tree, or
-            // read off the annotation itself when it is a merged field/widget
-            // that the `/Fields` walk did not reach.
-            let value = match scan.widget_values.get(&annot_id) {
-                Some(v) => v.clone(),
-                None => annot.get(b"V").ok().map(|v| resolve(doc, v).clone()),
-            };
-            let has_value = !value_is_empty(value.as_ref());
+            // A widget the `/Fields` walk never reached is its own field: its
+            // value can only be read off the annotation itself.
+            if !scan.known_widgets.contains(&annot_id) {
+                let value = annot.get(b"V").ok().map(|v| resolve(doc, v));
+                if !value_is_empty(value) {
+                    orphan_valued.push(annot_id);
+                }
+            }
 
             let appearance = match appearance_stream(doc, annot) {
                 ApSel::Decline => return None,
@@ -187,12 +183,9 @@ pub(crate) fn plan_flatten(doc: &Document) -> Option<FlattenPlan> {
             if invisible {
                 // D8 — a widget that is drawn on paper but not on screen (or
                 // neither) cannot be expressed as unconditional page content.
+                // Whether its field's value survives is settled below, by the
+                // same rule as every other widget: some widget must burn it.
                 if appearance.is_some() {
-                    return None;
-                }
-                // D9 — and a hidden field that holds data has nowhere to put
-                // it: nothing was ever painted to burn.
-                if has_value {
                     return None;
                 }
             } else if let Some(ap_id) = appearance {
@@ -204,11 +197,10 @@ pub(crate) fn plan_flatten(doc: &Document) -> Option<FlattenPlan> {
                     matrix,
                 });
                 next_name += 1;
-            } else if has_value {
-                // D9 — a value with no appearance to burn. This is the gate.
-                return None;
+                burned.insert(annot_id);
             }
-            // else: P2 — nothing drawn, nothing stored. Drop it.
+            // else: P2 — nothing drawn. Whether that is allowed is the
+            // valued-field check below.
 
             drop_annots.insert(annot_id);
             removed_widgets.insert(annot_id);
@@ -233,8 +225,17 @@ pub(crate) fn plan_flatten(doc: &Document) -> Option<FlattenPlan> {
         });
     }
 
-    // D11 again, from the other side: a valued widget that no page shows.
-    if !unplaced_valued.is_empty() {
+    // D9 / D11 — the data-preservation gate. Every field that holds a value
+    // must have at least one widget whose appearance is now page content: a
+    // radio group needs only its selected button, but a filled text field with
+    // no appearance, a hidden one, or one whose widget is on no page at all
+    // has nothing left showing its value, and the document declines.
+    for widgets in scan.valued_fields.values() {
+        if !widgets.iter().any(|widget| burned.contains(widget)) {
+            return None;
+        }
+    }
+    if orphan_valued.iter().any(|widget| !burned.contains(widget)) {
         return None;
     }
 
@@ -254,20 +255,26 @@ pub(crate) fn plan_flatten(doc: &Document) -> Option<FlattenPlan> {
 
 /// What the field-tree walk learned. Everything here is about *values*: the
 /// module's whole job is to prove no value is silently dropped.
+///
+/// A value belongs to a **field**, not to a widget. A radio group is the case
+/// that forces this: every button in the group inherits the group's `/V`, but
+/// only the one whose `/AS` names a present state paints anything. Requiring
+/// each *widget* to account for the value would decline every radio group ever
+/// made; requiring each *field* to have at least one widget that burns is the
+/// correct reading of "the value is still visible".
 #[derive(Default)]
 struct FieldScan {
-    /// Effective (inherited) `/V` per widget annotation object.
-    widget_values: HashMap<ObjectId, Option<Object>>,
-    /// Widgets whose effective value is non-empty, minus the ones a page
-    /// turns out to show.
-    valued_widgets: HashSet<ObjectId>,
+    /// Field node that owns a non-empty `/V` -> the widget annotations under
+    /// it. At least one of them must burn, or the document declines (D9/D11).
+    valued_fields: HashMap<ObjectId, Vec<ObjectId>>,
+    /// Every widget the field tree reaches, so a widget a page shows but
+    /// `/Fields` never mentions can be recognized and handled on its own.
+    known_widgets: HashSet<ObjectId>,
     /// Partial field name (any trailing `[n]` stripped) -> effective values.
     /// The XFA `datasets` mirror check reads this.
     values_by_name: HashMap<Vec<u8>, Vec<Option<Object>>>,
     /// Any field anywhere carries a non-empty value (feeds D5).
     any_value: bool,
-    /// D11: a leaf field with a value and no widget under it.
-    valued_leaf_without_widget: bool,
 }
 
 /// Recursive `/Fields` walk with `/FT` and `/V` inheritance. Returns `None`
@@ -277,6 +284,7 @@ fn walk_field(
     node: &Object,
     inherited_ft: Option<&[u8]>,
     inherited_v: Option<&Object>,
+    owner: Option<ObjectId>,
     depth: usize,
     scan: &mut FieldScan,
 ) -> Option<()> {
@@ -313,6 +321,16 @@ fn walk_field(
     if has_value {
         scan.any_value = true;
     }
+    // Whichever node last declared a non-empty `/V` owns the value for this
+    // subtree; a node that declares an empty one takes the value away again.
+    let owner = match own_v {
+        Some(_) if has_value => Some(node_id?),
+        Some(_) => None,
+        None => owner,
+    };
+    if let Some(owner) = owner {
+        scan.valued_fields.entry(owner).or_default();
+    }
 
     if let Ok(Object::String(name, _)) = dict.get(b"T").map(|t| resolve(doc, t)) {
         scan.values_by_name
@@ -323,26 +341,18 @@ fn walk_field(
 
     let is_widget = matches!(dict.get(b"Subtype").map(|s| resolve(doc, s)), Ok(Object::Name(n)) if n == b"Widget");
     if is_widget {
-        // A merged field/widget node, or a widget kid: record the effective
-        // value against the annotation object the page will reference.
+        // A merged field/widget node, or a widget kid. Attribute it to the
+        // field whose value it may be showing.
         let id = node_id?;
-        scan.widget_values.insert(id, value.cloned());
-        if has_value {
-            scan.valued_widgets.insert(id);
+        scan.known_widgets.insert(id);
+        if let Some(owner) = owner {
+            scan.valued_fields.entry(owner).or_default().push(id);
         }
     }
 
-    match dict.get(b"Kids") {
-        Ok(kids) => {
-            let kids = resolve(doc, kids).as_array().ok()?;
-            for kid in kids {
-                walk_field(doc, kid, ft, value, depth + 1, scan)?;
-            }
-        }
-        Err(_) => {
-            if has_value && !is_widget {
-                scan.valued_leaf_without_widget = true;
-            }
+    if let Ok(kids) = dict.get(b"Kids") {
+        for kid in resolve(doc, kids).as_array().ok()? {
+            walk_field(doc, kid, ft, value, owner, depth + 1, scan)?;
         }
     }
     Some(())
@@ -365,7 +375,10 @@ fn value_is_empty(value: Option<&Object>) -> bool {
 fn strip_index(name: &[u8]) -> Vec<u8> {
     if name.last() == Some(&b']') {
         if let Some(open) = name.iter().rposition(|&b| b == b'[') {
-            if name[open + 1..name.len() - 1].iter().all(u8::is_ascii_digit) {
+            if name[open + 1..name.len() - 1]
+                .iter()
+                .all(u8::is_ascii_digit)
+            {
                 return name[..open].to_vec();
             }
         }
@@ -921,7 +934,13 @@ fn bind_xobjects(doc: &mut Document, page_id: ObjectId, bindings: &[(Vec<u8>, Ob
 fn resource_dict(doc: &Document, owner: ObjectId, inline: bool) -> Option<&Dictionary> {
     let object = doc.get_object(owner).ok()?;
     if inline {
-        object.as_dict().ok()?.get(b"Resources").ok()?.as_dict().ok()
+        object
+            .as_dict()
+            .ok()?
+            .get(b"Resources")
+            .ok()?
+            .as_dict()
+            .ok()
     } else {
         object.as_dict().ok()
     }

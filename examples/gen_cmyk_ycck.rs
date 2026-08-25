@@ -14,8 +14,10 @@ use mozjpeg::{ColorSpace, Compress, Decompress};
 fn main() {
     let mut args = std::env::args_os().skip(1);
     let (src, dst) = (
-        args.next().expect("usage: gen_cmyk_ycck <in.jpg> <out.jpg>"),
-        args.next().expect("usage: gen_cmyk_ycck <in.jpg> <out.jpg>"),
+        args.next()
+            .expect("usage: gen_cmyk_ycck <in.jpg> <out.jpg>"),
+        args.next()
+            .expect("usage: gen_cmyk_ycck <in.jpg> <out.jpg>"),
     );
     let data = std::fs::read(&src).expect("read input");
 
@@ -41,5 +43,12 @@ fn main() {
     let out = started.finish().expect("finish compress");
 
     std::fs::write(&dst, &out).expect("write output");
-    println!("{} -> {} ({} bytes, {}x{})", src.to_string_lossy(), dst.to_string_lossy(), out.len(), w, h);
+    println!(
+        "{} -> {} ({} bytes, {}x{})",
+        src.to_string_lossy(),
+        dst.to_string_lossy(),
+        out.len(),
+        w,
+        h
+    );
 }
