@@ -263,12 +263,17 @@ On `corpus-expanded/irs-w2.pdf` (the official IRS Form W-2 — a *static* XFA
 form whose 568 widget annotations draw no ink at all, next to a 1.58 MB XFA
 packet set):
 
-| Pipeline | Size | of input | Form? | Values? |
-| --- | ---: | ---: | --- | --- |
-| input | 2,150,352 | 100.0% | interactive | intact |
-| amatl defaults | 1,392,531 | 64.8% | interactive | intact |
-| amatl `--flatten-forms` | 250,229 | 11.6% | static | intact |
-| Ghostscript `/ebook` | 183,761 | 8.5% | destroyed | destroyed |
+| Pipeline | Size | of input | Form? | Pages differing from the original render |
+| --- | ---: | ---: | --- | ---: |
+| input | 2,150,352 | 100.0% | interactive | — |
+| amatl defaults | 1,392,531 | 64.8% | interactive | 0 of 11 |
+| amatl defaults + `--flatten-forms` | 250,229 | 11.6% | static | 0 of 11 |
+| amatl kitchen sink + `--flatten-forms` | **140,215** | **6.5%** | static | 0 of 11 |
+| Ghostscript `/ebook` | 189,094 | 8.8% | removed | **11 of 11**, up to 0.55% of pixels |
+
+This is the file Ghostscript used to win by 4× (57.9% vs 8.8% in
+`scripts/bench-full.sh`). It is now amatl that is smaller — and amatl's output
+is the pixel-identical one.
 
 `scripts/forms-vs-gs.sh` shows the contract earning its keep on a real filled
 dynamic XFA form (`xfa_filled_imm1344e.pdf`, a Canadian IMM 1344E from the

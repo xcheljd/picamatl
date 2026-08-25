@@ -209,11 +209,24 @@ already unreferenced when `prune_objects()` runs.
 | amatl defaults + `--flatten-forms` | 250,229 | 11.6% |
 | Ghostscript `/ebook` (deletes the form layer unconditionally) | 183,761 | 8.5% |
 
-Rendered through Ghostscript at 150 dpi, all 11 pages of the flattened output
-are pixel-identical to the original — measured with `scripts/forms-verify.py`
-on a flatten-only run (`--target-dpi 0 --no-downsample-flate-images
---no-subset-fonts`), so the comparison is about flattening and nothing else.
-`census-brief.pdf` is pixel-identical across all 9 pages on the same basis.
+And with the rest of the opt-in flags on (the `scripts/bench-full.sh` kitchen
+sink, zlib backend):
+
+| | bytes | of input | pages differing from the original render |
+| --- | ---: | ---: | ---: |
+| amatl kitchen sink, `--no-flatten-forms` | 1,281,292 | 59.6% | — |
+| amatl kitchen sink, `--flatten-forms` | **140,215** | **6.5%** | 0 of 11 vs the line above |
+| Ghostscript `/ebook` | 189,094 | 8.8% | **11 of 11**, up to 0.55% of pixels |
+
+That is the whole point of the exercise: on the file Ghostscript used to win by
+4× it is now amatl that is smaller, and amatl's output is the pixel-identical
+one.
+
+Render fidelity was measured with `scripts/forms-verify.py` (Ghostscript, 100
+and 150 dpi, grayscale, anti-aliasing off). On a flatten-*only* run
+(`--target-dpi 0 --no-downsample-flate-images --no-subset-fonts`, so the
+comparison is about flattening and nothing else) all 11 pages of `irs-w2.pdf`
+and all 9 pages of `census-brief.pdf` are pixel-identical to the input.
 
 `census-brief.pdf` gains a small win (a vestigial `/AcroForm` whose `/DR` font
 resources become unreferenced). Every other corpus file is untouched: no
