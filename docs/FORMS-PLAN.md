@@ -41,8 +41,8 @@ delete, so it deletes it and reports success.
 | --- | --- | ---: | --- | ---: | ---: | ---: | --- |
 | `corpus-expanded/irs-w2.pdf` | yes | 1,583,884 B (9 packets) | absent | 568 | **0** | 40 (`/Btn`, all `/Off`) | **flatten** |
 | `corpus-expanded/census-brief.pdf` | yes, `/Fields` empty | — | absent | 0 | 0 | 0 | **flatten** (vestigial `/DR`) |
-| `corpus-expanded/xfa_filled_imm1344e.pdf` | yes | 2,449,896 B, **481,594 B of filled `datasets`** | **true** | 1 | 0 | 1 | **decline** |
-| `corpus-expanded/xfa_issue14315.pdf` | yes | 4,280 B | **true** | 0 | 0 | 0 | **decline** |
+| `corpus-expanded/xfa_filled_imm1344e.pdf` | yes | 2,451,896 B (10 packets), **481,594 B of filled `datasets`** | **true** | 1 | 1 | 1 | **decline** |
+| `corpus-expanded/xfa_issue14315.pdf` | yes | 3,080 B (6 packets) | **true** | 0 | 0 | 0 | **decline** |
 | `corpus/irs-1040gi.pdf` | no | — | — | 0 (498 `/Link`) | — | — | no-op |
 | every other corpus file | no | — | — | 0 | — | — | no-op |
 
