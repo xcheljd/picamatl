@@ -8,6 +8,65 @@ and this project adheres to
 
 ## [Unreleased]
 
+### Added
+
+- **`--strip-private-data` (`OptimizeOptions::strip_private_data`, off by
+  default)** — removes every `/PieceInfo` page-piece dictionary, where an
+  authoring application keeps its own private copy of the artwork beside the
+  flattened page that draws it (ISO 32000-1 14.5). Illustrator's
+  `AIPrivateData` is the extreme case: on `corpus-expanded/cmyk-jpeg.pdf` it is
+  **261,453 B — 96% of amatl's entire output for that file**, taking it from
+  67.4% of input to 3.3%; `corpus/arxiv-attention.pdf` sheds a further
+  239,955 B. Pixel-identical (verified page by page at 100 dpi on all three
+  affected corpus files); what it costs is round-trip editability in the
+  producing application, hence opt-in, same posture as `--strip-metadata`.
+
+### Changed
+
+- **Type1 → Type1C conversion now plans per `/FontDescriptor`, not per font
+  dictionary.** Producers routinely point several font dictionaries — one
+  program, several `/Encoding` variants — at a single descriptor, and the
+  "referenced exactly once" soundness test then failed for all of them:
+  `corpus-expanded/arxiv-diffusion.pdf` shipped **all** 331,824 B of its font
+  bytes unconverted. The group is planned as a unit — every reference to the
+  descriptor must be one of the font dictionaries whose usage the walk
+  attributed, the members must agree on their base name, and their glyph sets
+  union into one conversion — so the guarantee is unchanged while the blocked
+  case now converts. Worth **316,418 B** on arxiv-diffusion and **55,738 B**
+  on arxiv-gpt4; 125 pages verified pixel-identical at 72 dpi, pdftotext
+  identical.
+
+- **The signature guard on the three entropy-level passes is gone.**
+  `redeflate_flate_streams`, `reoptimize_jpeg_streams` and
+  `minify_content_streams` used to decline any document carrying a `/Sig`
+  dictionary, a `/ByteRange`, or an AcroForm `/SigFlags`. That guard protected
+  nothing: amatl re-serializes the entire document on every run, so every file
+  offset moves and an offset-pinned digest is already invalid in the output —
+  font subsetting, image downsampling, ObjStm packing and metadata stripping
+  were never gated on signatures in the first place. Verified on
+  `corpus-expanded/irs-w2.pdf`, a Reader-extended IRS form: the `/UR3`
+  signature's `/ByteRange` in amatl's *previous* output already pointed past
+  EOF. Removing the incoherent guard is worth **507,344 B (28% of that file's
+  output)**, almost all of it the 1.5 MB XFA attachment that shipped with the
+  producer's weak deflate. The README now states plainly that optimizing a
+  signed PDF invalidates its signature.
+
+### Fixed
+
+- **One Type3 glyph disabled every font optimization in the document.**
+  `lopdf`'s content parser does not know `d0`/`d1`, the glyph-metric operators
+  that open a Type3 `/CharProcs` stream: it reads `d1` as the operator `d`
+  plus a stray number that binds as the *first operand of the next operator*,
+  and a char proc that ends right after `d1` fails to parse at all. Either
+  outcome aborted the font-usage walk, and one abort discards every font plan
+  in the file. `corpus-expanded/arxiv-gpt4.pdf` shipped 713 KB of font
+  programs untouched because of a single 22-byte char proc. The metrics prefix
+  is now split off before parsing — a leading run of numeric tokens at the
+  operator's exact arity, nothing else — so the operator sequence the walker
+  inspects is unchanged and every other parse failure still declines. Worth
+  **693,711 B (41% of that file's output)**; 100/100 pages verified
+  pixel-identical at 72 dpi.
+
 ### Fixed
 
 - **CMYK/YCCK JPEGs were re-encoded to RGB under an unchanged `/DeviceCMYK`

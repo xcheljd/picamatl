@@ -72,7 +72,7 @@ impl FontPlan {
         match self {
             FontPlan::Cid(p) => p.type0_id,
             FontPlan::Simple(p) => p.font_id,
-            FontPlan::Type1(p) => p.font_id,
+            FontPlan::Type1(p) => p.font_ids[0],
         }
     }
 }
@@ -116,7 +116,9 @@ pub(crate) struct SimpleFontPlan {
 /// and re-tags the font names — `/Encoding`, `/Widths`, and `/ToUnicode`
 /// never change, so text extraction is bit-identical.
 pub(crate) struct Type1FontPlan {
-    font_id: ObjectId,
+    /// Every font dictionary served by this descriptor. Usually one; more
+    /// when a producer points several `/Encoding` variants at one program.
+    font_ids: Vec<ObjectId>,
     descriptor_id: ObjectId,
     font_file_id: ObjectId,
     /// Flate-compressed CFF font program.
@@ -168,18 +170,15 @@ pub(crate) fn plan_font_subsets(
         .used
         .iter()
         .filter(|(id, cids)| !walker.ineligible.contains(id) && !cids.is_empty())
-        .filter_map(|(&id, cids)| {
-            plan_one(
-                doc,
-                id,
-                cids,
-                &refcounts,
-                subset_fonts,
-                convert_type1,
-                strip_hinting,
-            )
-        })
+        .filter_map(|(&id, cids)| plan_one(doc, id, cids, &refcounts, subset_fonts, strip_hinting))
         .collect();
+    if convert_type1 {
+        plans.extend(
+            plan_type1_conversions(doc, &walker, &refcounts)
+                .into_iter()
+                .map(FontPlan::Type1),
+        );
+    }
     // HashMap iteration order is arbitrary; sort so output is reproducible.
     plans.sort_by_key(FontPlan::font_id);
     plans
@@ -187,14 +186,12 @@ pub(crate) fn plan_font_subsets(
 
 /// Dispatch a used font to the planner matching its subtype (each planner
 /// gated by its own option).
-#[allow(clippy::too_many_arguments)]
 fn plan_one(
     doc: &Document,
     id: ObjectId,
     codes: &BTreeSet<u16>,
     refcounts: &HashMap<ObjectId, usize>,
     subset_fonts: bool,
-    convert_type1: bool,
     strip_hinting: bool,
 ) -> Option<FontPlan> {
     let dict = doc.get_object(id).ok()?.as_dict().ok()?;
@@ -204,9 +201,6 @@ fn plan_one(
         }
         Ok(Object::Name(n)) if n == b"TrueType" && subset_fonts => {
             plan_one_simple_font(doc, id, codes, refcounts, strip_hinting).map(FontPlan::Simple)
-        }
-        Ok(Object::Name(n)) if n == b"Type1" && convert_type1 => {
-            plan_one_type1_font(doc, id, codes, refcounts).map(FontPlan::Type1)
         }
         _ => None,
     }
@@ -600,8 +594,10 @@ fn apply_type1_plan(doc: &mut Document, plan: Type1FontPlan) {
         d.set("FontFile3", Object::Reference(plan.font_file_id));
         d.set("FontName", Object::Name(plan.tagged_name.clone()));
     }
-    if let Ok(Object::Dictionary(d)) = doc.get_object_mut(plan.font_id) {
-        d.set("BaseFont", Object::Name(plan.tagged_name));
+    for font_id in plan.font_ids {
+        if let Ok(Object::Dictionary(d)) = doc.get_object_mut(font_id) {
+            d.set("BaseFont", Object::Name(plan.tagged_name.clone()));
+        }
     }
 }
 
@@ -964,7 +960,7 @@ impl<'a> Walker<'a> {
 
         // Strict parsing: the lenient `Content::decode` silently drops a
         // trailing unparseable region, which could hide show operators.
-        let Ok(parsed) = Content::decode_strict(content) else {
+        let Some(parsed) = decode_content_strict(content) else {
             self.abort();
             return fallback;
         };
@@ -1855,20 +1851,65 @@ fn parse_type1_encoding(
     }
 }
 
-/// Validate one used Type1 font end to end and build its Type1C conversion
-/// plan. Any failure — unparseable font program, unknown encoding shape,
-/// charstring anomalies, shared structure, not strictly smaller — returns
-/// `None` and the font ships untouched.
-fn plan_one_type1_font(
+/// Group every used Type1 font by the descriptor that carries its program,
+/// and plan one conversion per group.
+///
+/// Producers routinely point several font dictionaries — same program,
+/// different `/Encoding` — at a single `/FontDescriptor`. Planning per font
+/// dictionary meant a shared descriptor failed the "referenced exactly once"
+/// soundness test and the whole program shipped as Type1 (measured: all
+/// 331,824 B of `corpus-expanded/arxiv-diffusion.pdf`'s font bytes). Planning
+/// per descriptor keeps the same guarantee — every reference to the
+/// descriptor must be one of the font dictionaries whose usage we attributed
+/// — while letting the group's glyph sets union into one conversion.
+fn plan_type1_conversions(
     doc: &Document,
-    font_id: ObjectId,
-    codes: &BTreeSet<u16>,
+    walker: &Walker,
+    refcounts: &HashMap<ObjectId, usize>,
+) -> Vec<Type1FontPlan> {
+    let mut groups: BTreeMap<ObjectId, Vec<(ObjectId, BTreeSet<u16>)>> = BTreeMap::new();
+    for (&font_id, codes) in &walker.used {
+        if walker.ineligible.contains(&font_id) || codes.is_empty() {
+            continue;
+        }
+        let Ok(Object::Dictionary(dict)) = doc.get_object(font_id) else {
+            continue;
+        };
+        if !matches!(dict.get(b"Subtype").map(|s| resolve(doc, s)),
+            Ok(Object::Name(n)) if n == b"Type1")
+        {
+            continue;
+        }
+        let Ok(descriptor) = dict.get(b"FontDescriptor") else {
+            continue;
+        };
+        if let (Some(descriptor_id), _) = resolve_ref(doc, descriptor) {
+            groups
+                .entry(descriptor_id)
+                .or_default()
+                .push((font_id, codes.clone()));
+        }
+    }
+    groups
+        .into_iter()
+        .filter_map(|(descriptor_id, mut members)| {
+            members.sort_by_key(|(id, _)| *id);
+            plan_type1_group(doc, descriptor_id, &members, refcounts)
+        })
+        .collect()
+}
+
+/// Validate one descriptor's worth of used Type1 fonts end to end and build
+/// their shared Type1C conversion plan. Any failure — unparseable font
+/// program, unknown encoding shape, charstring anomalies, shared structure,
+/// not strictly smaller — returns `None` and the fonts ship untouched.
+fn plan_type1_group(
+    doc: &Document,
+    descriptor_id: ObjectId,
+    members: &[(ObjectId, BTreeSet<u16>)],
     refcounts: &HashMap<ObjectId, usize>,
 ) -> Option<Type1FontPlan> {
-    let font = doc.get_object(font_id).ok()?.as_dict().ok()?;
-    let (descriptor_id, descriptor) = resolve_ref(doc, font.get(b"FontDescriptor").ok()?);
-    let descriptor_id = descriptor_id?;
-    let descriptor = descriptor.as_dict().ok()?;
+    let descriptor = doc.get_object(descriptor_id).ok()?.as_dict().ok()?;
     // Exactly one font program, of the Type1 kind: a descriptor already
     // carrying a `/FontFile3` (or a TrueType program) is not ours to touch.
     if descriptor.get(b"FontFile2").is_ok() || descriptor.get(b"FontFile3").is_ok() {
@@ -1877,68 +1918,163 @@ fn plan_one_type1_font(
     let (font_file_id, font_file) = resolve_ref(doc, descriptor.get(b"FontFile").ok()?);
     let font_file_id = font_file_id?;
     let font_file = font_file.as_stream().ok()?;
-    // Shared descriptor/font-program structure could serve fonts whose usage
-    // was not attributed here; mutating it would be unsound.
-    if refcounts.get(&descriptor_id) != Some(&1) || refcounts.get(&font_file_id) != Some(&1) {
+    // Every reference to the descriptor must be one of the font dictionaries
+    // in this group, and the program must belong to this descriptor alone —
+    // otherwise some font whose usage was never attributed here shares the
+    // structure, and rewriting it would be unsound.
+    if refcounts.get(&descriptor_id) != Some(&members.len())
+        || refcounts.get(&font_file_id) != Some(&1)
+    {
         return None;
     }
 
     let font_bytes = strict_stream_bytes(doc, font_file)?;
     let t1 = type1::parse(&font_bytes)?;
-    let (base, diffs) = parse_type1_encoding(doc, font)?;
 
     // Resolve every used code to a glyph name through the same encoding the
-    // viewer applies (`/Differences`, then the base). A code that resolves
-    // to no name, or to a glyph the font does not carry, renders `.notdef`
-    // before AND after conversion (the encoding objects never change), so it
-    // constrains nothing.
+    // viewer applies (`/Differences`, then the base), once per member: they
+    // share a program but not necessarily an `/Encoding`. A code that
+    // resolves to no name, or to a glyph the font does not carry, renders
+    // `.notdef` before AND after conversion (the encoding objects never
+    // change), so it constrains nothing.
     let mut keep: BTreeSet<Vec<u8>> = BTreeSet::new();
-    for &code in codes {
-        let code = u8::try_from(code).ok()?;
-        let name: Option<Vec<u8>> = match diffs.get(&code) {
-            Some(n) => Some(n.clone()),
-            None => match &base {
-                Type1Base::Table(table) => {
-                    let n = table[usize::from(code)];
-                    (!n.is_empty()).then(|| n.as_bytes().to_vec())
+    let mut base_name: Option<Vec<u8>> = None;
+    for (font_id, codes) in members {
+        let font = doc.get_object(*font_id).ok()?.as_dict().ok()?;
+        let (base, diffs) = parse_type1_encoding(doc, font)?;
+        for &code in codes {
+            let code = u8::try_from(code).ok()?;
+            let name: Option<Vec<u8>> = match diffs.get(&code) {
+                Some(n) => Some(n.clone()),
+                None => match &base {
+                    Type1Base::Table(table) => {
+                        let n = table[usize::from(code)];
+                        (!n.is_empty()).then(|| n.as_bytes().to_vec())
+                    }
+                    Type1Base::Builtin => t1.builtin_name(code).map(<[u8]>::to_vec),
+                },
+            };
+            if let Some(name) = name {
+                if t1.has_glyph(&name) {
+                    keep.insert(name);
                 }
-                Type1Base::Builtin => t1.builtin_name(code).map(<[u8]>::to_vec),
+            }
+        }
+        // One name is written back to every member and to the descriptor, so
+        // the members must agree on it modulo their subset tags.
+        let this_name = match font.get(b"BaseFont").map(|o| resolve(doc, o)) {
+            Ok(Object::Name(n)) => strip_subset_tag(n).to_vec(),
+            _ => match descriptor.get(b"FontName").map(|o| resolve(doc, o)) {
+                Ok(Object::Name(n)) => strip_subset_tag(n).to_vec(),
+                _ => return None,
             },
         };
-        if let Some(name) = name {
-            if t1.has_glyph(&name) {
-                keep.insert(name);
-            }
+        match &base_name {
+            None => base_name = Some(this_name),
+            Some(seen) if *seen == this_name => {}
+            Some(_) => return None,
         }
     }
 
     let cff = type1::convert_to_cff(&t1, &keep)?;
     let deflated_cff = deflate_level9(&cff)?;
-    // Strict-smaller guard on stored bytes, per font: never regress one.
+    // Strict-smaller guard on stored bytes, per program: never regress one.
     if deflated_cff.len() >= font_file.content.len() {
         return None;
     }
 
-    let base_name = match font.get(b"BaseFont").map(|o| resolve(doc, o)) {
-        Ok(Object::Name(n)) => n.clone(),
-        _ => match descriptor.get(b"FontName").map(|o| resolve(doc, o)) {
-            Ok(Object::Name(n)) => n.clone(),
-            _ => return None,
-        },
-    };
     let tag = subset_tag(&cff);
+    let base_name = base_name?;
     let mut tagged_name = Vec::with_capacity(base_name.len() + 7);
     tagged_name.extend_from_slice(&tag);
     tagged_name.push(b'+');
-    tagged_name.extend_from_slice(strip_subset_tag(&base_name));
+    tagged_name.extend_from_slice(&base_name);
 
     Some(Type1FontPlan {
-        font_id,
+        font_ids: members.iter().map(|(id, _)| *id).collect(),
         descriptor_id,
         font_file_id,
         deflated_cff,
         tagged_name,
     })
+}
+
+/// Strict content decode, with the one tolerance `lopdf`'s parser needs.
+///
+/// `lopdf` does not know `d0`/`d1` — the two glyph-metric operators that, per
+/// PDF 32000-1 §9.6.5, open a Type3 `/CharProcs` stream. It tokenizes `d1` as
+/// the operator `d` plus a stray number `1`, which then binds as the *first
+/// operand of the next operator*; a char proc that ends right after `d1`
+/// fails outright. Either way the walk used to abort, and one abort discards
+/// every font plan in the document (measured on a LaTeX paper: 713 KB of font
+/// programs left untouched because of one 22-byte char proc).
+///
+/// So the metrics prefix is split off before parsing, not after a failure:
+/// a stream that "parses" with the stray number attached is misparsed, and
+/// the walker's operand checks are what stands between that and a wrong
+/// glyph attribution. The tolerance is deliberately narrow — only a
+/// *leading* run of numeric tokens followed by `d0`/`d1` at the matching
+/// arity is removed, and neither operator shows text or selects a font, so
+/// the operation sequence the walker inspects is unchanged. Every other
+/// parse failure still declines, exactly as before.
+fn decode_content_strict(content: &[u8]) -> Option<Content> {
+    let body = strip_type3_metrics(content).unwrap_or(content);
+    Content::decode_strict(body).ok()
+}
+
+/// Split off a leading `wx wy d0` / `wx wy llx lly urx ury d1` prefix,
+/// returning the rest of the stream. `None` unless the stream opens with
+/// exactly that: only numeric tokens may precede the operator, the operand
+/// count must match it, and any delimiter (`(`, `<`, `[`, `/`, `%`, ...)
+/// before it means this is not a Type3 metrics prefix.
+fn strip_type3_metrics(content: &[u8]) -> Option<&[u8]> {
+    fn is_ws(b: u8) -> bool {
+        matches!(b, b'\0' | b'\t' | b'\n' | b'\x0c' | b'\r' | b' ')
+    }
+    fn is_delim(b: u8) -> bool {
+        matches!(
+            b,
+            b'(' | b')' | b'<' | b'>' | b'[' | b']' | b'{' | b'}' | b'/' | b'%'
+        )
+    }
+    let mut i = 0usize;
+    let mut operands = 0usize;
+    loop {
+        while i < content.len() && is_ws(content[i]) {
+            i += 1;
+        }
+        let start = i;
+        while i < content.len() && !is_ws(content[i]) && !is_delim(content[i]) {
+            i += 1;
+        }
+        if i == start {
+            // A delimiter, or end of stream, before any `d0`/`d1`.
+            return None;
+        }
+        let token = &content[start..i];
+        match token {
+            b"d0" => return (operands == 2).then(|| &content[i..]),
+            b"d1" => return (operands == 6).then(|| &content[i..]),
+            _ => {
+                if !is_number(token) || operands >= 6 {
+                    return None;
+                }
+                operands += 1;
+            }
+        }
+    }
+}
+
+/// A PDF numeric object token: optional sign, digits and at most one point,
+/// with at least one digit.
+fn is_number(token: &[u8]) -> bool {
+    let body = match token.first() {
+        Some(b'+' | b'-') => &token[1..],
+        _ => token,
+    };
+    body.iter().filter(|&&b| b == b'.').count() <= 1
+        && body.iter().any(u8::is_ascii_digit)
+        && body.iter().all(|&b| b.is_ascii_digit() || b == b'.')
 }
 
 #[cfg(test)]
@@ -2530,6 +2666,345 @@ mod tests {
         {
             assert_glyph_preserved(&view, &original, cid, cid);
         }
+    }
+
+    // -- Type1 -> Type1C conversion -----------------------------------------
+
+    /// Type1 encryption (`eexec` and charstrings share the algorithm).
+    fn t1_encrypt(plain: &[u8], key: u16, pad: usize) -> Vec<u8> {
+        let mut r = key;
+        let mut out = Vec::with_capacity(plain.len() + pad);
+        for &p in std::iter::repeat_n(&0u8, pad).chain(plain.iter()) {
+            let c = p ^ (r >> 8) as u8;
+            r = (u16::from(c).wrapping_add(r))
+                .wrapping_mul(52845)
+                .wrapping_add(22719);
+            out.push(c);
+        }
+        out
+    }
+
+    /// A Type1 charstring drawing one filled box, with `width` as the advance.
+    fn t1_charstring(width: i32, size: i32) -> Vec<u8> {
+        fn num(v: i32, out: &mut Vec<u8>) {
+            // Type1 integers: the 255 form is always valid and keeps this
+            // helper trivial.
+            out.push(255);
+            out.extend_from_slice(&v.to_be_bytes());
+        }
+        let mut cs = Vec::new();
+        num(0, &mut cs);
+        num(width, &mut cs);
+        cs.push(13); // hsbw
+        num(0, &mut cs);
+        num(0, &mut cs);
+        cs.push(21); // rmoveto
+        for (dx, dy) in [(size, 0), (0, size), (-size, 0)] {
+            num(dx, &mut cs);
+            num(dy, &mut cs);
+            cs.push(5); // rlineto
+        }
+        cs.push(9); // closepath
+        cs.push(14); // endchar
+        cs
+    }
+
+    /// A minimal but real Type1 font program carrying `glyphs`.
+    fn build_type1_program(name: &str, glyphs: &[(&str, i32)]) -> Vec<u8> {
+        let mut clear = Vec::new();
+        clear.extend_from_slice(b"%!PS-AdobeFont-1.0: ");
+        clear.extend_from_slice(name.as_bytes());
+        clear.extend_from_slice(b"\n/FontName /");
+        clear.extend_from_slice(name.as_bytes());
+        clear.extend_from_slice(b" def\n/PaintType 0 def\n/FontType 1 def\n");
+        clear.extend_from_slice(b"/FontMatrix [0.001 0 0 0.001 0 0] readonly def\n");
+        clear.extend_from_slice(b"/FontBBox {0 0 700 700} readonly def\n");
+        clear.extend_from_slice(b"/Encoding 256 array\n");
+        clear.extend_from_slice(b"0 1 255 {1 index exch /.notdef put} for\n");
+        for (i, (glyph, _)) in glyphs.iter().enumerate() {
+            clear.extend_from_slice(format!("dup {} /{glyph} put\n", 65 + i).as_bytes());
+        }
+        clear.extend_from_slice(b"readonly def\ncurrentdict end\ncurrentfile eexec\n");
+
+        let mut private = Vec::new();
+        private.extend_from_slice(b"dup /Private 8 dict dup begin\n/lenIV 4 def\n");
+        private.extend_from_slice(b"/BlueValues [0 0] ND\n/Subrs 0 array\nND\n");
+        private.extend_from_slice(
+            format!("/CharStrings {} dict dup begin\n", glyphs.len() + 1).as_bytes(),
+        );
+        for (glyph, width) in std::iter::once(&(".notdef", 0)).chain(glyphs.iter()) {
+            let cs = t1_encrypt(&t1_charstring(*width, 600), 4330, 4);
+            private.extend_from_slice(format!("/{glyph} {} RD ", cs.len()).as_bytes());
+            private.extend_from_slice(&cs);
+            private.extend_from_slice(b" ND\n");
+        }
+        private.extend_from_slice(b"end\nend\nmark currentfile closefile\n");
+
+        let mut out = clear;
+        out.extend_from_slice(&t1_encrypt(&private, 55665, 4));
+        out
+    }
+
+    /// Build a PDF where `dicts` font dictionaries share ONE descriptor and
+    /// one `/FontFile`, each with its own `/Differences`, each drawn on its
+    /// own page.
+    fn build_shared_type1_pdf(dicts: usize) -> Vec<u8> {
+        let program = build_type1_program("TestFont", &[("A", 600), ("B", 500)]);
+        let mut doc = Document::with_version("1.7");
+        let pages_id = doc.new_object_id();
+        let file_id = doc.add_object(Stream::new(
+            dictionary! {
+                "Length1" => program.len() as i64,
+                "Length2" => 0,
+                "Length3" => 0,
+            },
+            program,
+        ));
+        let descriptor_id = doc.add_object(dictionary! {
+            "Type" => "FontDescriptor",
+            "FontName" => "TestFont",
+            "Flags" => 4,
+            "FontBBox" => vec![0.into(), 0.into(), 700.into(), 700.into()],
+            "ItalicAngle" => 0,
+            "Ascent" => 700,
+            "Descent" => 0,
+            "CapHeight" => 700,
+            "StemV" => 80,
+            "FontFile" => file_id,
+        });
+        let mut page_ids = Vec::new();
+        for i in 0..dicts {
+            let glyph = if i % 2 == 0 { "A" } else { "B" };
+            let font_id = doc.add_object(dictionary! {
+                "Type" => "Font",
+                "Subtype" => "Type1",
+                "BaseFont" => "TestFont",
+                "FirstChar" => 65,
+                "LastChar" => 66,
+                "Widths" => vec![600.into(), 500.into()],
+                "FontDescriptor" => descriptor_id,
+                // A distinct /Differences per member: same program, different
+                // encodings, which is exactly why producers share descriptors.
+                "Encoding" => dictionary! {
+                    "Type" => "Encoding",
+                    "Differences" => vec![(65 + i as i64).into(), glyph.into()],
+                },
+            });
+            let content_id = doc.add_object(Stream::new(
+                dictionary! {},
+                b"BT /F1 24 Tf 72 720 Td (A) Tj ET".to_vec(),
+            ));
+            page_ids.push(doc.add_object(dictionary! {
+                "Type" => "Page",
+                "Parent" => pages_id,
+                "Contents" => content_id,
+                "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+                "Resources" => dictionary! { "Font" => dictionary! { "F1" => font_id } },
+            }));
+        }
+        finish_pdf(&mut doc, pages_id, page_ids)
+    }
+
+    /// The descriptor of a converted font: `/FontFile` gone, `/FontFile3`
+    /// present, plus every `/BaseFont` in the file.
+    fn type1c_view(pdf: &[u8]) -> (usize, usize, Vec<Vec<u8>>) {
+        let doc = Document::load_mem(pdf).expect("output must load");
+        let mut type1c = 0;
+        let mut type1 = 0;
+        let mut names = Vec::new();
+        for obj in doc.objects.values() {
+            match obj {
+                Object::Stream(s) => {
+                    if matches!(s.dict.get(b"Subtype"), Ok(Object::Name(n)) if n == b"Type1C") {
+                        type1c += 1;
+                    }
+                    if s.dict.get(b"Length1").is_ok() {
+                        type1 += 1;
+                    }
+                }
+                Object::Dictionary(d) => {
+                    if let Ok(Object::Name(n)) = d.get(b"BaseFont") {
+                        names.push(n.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
+        (type1c, type1, names)
+    }
+
+    /// One descriptor, three font dictionaries: the group converts once and
+    /// every member is re-tagged to the same name.
+    #[test]
+    fn type1_conversion_handles_a_shared_font_descriptor() {
+        let pdf = build_shared_type1_pdf(3);
+        let opts = OptimizeOptions::default().with_convert_type1(true);
+        let out = optimize_with_options(&pdf, opts);
+        let (type1c, type1, names) = type1c_view(&out);
+        assert_eq!(type1c, 1, "one shared Type1C program");
+        assert_eq!(type1, 0, "no Type1 program may survive");
+        assert_eq!(names.len(), 3, "all three font dictionaries kept");
+        assert!(
+            names.windows(2).all(|w| w[0] == w[1]),
+            "every member re-tagged to the same subset name: {names:?}"
+        );
+        assert!(out.len() < pdf.len(), "conversion must shrink the file");
+    }
+
+    /// The single-dictionary case still works, and is what the group path
+    /// degenerates to.
+    #[test]
+    fn type1_conversion_still_handles_an_unshared_descriptor() {
+        let pdf = build_shared_type1_pdf(1);
+        let opts = OptimizeOptions::default().with_convert_type1(true);
+        let out = optimize_with_options(&pdf, opts);
+        let (type1c, type1, _) = type1c_view(&out);
+        assert_eq!((type1c, type1), (1, 0));
+    }
+
+    /// A descriptor reference the walk did not attribute to a used font (here
+    /// an extra font dictionary that is never drawn) still declines: its
+    /// glyphs are not in the union, so converting could drop them.
+    #[test]
+    fn type1_conversion_declines_an_unattributed_sharer() {
+        let pdf = build_shared_type1_pdf(2);
+        let mut doc = Document::load_mem(&pdf).unwrap();
+        let (descriptor_id, _) = doc
+            .objects
+            .iter()
+            .find(|(_, o)| {
+                matches!(o, Object::Dictionary(d)
+                    if matches!(d.get(b"Type"), Ok(Object::Name(n)) if n == b"FontDescriptor"))
+            })
+            .map(|(id, o)| (*id, o.clone()))
+            .unwrap();
+        // A third font dictionary, referenced from nowhere a page can reach.
+        let orphan = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type1",
+            "BaseFont" => "TestFont",
+            "FontDescriptor" => descriptor_id,
+        });
+        doc.catalog_mut()
+            .unwrap()
+            .set("AA", Object::Reference(orphan));
+        let mut with_extra: Vec<u8> = Vec::new();
+        doc.save_to(&mut with_extra).unwrap();
+
+        let opts = OptimizeOptions::default().with_convert_type1(true);
+        let out = optimize_with_options(&with_extra, opts);
+        let (type1c, type1, _) = type1c_view(&out);
+        assert_eq!(
+            (type1c, type1),
+            (0, 1),
+            "an unattributed sharer must leave the program as Type1"
+        );
+    }
+
+    #[test]
+    fn type3_metrics_prefix_is_split_off_only_when_well_formed() {
+        // d1: six operands. d0: two.
+        assert_eq!(
+            strip_type3_metrics(b"0.27 0 0 0 0 0 d1\n1 0 0 1 0 0 cm"),
+            Some(&b"\n1 0 0 1 0 0 cm"[..])
+        );
+        assert_eq!(strip_type3_metrics(b"12 0 d0 BT"), Some(&b" BT"[..]));
+        // Wrong operand count for the operator: not a metrics prefix.
+        assert_eq!(strip_type3_metrics(b"0 0 0 d1 BT"), None);
+        assert_eq!(strip_type3_metrics(b"1 2 3 d0"), None);
+        // A delimiter or a non-numeric token before the operator.
+        assert_eq!(strip_type3_metrics(b"BT /F1 12 Tf"), None);
+        assert_eq!(strip_type3_metrics(b"1 2 (s) Tj"), None);
+        assert_eq!(strip_type3_metrics(b"0 0 0 0 0 0 0 0 d1"), None);
+        // No operator at all.
+        assert_eq!(strip_type3_metrics(b"1 2 3 4"), None);
+        assert_eq!(strip_type3_metrics(b""), None);
+    }
+
+    #[test]
+    fn type3_char_procs_parse_instead_of_aborting_the_walk() {
+        // lopdf rejects `d1` outright, so the tolerance is what makes this
+        // stream readable at all; the remaining operators must survive.
+        let charproc = b"0.277832 0 0 0 0 0 d1\nBT /F1 12 Tf (Hi) Tj ET".to_vec();
+        // lopdf reads `d1` as operator `d` plus a stray `1` that binds to the
+        // next operator -- a misparse, not a parse.
+        let lopdf_ops: Vec<(String, usize)> = Content::decode_strict(&charproc)
+            .expect("lopdf accepts it, wrongly")
+            .operations
+            .iter()
+            .map(|o| (o.operator.clone(), o.operands.len()))
+            .collect();
+        assert_eq!(lopdf_ops[0], ("d".to_string(), 6));
+        assert_eq!(lopdf_ops[1], ("BT".to_string(), 1), "stray operand shifted");
+        // A char proc that ends at `d1` does not parse at all.
+        assert!(Content::decode_strict(b"0.277832 0 0 0 0 0 d1\n").is_err());
+
+        let parsed = decode_content_strict(&charproc).expect("d1 prefix split off");
+        let ops: Vec<&str> = parsed
+            .operations
+            .iter()
+            .map(|o| o.operator.as_str())
+            .collect();
+        assert_eq!(ops, ["BT", "Tf", "Tj", "ET"]);
+        // Still strict about everything else.
+        assert!(decode_content_strict(b"(unterminated").is_none());
+        assert!(decode_content_strict(b"0 0 0 0 0 0 d1 (unterminated").is_none());
+    }
+
+    #[test]
+    fn a_type3_glyph_no_longer_disables_subsetting_document_wide() {
+        let cids = gids_for("Hello");
+        let pairs: Vec<(u16, char)> = cids.iter().copied().zip("Hello".chars()).collect();
+        let mut doc = Document::with_version("1.7");
+        let pages_id = doc.new_object_id();
+        let font_id = add_type0_font(&mut doc, &FontSpec::identity(pairs));
+        let text_page = add_text_page(&mut doc, pages_id, font_id, show_text_ops("F1", &cids));
+
+        // A Type3 font whose one char proc opens with `d1`, drawn on its own
+        // page. Nothing about it constrains the Type0 font on page 1.
+        let proc_id = doc.add_object(Stream::new(
+            dictionary! {},
+            b"10 0 0 0 10 10 d1\n0 0 10 10 re f".to_vec(),
+        ));
+        let t3_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type3",
+            "FontBBox" => vec![0.into(), 0.into(), 10.into(), 10.into()],
+            "FontMatrix" => vec![
+                0.001.into(), 0.into(), 0.into(), 0.001.into(), 0.into(), 0.into(),
+            ],
+            "CharProcs" => dictionary! { "a" => proc_id },
+            "Encoding" => dictionary! {
+                "Type" => "Encoding",
+                "Differences" => vec![97.into(), "a".into()],
+            },
+            "FirstChar" => 97,
+            "LastChar" => 97,
+            "Widths" => vec![10.into()],
+        });
+        let t3_content = doc.add_object(Stream::new(
+            dictionary! {},
+            b"BT /T3 12 Tf (a) Tj ET".to_vec(),
+        ));
+        let t3_page = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "Contents" => t3_content,
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Resources" => dictionary! { "Font" => dictionary! { "T3" => t3_id } },
+        });
+        let pdf = finish_pdf(&mut doc, pages_id, vec![text_page, t3_page]);
+
+        let out = optimize_with_options(&pdf, subset_opts());
+        assert!(
+            out.len() < pdf.len(),
+            "the Type0 font must still be subsetted alongside a Type3 glyph"
+        );
+        let view = subset_view(&out);
+        assert!(
+            view.font.len() < noto_bytes().len(),
+            "font program should have shrunk"
+        );
     }
 
     #[test]

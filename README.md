@@ -69,6 +69,16 @@ parser becomes the same graceful fallback as an ordinary error) and pinned by
 regression tests for the three failure shapes: panic, degenerate input, and
 parse error. Amatl is safe to run on untrusted input in an automated pipeline.
 
+**Digital signatures do not survive optimization.** Every amatl run
+re-serializes the whole document, so a `/ByteRange` digest — which pins file
+offsets — is invalid in the output. This has always been true (font
+subsetting, image downsampling and object-stream packing were never gated on
+signatures); as of the current release the three entropy-level passes
+(re-deflate, JPEG Huffman re-optimization, content minification) no longer
+pretend otherwise by declining, which is worth up to 24% of the output on a
+Reader-extended form. If a signature must stay valid, do not optimize the
+file.
+
 ## Usage
 
 ```rust
@@ -111,6 +121,16 @@ every page and XObject — the PDF 1.7 specification file carries 134 of them,
 (library: `.with_strip_metadata(true)`) removes every `/Metadata` entry. It is
 render-identical but discards provenance and breaks PDF/A and PDF/UA
 identification, so it is opt-in.
+
+**Private authoring data is kept by default.** An Illustrator- or
+InDesign-authored figure carries the producer's own editable copy of the
+artwork in a `/PieceInfo` page-piece dictionary (ISO 32000-1 14.5), beside the
+flattened page that actually draws it. No conforming reader consults it to
+render: on the corpus it is 295 KB of a 374 KB file (96% of amatl's output for
+that file) and 240 KB inside a 2.2 MB paper. `--strip-private-data`
+(library: `.with_strip_private_data(true)`) removes every `/PieceInfo` entry.
+It is pixel-identical — verified page by page — but the producing application
+loses its round trip, so it is opt-in.
 
 **Amatl will never lossy-symbol-encode your scans.** Symbol-mode JBIG2 — the
 encoding behind the Xerox scanner scandal, where visually plausible character

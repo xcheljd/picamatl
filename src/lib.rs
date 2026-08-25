@@ -149,6 +149,18 @@ pub struct OptimizeOptions {
     /// the file on it (adobe-spec: 860 KB, 12%). Default: `false`.
     pub strip_metadata: bool,
 
+    /// If true, remove every `/PieceInfo` entry — the "page-piece"
+    /// dictionaries of ISO 32000-1 14.5, where an authoring application
+    /// stashes its own private data (Illustrator's `AIPrivateData`,
+    /// InDesign's, Photoshop's). Conforming readers ignore them entirely, so
+    /// this is visually lossless and changes no page content; what it costs
+    /// is round-trip editability in the producing application, which is why
+    /// it is opt-in like `strip_metadata`. Illustrator-authored figures carry
+    /// the whole editable artwork alongside the flattened page: measured at
+    /// 295 KB of a 374 KB file, and 307 KB inside a 2.2 MB paper.
+    /// Default: `false`.
+    pub strip_private_data: bool,
+
     /// If true, pack eligible non-stream objects into PDF 1.5 `ObjStm` streams
     /// with a binary cross-reference stream (additional structural
     /// compression). Default: `true` (was `false` through 0.3.0). Lossless —
@@ -299,6 +311,7 @@ impl Default for OptimizeOptions {
             dpi_margin: DPI_MARGIN,
             strip_accessibility: false,
             strip_metadata: false,
+            strip_private_data: false,
             pack_object_streams: true,
             downsample_flate_images: true,
             subset_fonts: true,
@@ -349,6 +362,14 @@ impl OptimizeOptions {
     #[must_use]
     pub fn with_strip_metadata(mut self, strip: bool) -> Self {
         self.strip_metadata = strip;
+        self
+    }
+
+    /// Enable/disable stripping every `/PieceInfo` (private application data)
+    /// entry. See [`OptimizeOptions::strip_private_data`].
+    #[must_use]
+    pub fn with_strip_private_data(mut self, strip: bool) -> Self {
+        self.strip_private_data = strip;
         self
     }
 
@@ -553,10 +574,13 @@ fn page_resources(doc: &Document, page_id: ObjectId) -> Option<&lopdf::Dictionar
     None
 }
 
-/// Map of image-XObject resource names to their object id for one page.
-fn page_image_names(doc: &Document, page_id: ObjectId) -> HashMap<Vec<u8>, ObjectId> {
+/// Depth bound for nested Form XObjects during placement collection.
+const MAX_FORM_DEPTH: usize = 12;
+
+/// The `/XObject` sub-dictionary of a resource dictionary, resolved.
+fn xobject_map(doc: &Document, resources: Option<&lopdf::Dictionary>) -> HashMap<Vec<u8>, ObjectId> {
     let mut map = HashMap::new();
-    let Some(resources) = page_resources(doc, page_id) else {
+    let Some(resources) = resources else {
         return map;
     };
     let Ok(xobjects) = resources.get(b"XObject").map(|x| resolve(doc, x)) else {
@@ -576,57 +600,138 @@ fn page_image_names(doc: &Document, page_id: ObjectId) -> HashMap<Vec<u8>, Objec
 /// Largest on-page rendered size (in points) for each image object id, across
 /// every placement on every page. We size to the largest use so a shared image
 /// is never under-resolved.
+///
+/// Placements inside Form XObjects count: a producer that wraps its page in a
+/// form (Illustrator, LaTeX `\includegraphics`, IRS's XFA-rendered forms) used
+/// to hide every image it draws from this scan, and an image with no recorded
+/// placement is never downsampled. On `corpus/irs-1040gi.pdf` that hid a
+/// 5120x3413 scan drawn at 405 effective DPI — 1.45 MB, half the optimized
+/// file — behind one form.
+///
+/// Failing to see a placement is safe (the image is left alone); *under*-
+/// stating one is not, so anything unparseable simply contributes no
+/// placement, and a form's `/BBox` clip is deliberately ignored — clipping can
+/// only ever make the visible area smaller than what we record.
 fn collect_placements(doc: &Document) -> HashMap<ObjectId, (f32, f32)> {
     let mut sizes: HashMap<ObjectId, (f32, f32)> = HashMap::new();
 
     for (_, page_id) in doc.get_pages() {
-        let names = page_image_names(doc, page_id);
-        if names.is_empty() {
-            continue;
-        }
+        let resources = page_resources(doc, page_id);
         let content_bytes = doc.get_page_content(page_id);
-        let Ok(content) = Content::decode(&content_bytes) else {
-            continue;
-        };
-
-        let mut ctm = Mat::IDENTITY;
-        let mut stack: Vec<Mat> = Vec::new();
-
-        for op in content.operations {
-            match op.operator.as_str() {
-                "q" => stack.push(ctm),
-                "Q" => {
-                    if let Some(prev) = stack.pop() {
-                        ctm = prev;
-                    }
-                }
-                "cm" if op.operands.len() == 6 => {
-                    let m = Mat {
-                        a: num(&op.operands[0]),
-                        b: num(&op.operands[1]),
-                        c: num(&op.operands[2]),
-                        d: num(&op.operands[3]),
-                        e: num(&op.operands[4]),
-                        f: num(&op.operands[5]),
-                    };
-                    ctm = m.concat(ctm);
-                }
-                "Do" => {
-                    if let Some(Object::Name(name)) = op.operands.first() {
-                        if let Some(id) = names.get(name) {
-                            let (w, h) = (ctm.rendered_width(), ctm.rendered_height());
-                            let entry = sizes.entry(*id).or_insert((0.0, 0.0));
-                            entry.0 = entry.0.max(w);
-                            entry.1 = entry.1.max(h);
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
+        let mut path: Vec<ObjectId> = Vec::new();
+        walk_placements(
+            doc,
+            &content_bytes,
+            resources,
+            Mat::IDENTITY,
+            &mut sizes,
+            &mut path,
+        );
     }
 
     sizes
+}
+
+/// Walk one content stream's operators in its resource context, recording
+/// image placements and recursing into the Form XObjects it draws.
+fn walk_placements(
+    doc: &Document,
+    content_bytes: &[u8],
+    resources: Option<&lopdf::Dictionary>,
+    initial_ctm: Mat,
+    sizes: &mut HashMap<ObjectId, (f32, f32)>,
+    path: &mut Vec<ObjectId>,
+) {
+    let names = xobject_map(doc, resources);
+    if names.is_empty() {
+        return;
+    }
+    let Ok(content) = Content::decode(content_bytes) else {
+        return;
+    };
+
+    let mut ctm = initial_ctm;
+    let mut stack: Vec<Mat> = Vec::new();
+
+    for op in content.operations {
+        match op.operator.as_str() {
+            "q" => stack.push(ctm),
+            "Q" => {
+                if let Some(prev) = stack.pop() {
+                    ctm = prev;
+                }
+            }
+            "cm" if op.operands.len() == 6 => {
+                let m = Mat {
+                    a: num(&op.operands[0]),
+                    b: num(&op.operands[1]),
+                    c: num(&op.operands[2]),
+                    d: num(&op.operands[3]),
+                    e: num(&op.operands[4]),
+                    f: num(&op.operands[5]),
+                };
+                ctm = m.concat(ctm);
+            }
+            "Do" => {
+                let Some(Object::Name(name)) = op.operands.first() else {
+                    continue;
+                };
+                let Some(&id) = names.get(name) else { continue };
+                let Ok(Object::Stream(stream)) = doc.get_object(id) else {
+                    continue;
+                };
+                match stream.dict.get(b"Subtype").map(|s| resolve(doc, s)) {
+                    Ok(Object::Name(n)) if n == b"Image" => {
+                        let (w, h) = (ctm.rendered_width(), ctm.rendered_height());
+                        let entry = sizes.entry(id).or_insert((0.0, 0.0));
+                        entry.0 = entry.0.max(w);
+                        entry.1 = entry.1.max(h);
+                    }
+                    Ok(Object::Name(n)) if n == b"Form" => {
+                        // Cycle guard and depth bound: a malformed form
+                        // reachable from itself must not loop.
+                        if path.contains(&id) || path.len() >= MAX_FORM_DEPTH {
+                            continue;
+                        }
+                        let form_ctm = match stream.dict.get(b"Matrix").map(|m| resolve(doc, m)) {
+                            Ok(Object::Array(items)) if items.len() == 6 => Mat {
+                                a: num(&items[0]),
+                                b: num(&items[1]),
+                                c: num(&items[2]),
+                                d: num(&items[3]),
+                                e: num(&items[4]),
+                                f: num(&items[5]),
+                            }
+                            .concat(ctm),
+                            // No /Matrix means the identity; anything else is
+                            // unreadable, and guessing a scale here could
+                            // UNDER-state the placement. Skip the form.
+                            Err(_) | Ok(Object::Null) => ctm,
+                            _ => continue,
+                        };
+                        // A form without its own /Resources inherits the
+                        // context it is drawn in (ISO 32000-1 8.10.2).
+                        let own = match stream.dict.get(b"Resources").map(|r| resolve(doc, r)) {
+                            Ok(Object::Dictionary(_)) => {
+                                resolve(doc, stream.dict.get(b"Resources").unwrap())
+                                    .as_dict()
+                                    .ok()
+                            }
+                            _ => resources,
+                        };
+                        let Some(bytes) = content_stream_plain(doc, stream) else {
+                            continue;
+                        };
+                        path.push(id);
+                        walk_placements(doc, &bytes, own, form_ctm, sizes, path);
+                        path.pop();
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Dictionary edits that accompany a replacement's new stream bytes, beyond
@@ -3509,7 +3614,7 @@ fn replan_content(
 /// Declined wholesale for encrypted, PDF/A-declared, and signed documents,
 /// same posture as `redeflate_flate_streams`.
 fn minify_content_streams(doc: &mut Document, backend: DeflateBackend) -> bool {
-    if doc.is_encrypted() || fonts::pdfa_blocked(doc) || signature_present(doc) {
+    if doc.is_encrypted() || fonts::pdfa_blocked(doc) {
         return false;
     }
     let refcounts = count_object_references(doc);
@@ -4021,6 +4126,25 @@ fn try_optimize(input: &[u8], options: OptimizeOptions) -> Result<Option<Vec<u8>
         }
     }
 
+    // Optionally drop every page-piece dictionary (ISO 32000-1 14.5): private
+    // data an authoring application keeps beside the page it rendered.
+    // Illustrator's is the extreme case — the entire editable artwork,
+    // PostScript-encoded, next to the flattened page that draws it (295 KB of
+    // a 374 KB corpus file). No conforming reader consults it to render;
+    // dropping it costs round-trip editability in the producing application
+    // and nothing else, which is why it is opt-in. As with `/Metadata`, only
+    // the reference is removed here — `prune_objects()` below collects the
+    // orphaned streams.
+    if options.strip_private_data {
+        for object in doc.objects.values_mut() {
+            match object {
+                Object::Dictionary(dict) => dict.remove(b"PieceInfo"),
+                Object::Stream(stream) => stream.dict.remove(b"PieceInfo"),
+                _ => None,
+            };
+        }
+    }
+
     // Merge true duplicate objects (identical serialized bytes -> same
     // canonical id, references redirected, duplicates removed) — iterated to a
     // FIXPOINT, alternating the non-stream and stream passes. One generation
@@ -4125,9 +4249,10 @@ const MAX_REDEFLATE_BYTES: usize = 128 * 1024 * 1024;
 /// Idempotent: a second pass re-deflates already-level-9 output to the same
 /// size, which fails the strictly-smaller test and changes nothing.
 ///
-/// Declined wholesale for encrypted documents (stream bytes are ciphertext),
-/// PDF/A-declared documents, and signed documents — a signature's byte range
-/// covers offsets this pass would move.
+/// Declined wholesale for encrypted documents (stream bytes are ciphertext)
+/// and PDF/A-declared documents. Signed documents are NOT declined: see the
+/// note above `save_document` for why a signature guard here protects
+/// nothing.
 /// True when at least one raw `/DCTDecode` payload has Huffman tables worth
 /// rebuilding. Read-only; used only to answer "is there any work at all" for
 /// a document nothing else touches (see `try_optimize`). Stops at the first
@@ -4159,7 +4284,7 @@ fn any_jpeg_huffman_work(doc: &Document) -> bool {
 /// path passes through untouched: CMYK/Separation payloads, and any image
 /// whose effective DPI is already at target.
 fn reoptimize_jpeg_streams(doc: &mut Document) {
-    if doc.is_encrypted() || fonts::pdfa_blocked(doc) || signature_present(doc) {
+    if doc.is_encrypted() || fonts::pdfa_blocked(doc) {
         return;
     }
 
@@ -4191,7 +4316,7 @@ fn reoptimize_jpeg_streams(doc: &mut Document) {
 }
 
 fn redeflate_flate_streams(doc: &mut Document, backend: DeflateBackend) {
-    if doc.is_encrypted() || fonts::pdfa_blocked(doc) || signature_present(doc) {
+    if doc.is_encrypted() || fonts::pdfa_blocked(doc) {
         return;
     }
 
@@ -4243,33 +4368,23 @@ fn replan_deflate(content: &[u8], backend: DeflateBackend) -> Option<Vec<u8>> {
     (inflate_capped(&out, plain.len())? == plain).then_some(out)
 }
 
-/// True when the document carries a digital signature. A signature dictionary
-/// pins a `/ByteRange` over the file's bytes; AcroForm `/SigFlags` declares one
-/// exists. Rather than reason about which bytes a range covers, the re-deflate
-/// pass declines such documents entirely.
-fn signature_present(doc: &Document) -> bool {
-    if let Ok(catalog) = doc.catalog() {
-        if let Ok(acroform) = catalog.get(b"AcroForm") {
-            if let Object::Dictionary(d) = resolve(doc, acroform) {
-                if d.get(b"SigFlags").is_ok() {
-                    return true;
-                }
-            }
-        }
-    }
-    doc.objects.values().any(|obj| match obj {
-        Object::Dictionary(d) => is_signature_dict(d),
-        Object::Stream(s) => is_signature_dict(&s.dict),
-        _ => false,
-    })
-}
-
-fn is_signature_dict(dict: &lopdf::Dictionary) -> bool {
-    dict.get(b"ByteRange").is_ok()
-        || matches!(dict.get(b"Type"),
-            Ok(Object::Name(n)) if n == b"Sig" || n == b"DocTimeStamp")
-}
-
+/// Why there is no signature guard here (there used to be).
+///
+/// A `/ByteRange` digest covers file offsets, so it cannot survive *any*
+/// amatl output: every run re-serializes the whole document from scratch,
+/// moving every offset, and font subsetting, image downsampling, object-stream
+/// packing and metadata stripping were never gated on signatures in the first
+/// place. Gating only the three entropy-level passes (JPEG Huffman
+/// re-optimization, whole-document re-deflate, content minification) therefore
+/// protected nothing while costing real bytes -- measured at 477 KB on a
+/// Reader-extended IRS form whose 1.5 MB XFA attachment ships with a weak
+/// deflate.
+///
+/// The honest contract is the one amatl already had in practice: optimizing a
+/// signed PDF invalidates its signature, exactly as it does with every other
+/// PDF optimizer. That is documented in the README; the fail-safe contract
+/// covers rendered content, not offset-pinned digests. Callers who must keep a
+/// signature intact must not optimize the file at all.
 /// Serialize the document, optionally using PDF 1.5 object-stream packing when
 /// `options.pack_object_streams` is true. The packed path produces smaller
 /// output for object-heavy documents but is more complex; the classic path is
@@ -6773,53 +6888,80 @@ mod tests {
         assert_eq!(reloaded, twice, "a second zopfli pass must change nothing");
     }
 
+    /// Stored length of the (single) image stream in a loaded document.
+    fn image_stream_len_of(doc: &Document) -> usize {
+        doc.objects
+            .values()
+            .find_map(|o| match o {
+                Object::Stream(s)
+                    if matches!(s.dict.get(b"Subtype"), Ok(Object::Name(n)) if n == b"Image") =>
+                {
+                    Some(s.content.len())
+                }
+                _ => None,
+            })
+            .unwrap()
+    }
+
     /// A PDF/A conformance claim disables the pass wholesale (same posture as
     /// font subsetting), so a weakly-deflated stream ships untouched.
     #[test]
-    fn redeflate_declines_pdfa_and_signed_documents() {
-        for marker in ["pdfa", "signed"] {
-            let pdf = build_pdf_weakly_deflated(120, 120);
-            let mut doc = Document::load_mem(&pdf).unwrap();
-            let before = image_stream_len(&pdf);
-            match marker {
-                "pdfa" => {
-                    let meta = doc.add_object(Stream::new(
-                        dictionary! { "Type" => "Metadata", "Subtype" => "XML" },
-                        b"<x:xmpmeta><pdfaid:part>2</pdfaid:part></x:xmpmeta>".to_vec(),
-                    ));
-                    doc.catalog_mut().unwrap().set("Metadata", meta);
-                }
-                _ => {
-                    let sig = doc.add_object(dictionary! {
-                        "Type" => "Sig",
-                        "ByteRange" => vec![0.into(), 0.into(), 0.into(), 0.into()],
-                    });
-                    doc.catalog_mut().unwrap().set("Perms", sig);
-                }
-            }
-            let mut marked: Vec<u8> = Vec::new();
-            doc.save_to(&mut marked).unwrap();
+    fn redeflate_declines_pdfa_documents() {
+        let pdf = build_pdf_weakly_deflated(120, 120);
+        let before = image_stream_len(&pdf);
+        let mut doc = Document::load_mem(&pdf).unwrap();
+        let meta = doc.add_object(Stream::new(
+            dictionary! { "Type" => "Metadata", "Subtype" => "XML" },
+            b"<x:xmpmeta><pdfaid:part>2</pdfaid:part></x:xmpmeta>".to_vec(),
+        ));
+        doc.catalog_mut().unwrap().set("Metadata", meta);
+        let mut marked: Vec<u8> = Vec::new();
+        doc.save_to(&mut marked).unwrap();
 
-            redeflate_flate_streams(
-                &mut Document::load_mem(&marked).unwrap(),
-                DeflateBackend::Zlib,
-            );
-            let mut reloaded = Document::load_mem(&marked).unwrap();
-            redeflate_flate_streams(&mut reloaded, DeflateBackend::Zlib);
-            let after = reloaded
-                .objects
-                .values()
-                .find_map(|o| match o {
-                    Object::Stream(s)
-                        if matches!(s.dict.get(b"Subtype"), Ok(Object::Name(n)) if n == b"Image") =>
-                    {
-                        Some(s.content.len())
-                    }
-                    _ => None,
-                })
-                .unwrap();
-            assert_eq!(after, before, "{marker}: stream must be untouched");
-        }
+        let mut reloaded = Document::load_mem(&marked).unwrap();
+        redeflate_flate_streams(&mut reloaded, DeflateBackend::Zlib);
+        assert_eq!(
+            image_stream_len_of(&reloaded),
+            before,
+            "PDF/A: stream must be untouched"
+        );
+    }
+
+    /// A signature is NOT a reason to decline: amatl re-serializes the whole
+    /// document either way, so the `/ByteRange` digest is already broken by
+    /// the passes that were never gated. Declining here only cost bytes.
+    #[test]
+    fn redeflate_runs_on_signed_documents_and_keeps_the_signature_object() {
+        let pdf = build_pdf_weakly_deflated(120, 120);
+        let before = image_stream_len(&pdf);
+        let mut doc = Document::load_mem(&pdf).unwrap();
+        let sig = doc.add_object(dictionary! {
+            "Type" => "Sig",
+            "ByteRange" => vec![0.into(), 0.into(), 0.into(), 0.into()],
+        });
+        doc.catalog_mut().unwrap().set("Perms", sig);
+        doc.catalog_mut().unwrap().set(
+            "AcroForm",
+            dictionary! { "SigFlags" => 3, "Fields" => Object::Array(vec![]) },
+        );
+        let mut marked: Vec<u8> = Vec::new();
+        doc.save_to(&mut marked).unwrap();
+
+        let mut reloaded = Document::load_mem(&marked).unwrap();
+        redeflate_flate_streams(&mut reloaded, DeflateBackend::Zlib);
+        assert!(
+            image_stream_len_of(&reloaded) < before,
+            "signed: the weakly-deflated stream must still be re-deflated"
+        );
+        // The signature dictionary itself is data like any other: carried
+        // through untouched, never rewritten or dropped.
+        assert!(
+            reloaded.objects.values().any(|o| matches!(
+                o,
+                Object::Dictionary(d) if matches!(d.get(b"Type"), Ok(Object::Name(n)) if n == b"Sig")
+            )),
+            "the /Sig object must survive"
+        );
     }
 
     /// Task 3: the flipped default really produces ObjStm-packed output, and
@@ -7526,6 +7668,62 @@ mod tests {
             catalog.get(b"MarkInfo").is_err(),
             "MarkInfo must be removed"
         );
+    }
+
+    /// Page-piece dictionaries hold private authoring data no reader renders.
+    /// Opt-in, and the flag must take the referenced private stream with it.
+    #[test]
+    fn strip_private_data_drops_piece_info_and_is_opt_in() {
+        let pdf = build_pdf(80, 100);
+        let mut doc = Document::load_mem(&pdf).unwrap();
+        let page_id = doc.get_pages().values().copied().next().unwrap();
+        // Incompressible payload, so its removal cannot be confused with a
+        // deflate improvement elsewhere.
+        let private: Vec<u8> = (0..8192u32).map(|i| (i.wrapping_mul(2654435761) >> 24) as u8).collect();
+        let blob = doc.add_object(Stream::new(dictionary! {}, private));
+        let piece = dictionary! {
+            "Illustrator" => dictionary! {
+                "LastModified" => Object::string_literal("D:20260101000000Z"),
+                "Private" => Object::Reference(blob),
+            },
+        };
+        if let Ok(Object::Dictionary(page)) = doc.get_object_mut(page_id) {
+            page.set("PieceInfo", piece.clone());
+        }
+        doc.catalog_mut().unwrap().set("PieceInfo", piece);
+        let mut reencoded: Vec<u8> = Vec::new();
+        doc.save_to(&mut reencoded).unwrap();
+
+        let kept = optimize_with_options(&reencoded, OptimizeOptions::default());
+        let kept_doc = Document::load_mem(&kept).expect("default output must load");
+        assert!(
+            kept_doc.catalog().unwrap().get(b"PieceInfo").is_ok(),
+            "default must keep /PieceInfo"
+        );
+
+        let opts = OptimizeOptions::default().with_strip_private_data(true);
+        let out = optimize_with_options(&reencoded, opts);
+        let out_doc = Document::load_mem(&out).expect("stripped output must load");
+        for object in out_doc.objects.values() {
+            let dict = match object {
+                Object::Dictionary(d) => d,
+                Object::Stream(s) => &s.dict,
+                _ => continue,
+            };
+            assert!(dict.get(b"PieceInfo").is_err(), "no /PieceInfo may survive");
+        }
+        // The private payload itself must be gone, not merely unreferenced.
+        assert!(
+            !out_doc
+                .objects
+                .values()
+                .any(|o| matches!(o, Object::Stream(s) if s.content.len() > 4096)),
+            "the orphaned private stream must be pruned"
+        );
+        assert!(out.len() < kept.len(), "stripping must shrink the output");
+
+        // Page content is untouched: same page count, same content bytes.
+        assert_eq!(kept_doc.get_pages().len(), out_doc.get_pages().len());
     }
 
     #[test]
