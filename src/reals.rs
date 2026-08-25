@@ -333,10 +333,13 @@ fn objstm_edits(out: &[u8], tag_at: usize, literals: &RealLiterals) -> Option<Ve
 /// whose dictionary contains `inside`. Shaped for exactly what lopdf's writer
 /// emits: `<id> <gen> obj\n<<...>>stream\n<payload>\nendstream`.
 fn locate_stream(out: &[u8], inside: usize) -> Option<(usize, usize, usize, usize)> {
-    let hdr = out
-        .get(..inside)?
-        .windows(b" obj\n<<".len())
-        .rposition(|w| w == b" obj\n<<")?;
+    // Same bound as `objstm_payloads`: the object header is right there.
+    let window = inside.saturating_sub(4096);
+    let hdr = window
+        + out
+            .get(window..inside)?
+            .windows(b" obj\n<<".len())
+            .rposition(|w| w == b" obj\n<<")?;
     let dict_start = hdr + b" obj\n".len();
     let dict_end = find_sub(out, b">>stream\n", dict_start)? + 2;
     if inside >= dict_end {
@@ -623,9 +626,14 @@ fn objstm_payloads(input: &[u8]) -> Vec<Vec<u8>> {
     let mut from = 0;
     while let Some(tag_at) = find_sub(input, b"/ObjStm", from) {
         from = tag_at + 1;
+        // An object header sits a few dozen bytes before its `/ObjStm` entry;
+        // bounding the backward search keeps this linear over the whole file
+        // rather than quadratic in the number of object streams.
+        let window = tag_at.saturating_sub(4096);
         let Some(dict_start) = input
-            .get(..tag_at)
+            .get(window..tag_at)
             .and_then(|head| head.windows(3).rposition(|w| w == b"obj"))
+            .map(|at| window + at)
         else {
             continue;
         };
