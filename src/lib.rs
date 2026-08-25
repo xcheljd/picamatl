@@ -573,6 +573,15 @@ impl Mat {
     }
 }
 
+/// A content-stream operand as a number, with 0.0 standing in for anything
+/// that is not one.
+///
+/// The zero is a deliberate conservative guess, not an oversight: these
+/// operands feed `cm`/`Tm` matrices whose only use is estimating how large an
+/// image is *rendered*. A malformed operand collapses that estimate toward a
+/// smaller rendered size, which raises the effective DPI and — at worst —
+/// makes an image look under-resolved, i.e. leaves it untouched. Guessing
+/// large would do the opposite and downsample something that is drawn big.
 fn num(obj: &Object) -> f32 {
     match obj {
         Object::Integer(i) => *i as f32,
@@ -1016,14 +1025,23 @@ fn plan_replacement(
     options: OptimizeOptions,
 ) -> Option<Replacement> {
     let (rendered_w_pts, rendered_h_pts) = rendered;
-    if rendered_w_pts <= 0.0 || rendered_h_pts <= 0.0 {
+    // The finiteness half matters as much as the sign: a content stream whose
+    // matrix arithmetic overflowed to ±inf, or whose operands multiplied out
+    // to NaN, must decline here rather than reach the target geometry below
+    // (NaN survives `<= 0.0`, and `f32::max` would then quietly turn it into a
+    // 1px target).
+    if !rendered_w_pts.is_finite()
+        || !rendered_h_pts.is_finite()
+        || rendered_w_pts <= 0.0
+        || rendered_h_pts <= 0.0
+    {
         return None;
     }
 
     // Defensive: a non-positive target DPI means "do not downsample".
     // Without this guard, target_w/target_h below would collapse toward 1px.
     let target_dpi = options.target_dpi;
-    if target_dpi <= 0.0 {
+    if !target_dpi.is_finite() || target_dpi <= 0.0 {
         return None;
     }
     let dpi_margin = options.dpi_margin.max(1.0);
@@ -1115,8 +1133,17 @@ fn plan_replacement(
     // `non_uniform_placement_is_downsampled` pins the both-axes rule.
     let eff_dpi_w = px_w as f32 / (rendered_w_pts / 72.0);
     let eff_dpi_h = px_h as f32 / (rendered_h_pts / 72.0);
-    let target_w = ((rendered_w_pts / 72.0) * target_dpi).round().max(1.0) as u32;
-    let target_h = ((rendered_h_pts / 72.0) * target_dpi).round().max(1.0) as u32;
+    // Both inputs are finite and positive by the guards above, so the products
+    // can only leave the finite range by overflowing to +inf — which `as u32`
+    // would saturate to u32::MAX, an "upscale to 4 billion pixels" target.
+    // Decline instead of clamping: a placement that large is not a real page.
+    let target_w_f = (rendered_w_pts / 72.0) * target_dpi;
+    let target_h_f = (rendered_h_pts / 72.0) * target_dpi;
+    if !target_w_f.is_finite() || !target_h_f.is_finite() {
+        return None;
+    }
+    let target_w = target_w_f.round().max(1.0) as u32;
+    let target_h = target_h_f.round().max(1.0) as u32;
     let over_resolution =
         eff_dpi_w.max(eff_dpi_h) > target_dpi * dpi_margin && target_w < px_w && target_h < px_h;
 
@@ -1147,7 +1174,11 @@ fn plan_replacement(
     // churn is 1-4% and decays each pass. This makes optimize(optimize(x)) a
     // no-op in practice without blocking genuine wins.
     if smask_present {
-        let mask_id = smask_id.expect("smask_id is set whenever smask_present");
+        // `smask_present && smask_id.is_none()` already returned above, so this
+        // is `Some` — but the invariant lives 60 lines away, and a panic here
+        // would be a page-wide DoS on untrusted input. `?` declines instead:
+        // the outer contract is "any doubt leaves the image untouched".
+        let mask_id = smask_id?;
         // Resize eligibility (Phase 6 P-M1 split): the shared-mask refcount
         // guard applies only to the branches that would change the mask's
         // geometry. Evaluated lazily — the requant branch never needs it.
@@ -1380,18 +1411,7 @@ fn plan_dct(
         JpegRoute::GrayOrRgb => {}
     }
 
-    // Prefer scaled decoding; fall back to a full decode when libjpeg refuses
-    // the stream.
-    let (decoded, is_gray) =
-        decode_jpeg_scaled(&stream.content, target_w, target_h).or_else(|| {
-            let decoded =
-                image::load_from_memory_with_format(&stream.content, ImageFormat::Jpeg).ok()?;
-            let is_gray = matches!(
-                decoded,
-                DynamicImage::ImageLuma8(_) | DynamicImage::ImageLuma16(_)
-            );
-            Some((decoded, is_gray))
-        })?;
+    let (decoded, is_gray) = decode_jpeg(&stream.content, target_w, target_h)?;
     let resized = decoded.resize_exact(target_w, target_h, image::imageops::FilterType::Lanczos3);
 
     // Preserve the original component count so the PDF /ColorSpace (which we
@@ -1411,15 +1431,48 @@ const DECODE_BACK_MAX_MAD: f64 = 96.0;
 /// scale covers the target), falling back to a full decode for color spaces
 /// the scaled path declines (CMYK/YCCK) or streams libjpeg refuses. Returns
 /// `(image, is_grayscale)`, or `None` on any decode doubt.
+///
+/// This is the ONLY place the full-decode fallback lives, so the
+/// decompression-bomb budget below is applied once for every caller. The
+/// fallback is the dangerous half: unlike the scaled path it is bounded by
+/// nothing but the frame header, so a tiny crafted stream that libjpeg-turbo
+/// refuses and `jpeg-decoder` accepts would allocate gigabytes — an OOM abort,
+/// which is a process kill that `catch_unwind` cannot contain.
 fn decode_jpeg(data: &[u8], target_w: u32, target_h: u32) -> Option<(DynamicImage, bool)> {
-    decode_jpeg_scaled(data, target_w, target_h).or_else(|| {
-        let decoded = image::load_from_memory_with_format(data, ImageFormat::Jpeg).ok()?;
-        let is_gray = matches!(
-            decoded,
-            DynamicImage::ImageLuma8(_) | DynamicImage::ImageLuma16(_)
-        );
-        Some((decoded, is_gray))
-    })
+    if let Some(decoded) = decode_jpeg_scaled(data, target_w, target_h) {
+        return Some(decoded);
+    }
+    // libjpeg refused the stream. Before handing the same bytes to a more
+    // permissive decoder, price the allocation it would make from the frame
+    // header alone. An unreadable header declines: without dimensions there is
+    // no ceiling to check, and "we cannot tell" is the decline case
+    // everywhere else in this crate.
+    let frame = jpeg_frame_info(data)?;
+    if !jpeg_decode_within_budget(frame.width, frame.height, frame.components) {
+        return None;
+    }
+    let decoded = image::load_from_memory_with_format(data, ImageFormat::Jpeg).ok()?;
+    let is_gray = matches!(
+        decoded,
+        DynamicImage::ImageLuma8(_) | DynamicImage::ImageLuma16(_)
+    );
+    Some((decoded, is_gray))
+}
+
+/// True when a raster of `width * height * components` bytes is small enough
+/// to materialize. Mirrors [`MAX_FLATE_PIXEL_BYTES`] — the same 256 MiB
+/// ceiling the Flate path applies before inflating, for the same reason.
+///
+/// A zero component count is treated as 4 (the largest this crate ever
+/// decodes) rather than as "free": a frame header claiming zero components is
+/// already nonsense, and pricing it at zero would wave it straight through.
+fn jpeg_decode_within_budget(width: u16, height: u16, components: u8) -> bool {
+    let channels = if components == 0 {
+        4u64
+    } else {
+        u64::from(components)
+    };
+    u64::from(width) * u64::from(height) * channels <= MAX_FLATE_PIXEL_BYTES
 }
 
 /// Phase 5 D-M1: dimension-preserving JPEG requantization for a base image
@@ -2532,6 +2585,39 @@ fn deflate_backend(data: &[u8], backend: DeflateBackend) -> Option<Vec<u8>> {
 /// Returns `(image, is_grayscale)`, or `None` for anything that is not plain
 /// RGB or grayscale (e.g. CMYK/YCCK) so the caller can fall back to the
 /// general-purpose decoder rather than risk mis-handling color.
+/// The smallest `n/8` DCT scale whose output still covers the target in BOTH
+/// axes (never upscale), so the caller's resampling step always downsamples.
+/// Falls back to 8/8 — an unscaled decode — when no smaller scale covers the
+/// target. Shared by both scaled decoders so the two stay in lockstep.
+fn dct_scale_numerator(full_w: usize, full_h: usize, target_w: u32, target_h: u32) -> u8 {
+    for n in 1..=8u8 {
+        let scaled_w = (full_w * n as usize).div_ceil(8);
+        let scaled_h = (full_h * n as usize).div_ceil(8);
+        if scaled_w >= target_w as usize && scaled_h >= target_h as usize {
+            return n;
+        }
+    }
+    8
+}
+
+/// True when the raster libjpeg would hand back at scale `numerator/8` fits
+/// inside the [`MAX_FLATE_PIXEL_BYTES`] budget. The scaled path is bounded by
+/// the target geometry in the ordinary case, but its floor is 1/8 of the
+/// source, and 1/8 of a bomb is still a bomb.
+fn scaled_decode_within_budget(
+    full_w: usize,
+    full_h: usize,
+    numerator: u8,
+    channels: u64,
+) -> bool {
+    let scaled_w = (full_w as u64 * numerator as u64).div_ceil(8);
+    let scaled_h = (full_h as u64 * numerator as u64).div_ceil(8);
+    scaled_w
+        .checked_mul(scaled_h)
+        .and_then(|px| px.checked_mul(channels))
+        .is_some_and(|bytes| bytes <= MAX_FLATE_PIXEL_BYTES)
+}
+
 fn decode_jpeg_scaled(data: &[u8], target_w: u32, target_h: u32) -> Option<(DynamicImage, bool)> {
     let mut dec = mozjpeg::Decompress::new_mem(data).ok()?;
     let (full_w, full_h) = (dec.width(), dec.height());
@@ -2539,16 +2625,7 @@ fn decode_jpeg_scaled(data: &[u8], target_w: u32, target_h: u32) -> Option<(Dyna
         return None;
     }
 
-    // Smallest n/8 that still covers the target in BOTH axes (never upscale).
-    let mut numerator = 8u8;
-    for n in 1..=8u8 {
-        let scaled_w = (full_w * n as usize).div_ceil(8);
-        let scaled_h = (full_h * n as usize).div_ceil(8);
-        if scaled_w >= target_w as usize && scaled_h >= target_h as usize {
-            numerator = n;
-            break;
-        }
-    }
+    let numerator = dct_scale_numerator(full_w, full_h, target_w, target_h);
     // Decide the channel count from the JPEG's OWN colorspace and then request
     // that output explicitly. Do NOT rely on `image()`/`out_color_space`: for a
     // grayscale JPEG libjpeg's default can still hand back RGB, which would
@@ -2561,6 +2638,11 @@ fn decode_jpeg_scaled(data: &[u8], target_w: u32, target_h: u32) -> Option<(Dyna
         dec.color_space(),
         ColorSpace::JCS_CMYK | ColorSpace::JCS_YCCK
     ) {
+        return None;
+    }
+
+    // Even the scaled path allocates: 1/8 of an absurd source is still absurd.
+    if !scaled_decode_within_budget(full_w, full_h, numerator, if is_gray { 1 } else { 3 }) {
         return None;
     }
 
@@ -2676,6 +2758,27 @@ struct CmykImage {
 /// gray/RGB behaviour: an unparseable header means the real decoders get the
 /// same shot at the stream they have always had.
 fn jpeg_component_count(data: &[u8]) -> Option<u8> {
+    jpeg_frame_info(data).map(|f| f.components)
+}
+
+/// What a JPEG's frame header (SOF) declares: geometry and component count.
+///
+/// Read straight off the marker structure, WITHOUT decoding — which is the
+/// whole point. A decompression-bomb JPEG is a handful of bytes declaring a
+/// 60000x60000 frame; every decoder in this crate materializes
+/// `width * height * channels` from these three numbers, so they have to be
+/// checked before a decoder is handed the stream (see
+/// [`jpeg_decode_within_budget`]).
+#[derive(Clone, Copy, Debug)]
+struct JpegFrameInfo {
+    width: u16,
+    height: u16,
+    components: u8,
+}
+
+/// Parse the frame header, or `None` if the marker structure does not parse
+/// cleanly. See [`jpeg_component_count`] for what `None` means to callers.
+fn jpeg_frame_info(data: &[u8]) -> Option<JpegFrameInfo> {
     if data.len() < 2 || data[0] != 0xFF || data[1] != 0xD8 {
         return None;
     }
@@ -2715,7 +2818,11 @@ fn jpeg_component_count(data: &[u8]) -> Option<u8> {
             if len < 8 {
                 return None;
             }
-            return Some(data[i + 9]);
+            return Some(JpegFrameInfo {
+                height: u16::from_be_bytes([data[i + 5], data[i + 6]]),
+                width: u16::from_be_bytes([data[i + 7], data[i + 8]]),
+                components: data[i + 9],
+            });
         }
         i += 2 + len;
     }
@@ -2783,15 +2890,9 @@ fn decode_cmyk_jpeg_scaled(data: &[u8], target_w: u32, target_h: u32) -> Option<
         return None;
     }
 
-    // Smallest n/8 that still covers the target in BOTH axes (never upscale).
-    let mut numerator = 8u8;
-    for n in 1..=8u8 {
-        let scaled_w = (full_w * n as usize).div_ceil(8);
-        let scaled_h = (full_h * n as usize).div_ceil(8);
-        if scaled_w >= target_w as usize && scaled_h >= target_h as usize {
-            numerator = n;
-            break;
-        }
+    let numerator = dct_scale_numerator(full_w, full_h, target_w, target_h);
+    if !scaled_decode_within_budget(full_w, full_h, numerator, 4) {
+        return None;
     }
     dec.scale(numerator);
 
@@ -3081,10 +3182,22 @@ fn plan_jpx_conversions(doc: &Document, options: OptimizeOptions) -> Vec<JpxConv
                 }
             }
         }
+        let channels = if is_gray { 1usize } else { 3 };
+        // Price the raster BEFORE decoding. `decode()` allocates whatever the
+        // codestream header declares, so a JPEG2000 decompression bomb — a few
+        // KB claiming 60000x60000 — is an OOM abort, and an abort is a process
+        // kill no `catch_unwind` can contain. Same 256 MiB ceiling the Flate
+        // and DCT paths apply, for the same reason. The length check below
+        // stays: it catches a codestream that lied the other way.
+        let priced = u64::from(w)
+            .checked_mul(u64::from(h))
+            .and_then(|px| px.checked_mul(channels as u64));
+        if !priced.is_some_and(|bytes| bytes <= MAX_FLATE_PIXEL_BYTES) {
+            continue;
+        }
         let Ok(pixels) = jpx.decode() else {
             continue;
         };
-        let channels = if is_gray { 1usize } else { 3 };
         if pixels.len() != (w as usize) * (h as usize) * channels {
             continue;
         }
@@ -4010,7 +4123,7 @@ fn try_optimize(input: &[u8], options: OptimizeOptions) -> Result<Option<Vec<u8>
     // may have collapsed repeated images or identical embedded font programs
     // even when nothing needed downsampling, and discarding that would throw
     // away a real size win.
-    if replacements.is_empty()
+    let nothing_else_qualified = replacements.is_empty()
         && font_plans.is_empty()
         && bitonal_plans.is_empty()
         && jpx_plans.is_empty()
@@ -4019,14 +4132,22 @@ fn try_optimize(input: &[u8], options: OptimizeOptions) -> Result<Option<Vec<u8>
         && !merged_decoded
         && !minified
         && !flattened
-        && !gray_work
-        // Evaluated last, and only for a document with no other work: the
-        // probe redoes the entropy analysis `reoptimize_jpeg_streams` will
-        // do at the end, so short-circuiting keeps it off the common path.
-        // It has to be asked, though — a PDF whose only win is pass-through
-        // JPEGs with unoptimized Huffman tables is a real win, not a
-        // serialization detail, and must not be declined.
-        && !any_jpeg_huffman_work(&doc)
+        && !gray_work;
+
+    // The JPEG Huffman re-optimizer normally runs at the end of the pipeline,
+    // after every stream this pass replaces is in place. But for a document
+    // nothing else qualified to touch there is nothing to wait for, and the
+    // question "is there any work at all" can only be answered by doing the
+    // entropy analysis anyway — so run the real pass here and keep its answer,
+    // instead of probing with a throwaway analysis and then redoing it below.
+    // It has to be asked: a PDF whose only win is pass-through JPEGs with
+    // unoptimized Huffman tables is a real win, not a serialization detail,
+    // and must not be declined.
+    let jpeg_huffman_done = nothing_else_qualified;
+    let jpeg_huffman_work = jpeg_huffman_done && reoptimize_jpeg_streams(&mut doc);
+
+    if nothing_else_qualified
+        && !jpeg_huffman_work
         // Same story for the opt-in Type1C hint strip: it is real work, and
         // it is the only thing that happens in a `--strip-hinting` run over a
         // document whose fonts nothing else qualifies to touch.
@@ -4241,7 +4362,12 @@ fn try_optimize(input: &[u8], options: OptimizeOptions) -> Result<Option<Vec<u8>
     // src/jpeghuff.rs), so it needs no consent flag and runs unconditionally.
     // Placed here, after every image decision, for the same reason as the
     // re-deflate below: it is a pure re-serialization of bytes already chosen.
-    reoptimize_jpeg_streams(&mut doc);
+    // Skipped when the "is there any work at all" check above already ran it —
+    // which it only does for a document where nothing else qualified, so no
+    // image decision came after it there either.
+    if !jpeg_huffman_done {
+        reoptimize_jpeg_streams(&mut doc);
+    }
 
     // Last planning-free pass: re-deflate every already-Flate stream with the
     // configured backend (zlib level 9, or zopfli when opted in).
@@ -4297,45 +4423,11 @@ fn strip_stale_xref_trailer_keys(doc: &mut Document) {
 /// `inflate_capped` enforces everywhere else in the crate.
 const MAX_REDEFLATE_BYTES: usize = 128 * 1024 * 1024;
 
-/// Final lossless re-deflate pass: every stream whose `/Filter` is exactly
-/// `FlateDecode` is inflated and re-deflated at zlib level 9, keeping the
-/// result only when it is STRICTLY smaller and verified to inflate back to the
-/// original bytes.
-///
-/// This is a serialization change and nothing else. `/Filter` and
-/// `/DecodeParms` are untouched, so any PNG/TIFF predictor still applies to
-/// exactly the same post-inflate bytes: every reader decodes what it decoded
-/// before, byte for byte. No pixel is resampled and no encoding class moves,
-/// which is why it needs no consent flag — it is the same class of work
-/// `doc.compress()` already does by default, extended to streams that arrived
-/// with a producer's (often weaker) deflate output.
-///
-/// Idempotent: a second pass re-deflates already-level-9 output to the same
-/// size, which fails the strictly-smaller test and changes nothing.
-///
-/// Declined wholesale for encrypted documents (stream bytes are ciphertext)
-/// and PDF/A-declared documents. Signed documents are NOT declined: see the
-/// note above `save_document` for why a signature guard here protects
-/// nothing.
-/// True when at least one raw `/DCTDecode` payload has Huffman tables worth
-/// rebuilding. Read-only; used only to answer "is there any work at all" for
-/// a document nothing else touches (see `try_optimize`). Stops at the first
-/// stream that improves.
-fn any_jpeg_huffman_work(doc: &Document) -> bool {
-    doc.objects.values().any(|obj| {
-        let Object::Stream(stream) = obj else {
-            return false;
-        };
-        let Ok(filter) = stream.dict.get(b"Filter") else {
-            return false;
-        };
-        matches!(classify_filter(doc, filter), FilterClass::DctOnly)
-            && jpeghuff::optimize(&stream.content).is_some()
-    })
-}
-
 /// Re-optimize the Huffman tables of every raw `/DCTDecode` payload in the
-/// document.
+/// document. Returns true when at least one stream was replaced — the answer
+/// `try_optimize` needs for a document nothing else qualified to touch, where
+/// this pass is the only thing standing between "hand back the input bytes"
+/// and a real win.
 ///
 /// This is the JPEG analogue of [`redeflate_flate_streams`]: an entropy-coding
 /// improvement over bytes whose *content* is already decided. It is strictly
@@ -4347,9 +4439,9 @@ fn any_jpeg_huffman_work(doc: &Document) -> bool {
 /// simply decline (nothing is smaller). The headroom is in the JPEGs the image
 /// path passes through untouched: CMYK/Separation payloads, and any image
 /// whose effective DPI is already at target.
-fn reoptimize_jpeg_streams(doc: &mut Document) {
+fn reoptimize_jpeg_streams(doc: &mut Document) -> bool {
     if doc.is_encrypted() || fonts::pdfa_blocked(doc) {
-        return;
+        return false;
     }
 
     // Collect first (classification resolves references against the immutable
@@ -4372,13 +4464,38 @@ fn reoptimize_jpeg_streams(doc: &mut Document) {
         .filter_map(|(id, content)| jpeghuff::optimize(&content).map(|out| (id, out)))
         .collect();
 
+    let mut changed = false;
     for (id, content) in shrunk {
         if let Ok(Object::Stream(stream)) = doc.get_object_mut(id) {
             stream.set_content(content); // keeps /Length in sync
+            // Counted only when a stream really was rewritten: an id that no
+            // longer resolves is not work done.
+            changed = true;
         }
     }
+    changed
 }
 
+/// Final lossless re-deflate pass: every stream whose `/Filter` is exactly
+/// `FlateDecode` is inflated and re-deflated at zlib level 9, keeping the
+/// result only when it is STRICTLY smaller and verified to inflate back to the
+/// original bytes.
+///
+/// This is a serialization change and nothing else. `/Filter` and
+/// `/DecodeParms` are untouched, so any PNG/TIFF predictor still applies to
+/// exactly the same post-inflate bytes: every reader decodes what it decoded
+/// before, byte for byte. No pixel is resampled and no encoding class moves,
+/// which is why it needs no consent flag — it is the same class of work
+/// `doc.compress()` already does by default, extended to streams that arrived
+/// with a producer's (often weaker) deflate output.
+///
+/// Idempotent: a second pass re-deflates already-level-9 output to the same
+/// size, which fails the strictly-smaller test and changes nothing.
+///
+/// Declined wholesale for encrypted documents (stream bytes are ciphertext)
+/// and PDF/A-declared documents. Signed documents are NOT declined: see the
+/// note above `save_document` for why a signature guard here protects
+/// nothing.
 fn redeflate_flate_streams(doc: &mut Document, backend: DeflateBackend) {
     if doc.is_encrypted() || fonts::pdfa_blocked(doc) {
         return;
