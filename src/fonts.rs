@@ -964,7 +964,7 @@ impl<'a> Walker<'a> {
 
         // Strict parsing: the lenient `Content::decode` silently drops a
         // trailing unparseable region, which could hide show operators.
-        let Ok(parsed) = Content::decode_strict(content) else {
+        let Some(parsed) = decode_content_strict(content) else {
             self.abort();
             return fallback;
         };
@@ -1941,6 +1941,84 @@ fn plan_one_type1_font(
     })
 }
 
+/// Strict content decode, with the one tolerance `lopdf`'s parser needs.
+///
+/// `lopdf` does not know `d0`/`d1` — the two glyph-metric operators that, per
+/// PDF 32000-1 §9.6.5, open a Type3 `/CharProcs` stream. It tokenizes `d1` as
+/// the operator `d` plus a stray number `1`, which then binds as the *first
+/// operand of the next operator*; a char proc that ends right after `d1`
+/// fails outright. Either way the walk used to abort, and one abort discards
+/// every font plan in the document (measured on a LaTeX paper: 713 KB of font
+/// programs left untouched because of one 22-byte char proc).
+///
+/// So the metrics prefix is split off before parsing, not after a failure:
+/// a stream that "parses" with the stray number attached is misparsed, and
+/// the walker's operand checks are what stands between that and a wrong
+/// glyph attribution. The tolerance is deliberately narrow — only a
+/// *leading* run of numeric tokens followed by `d0`/`d1` at the matching
+/// arity is removed, and neither operator shows text or selects a font, so
+/// the operation sequence the walker inspects is unchanged. Every other
+/// parse failure still declines, exactly as before.
+fn decode_content_strict(content: &[u8]) -> Option<Content> {
+    let body = strip_type3_metrics(content).unwrap_or(content);
+    Content::decode_strict(body).ok()
+}
+
+/// Split off a leading `wx wy d0` / `wx wy llx lly urx ury d1` prefix,
+/// returning the rest of the stream. `None` unless the stream opens with
+/// exactly that: only numeric tokens may precede the operator, the operand
+/// count must match it, and any delimiter (`(`, `<`, `[`, `/`, `%`, ...)
+/// before it means this is not a Type3 metrics prefix.
+fn strip_type3_metrics(content: &[u8]) -> Option<&[u8]> {
+    fn is_ws(b: u8) -> bool {
+        matches!(b, b'\0' | b'\t' | b'\n' | b'\x0c' | b'\r' | b' ')
+    }
+    fn is_delim(b: u8) -> bool {
+        matches!(
+            b,
+            b'(' | b')' | b'<' | b'>' | b'[' | b']' | b'{' | b'}' | b'/' | b'%'
+        )
+    }
+    let mut i = 0usize;
+    let mut operands = 0usize;
+    loop {
+        while i < content.len() && is_ws(content[i]) {
+            i += 1;
+        }
+        let start = i;
+        while i < content.len() && !is_ws(content[i]) && !is_delim(content[i]) {
+            i += 1;
+        }
+        if i == start {
+            // A delimiter, or end of stream, before any `d0`/`d1`.
+            return None;
+        }
+        let token = &content[start..i];
+        match token {
+            b"d0" => return (operands == 2).then(|| &content[i..]),
+            b"d1" => return (operands == 6).then(|| &content[i..]),
+            _ => {
+                if !is_number(token) || operands >= 6 {
+                    return None;
+                }
+                operands += 1;
+            }
+        }
+    }
+}
+
+/// A PDF numeric object token: optional sign, digits and at most one point,
+/// with at least one digit.
+fn is_number(token: &[u8]) -> bool {
+    let body = match token.first() {
+        Some(b'+' | b'-') => &token[1..],
+        _ => token,
+    };
+    body.iter().filter(|&&b| b == b'.').count() <= 1
+        && body.iter().any(u8::is_ascii_digit)
+        && body.iter().all(|&b| b.is_ascii_digit() || b == b'.')
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2530,6 +2608,112 @@ mod tests {
         {
             assert_glyph_preserved(&view, &original, cid, cid);
         }
+    }
+
+    #[test]
+    fn type3_metrics_prefix_is_split_off_only_when_well_formed() {
+        // d1: six operands. d0: two.
+        assert_eq!(
+            strip_type3_metrics(b"0.27 0 0 0 0 0 d1\n1 0 0 1 0 0 cm"),
+            Some(&b"\n1 0 0 1 0 0 cm"[..])
+        );
+        assert_eq!(strip_type3_metrics(b"12 0 d0 BT"), Some(&b" BT"[..]));
+        // Wrong operand count for the operator: not a metrics prefix.
+        assert_eq!(strip_type3_metrics(b"0 0 0 d1 BT"), None);
+        assert_eq!(strip_type3_metrics(b"1 2 3 d0"), None);
+        // A delimiter or a non-numeric token before the operator.
+        assert_eq!(strip_type3_metrics(b"BT /F1 12 Tf"), None);
+        assert_eq!(strip_type3_metrics(b"1 2 (s) Tj"), None);
+        assert_eq!(strip_type3_metrics(b"0 0 0 0 0 0 0 0 d1"), None);
+        // No operator at all.
+        assert_eq!(strip_type3_metrics(b"1 2 3 4"), None);
+        assert_eq!(strip_type3_metrics(b""), None);
+    }
+
+    #[test]
+    fn type3_char_procs_parse_instead_of_aborting_the_walk() {
+        // lopdf rejects `d1` outright, so the tolerance is what makes this
+        // stream readable at all; the remaining operators must survive.
+        let charproc = b"0.277832 0 0 0 0 0 d1\nBT /F1 12 Tf (Hi) Tj ET".to_vec();
+        // lopdf reads `d1` as operator `d` plus a stray `1` that binds to the
+        // next operator -- a misparse, not a parse.
+        let lopdf_ops: Vec<(String, usize)> = Content::decode_strict(&charproc)
+            .expect("lopdf accepts it, wrongly")
+            .operations
+            .iter()
+            .map(|o| (o.operator.clone(), o.operands.len()))
+            .collect();
+        assert_eq!(lopdf_ops[0], ("d".to_string(), 6));
+        assert_eq!(lopdf_ops[1], ("BT".to_string(), 1), "stray operand shifted");
+        // A char proc that ends at `d1` does not parse at all.
+        assert!(Content::decode_strict(b"0.277832 0 0 0 0 0 d1\n").is_err());
+
+        let parsed = decode_content_strict(&charproc).expect("d1 prefix split off");
+        let ops: Vec<&str> = parsed
+            .operations
+            .iter()
+            .map(|o| o.operator.as_str())
+            .collect();
+        assert_eq!(ops, ["BT", "Tf", "Tj", "ET"]);
+        // Still strict about everything else.
+        assert!(decode_content_strict(b"(unterminated").is_none());
+        assert!(decode_content_strict(b"0 0 0 0 0 0 d1 (unterminated").is_none());
+    }
+
+    #[test]
+    fn a_type3_glyph_no_longer_disables_subsetting_document_wide() {
+        let cids = gids_for("Hello");
+        let pairs: Vec<(u16, char)> = cids.iter().copied().zip("Hello".chars()).collect();
+        let mut doc = Document::with_version("1.7");
+        let pages_id = doc.new_object_id();
+        let font_id = add_type0_font(&mut doc, &FontSpec::identity(pairs));
+        let text_page = add_text_page(&mut doc, pages_id, font_id, show_text_ops("F1", &cids));
+
+        // A Type3 font whose one char proc opens with `d1`, drawn on its own
+        // page. Nothing about it constrains the Type0 font on page 1.
+        let proc_id = doc.add_object(Stream::new(
+            dictionary! {},
+            b"10 0 0 0 10 10 d1\n0 0 10 10 re f".to_vec(),
+        ));
+        let t3_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type3",
+            "FontBBox" => vec![0.into(), 0.into(), 10.into(), 10.into()],
+            "FontMatrix" => vec![
+                0.001.into(), 0.into(), 0.into(), 0.001.into(), 0.into(), 0.into(),
+            ],
+            "CharProcs" => dictionary! { "a" => proc_id },
+            "Encoding" => dictionary! {
+                "Type" => "Encoding",
+                "Differences" => vec![97.into(), "a".into()],
+            },
+            "FirstChar" => 97,
+            "LastChar" => 97,
+            "Widths" => vec![10.into()],
+        });
+        let t3_content = doc.add_object(Stream::new(
+            dictionary! {},
+            b"BT /T3 12 Tf (a) Tj ET".to_vec(),
+        ));
+        let t3_page = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "Contents" => t3_content,
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Resources" => dictionary! { "Font" => dictionary! { "T3" => t3_id } },
+        });
+        let pdf = finish_pdf(&mut doc, pages_id, vec![text_page, t3_page]);
+
+        let out = optimize_with_options(&pdf, subset_opts());
+        assert!(
+            out.len() < pdf.len(),
+            "the Type0 font must still be subsetted alongside a Type3 glyph"
+        );
+        let view = subset_view(&out);
+        assert!(
+            view.font.len() < noto_bytes().len(),
+            "font program should have shrunk"
+        );
     }
 
     #[test]
