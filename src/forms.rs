@@ -786,11 +786,22 @@ fn resources_are_bindable(doc: &Document, page_id: ObjectId) -> bool {
         };
         match dict.get(b"Resources") {
             Ok(resources) => {
-                let Ok(resources) = resolve(doc, resources).as_dict() else {
-                    return false;
+                // Mirrors `bind_xobjects` exactly, reference for reference: a
+                // shape it would silently skip must be a shape this rejects.
+                let resources = match resources {
+                    Object::Dictionary(dict) => dict,
+                    Object::Reference(id) => match doc.get_object(*id) {
+                        Ok(Object::Dictionary(dict)) => dict,
+                        _ => return false,
+                    },
+                    _ => return false,
                 };
                 return match resources.get(b"XObject") {
-                    Ok(xobjects) => resolve(doc, xobjects).as_dict().is_ok(),
+                    Ok(Object::Dictionary(_)) => true,
+                    Ok(Object::Reference(id)) => {
+                        matches!(doc.get_object(*id), Ok(Object::Dictionary(_)))
+                    }
+                    Ok(_) => false,
                     Err(_) => true,
                 };
             }
