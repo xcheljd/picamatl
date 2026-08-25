@@ -22,6 +22,19 @@ contract that Ghostscript does not offer: **no value is ever silently lost.**
 Where a value cannot be preserved, amatl declines the whole document and hands
 back the input bytes.
 
+The difference is not theoretical. `scripts/forms-vs-gs.sh` runs both tools
+over three inputs:
+
+| input | Ghostscript `/ebook` | amatl `--flatten-forms` |
+| --- | --- | --- |
+| filled AcroForm, values **with** appearance streams | flattens; 2,469 → **2,780 B** (grew) | flattens; 2,469 → **1,248 B** |
+| filled AcroForm, a value with **no** appearance | drops `/AcroForm`; the field data is gone, the ink is regenerated | **declines** (D9); 2,454 → 1,450 B, form and all four values intact |
+| `xfa_filled_imm1344e.pdf`, a real filled **dynamic XFA** form | 3,023,968 → 4,158 B: the output is the *"Please wait…"* placeholder page and **all 9,298 filled data nodes are gone** | **declines** (D3); 3,023,968 → 343,099 B losslessly, all 9,298 data nodes intact |
+
+The third row is the one that matters. Ghostscript does not know it is looking
+at a document whose entire content lives in an XML packet it is about to
+delete, so it deletes it and reports success.
+
 ## Corpus survey
 
 | file | AcroForm | XFA | `/NeedsRendering` | widgets | widgets that draw ink | fields with a value | verdict |
@@ -194,7 +207,13 @@ already unreferenced when `prune_objects()` runs.
 | input | 2,150,352 | 100.0% |
 | amatl defaults (today) | 1,392,531 | 64.8% |
 | amatl defaults + `--flatten-forms` | 250,229 | 11.6% |
-| Ghostscript `/ebook` (destroys the form, would destroy data) | 183,761 | 8.5% |
+| Ghostscript `/ebook` (deletes the form layer unconditionally) | 183,761 | 8.5% |
+
+Rendered through Ghostscript at 150 dpi, all 11 pages of the flattened output
+are pixel-identical to the original — measured with `scripts/forms-verify.py`
+on a flatten-only run (`--target-dpi 0 --no-downsample-flate-images
+--no-subset-fonts`), so the comparison is about flattening and nothing else.
+`census-brief.pdf` is pixel-identical across all 9 pages on the same basis.
 
 `census-brief.pdf` gains a small win (a vestigial `/AcroForm` whose `/DR` font
 resources become unreferenced). Every other corpus file is untouched: no

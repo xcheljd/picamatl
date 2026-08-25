@@ -270,6 +270,14 @@ packet set):
 | amatl `--flatten-forms` | 250,229 | 11.6% | static | intact |
 | Ghostscript `/ebook` | 183,761 | 8.5% | destroyed | destroyed |
 
+`scripts/forms-vs-gs.sh` shows the contract earning its keep on a real filled
+dynamic XFA form (`xfa_filled_imm1344e.pdf`, a Canadian IMM 1344E from the
+pdf.js corpus): Ghostscript turns 3,023,968 bytes into 4,158 bytes of
+*"Please wait…"* placeholder page and takes all **9,298 filled data nodes**
+with it. amatl declines that document — and still shrinks it 88.7%
+losslessly, with every data node intact, because the XFA packets were stored
+undeflated.
+
 Rendered through Ghostscript at 150 dpi, all 11 pages of the flattened output
 are **pixel-identical** to the original — as are the 9 pages of
 `census-brief.pdf`, the corpus's other AcroForm file. The flag is completely
