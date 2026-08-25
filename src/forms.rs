@@ -817,6 +817,7 @@ fn content_is_spliceable(doc: &Document, page_id: ObjectId) -> bool {
         return false;
     };
     let mut depth = 0i64;
+    let mut in_text = false;
     for op in &parsed.operations {
         match op.operator.as_str() {
             "BI" => return false,
@@ -827,10 +828,14 @@ fn content_is_spliceable(doc: &Document, page_id: ObjectId) -> bool {
                     return false;
                 }
             }
+            // A `cm` inside a text object is not legal, so content that never
+            // closes its last `BT` cannot be appended to either.
+            "BT" => in_text = true,
+            "ET" => in_text = false,
             _ => {}
         }
     }
-    depth == 0
+    depth == 0 && !in_text
 }
 
 /// `q <A> cm /Name Do Q` for each burn, prefixed by the `Q` that closes the

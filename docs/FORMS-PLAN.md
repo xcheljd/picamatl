@@ -91,7 +91,7 @@ document is optimized exactly as it would have been without the flag:
 | D10 | `/AP /N` is a state subdictionary and `/AS` is absent | ISO 32000-1 requires `/AS` here; guessing which state to burn is guessing at data |
 | D11 | a field with a non-empty value that has no widgets at all, or none on any page | the same gate as D9 reaching the case where there was never anything to burn |
 | D12 | a widget to burn whose `/AP` stream has no `/BBox`, a degenerate `/BBox`/`/Rect`, or a non-invertible `/Matrix` | the 12.5.5 mapping is undefined |
-| D13 | a page whose content cannot be parsed, contains an inline image (`BI`), or is not `q`/`Q` balanced | see [Content-stream splicing](#content-stream-splicing) |
+| D13 | a page whose content cannot be parsed, contains an inline image (`BI`), is not `q`/`Q` balanced, or ends inside an unclosed text object (`BT` with no `ET`) | see [Content-stream splicing](#content-stream-splicing) |
 | D15 | a widget to burn whose appearance stream has no `/Resources` and whose operators name one (`Tf`, `Do`, `gs`, `sh`, `BDC`, a non-device `cs`/`CS`, a pattern `scn`) | it was resolving those names against `/AcroForm /DR`, which this pass deletes. Same silent-`Do` failure mode as D14 |
 | D14 | a page to burn into whose `/Resources` or `/Resources /XObject` does not resolve to a dictionary | the burn names would have nowhere to bind, and a `Do` on an undefined name is skipped *silently* — the one way a value could disappear without the document declining |
 
@@ -169,7 +169,8 @@ graphics state. That is only sound if the original content never pops past its
 own base level and ends balanced, so the plan parses the concatenated content
 with `Content::decode_strict`, refuses inline images (`BI`, which a naive
 scanner would miscount `q`/`Q` inside), and requires the `q`/`Q` depth to stay
-`>= 0` throughout and end at `0`. Otherwise: D13.
+`>= 0` throughout and end at `0` — and the last `BT` to have been closed, since
+a `cm` inside a text object is not legal. Otherwise: D13.
 
 The prepended `q` streams are byte-identical across pages and the existing
 `dedup_streams` fixpoint collapses them to one object; `minify_content_streams`
