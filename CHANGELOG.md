@@ -8,6 +8,19 @@ and this project adheres to
 
 ## [Unreleased]
 
+### Added
+
+- **`--strip-private-data` (`OptimizeOptions::strip_private_data`, off by
+  default)** — removes every `/PieceInfo` page-piece dictionary, where an
+  authoring application keeps its own private copy of the artwork beside the
+  flattened page that draws it (ISO 32000-1 14.5). Illustrator's
+  `AIPrivateData` is the extreme case: on `corpus-expanded/cmyk-jpeg.pdf` it is
+  **261,453 B — 96% of amatl's entire output for that file**, taking it from
+  67.4% of input to 3.3%; `corpus/arxiv-attention.pdf` sheds a further
+  239,955 B. Pixel-identical (verified page by page at 100 dpi on all three
+  affected corpus files); what it costs is round-trip editability in the
+  producing application, hence opt-in, same posture as `--strip-metadata`.
+
 ### Changed
 
 - **The signature guard on the three entropy-level passes is gone.**

@@ -122,6 +122,16 @@ every page and XObject — the PDF 1.7 specification file carries 134 of them,
 render-identical but discards provenance and breaks PDF/A and PDF/UA
 identification, so it is opt-in.
 
+**Private authoring data is kept by default.** An Illustrator- or
+InDesign-authored figure carries the producer's own editable copy of the
+artwork in a `/PieceInfo` page-piece dictionary (ISO 32000-1 14.5), beside the
+flattened page that actually draws it. No conforming reader consults it to
+render: on the corpus it is 295 KB of a 374 KB file (96% of amatl's output for
+that file) and 240 KB inside a 2.2 MB paper. `--strip-private-data`
+(library: `.with_strip_private_data(true)`) removes every `/PieceInfo` entry.
+It is pixel-identical — verified page by page — but the producing application
+loses its round trip, so it is opt-in.
+
 **Amatl will never lossy-symbol-encode your scans.** Symbol-mode JBIG2 — the
 encoding behind the Xerox scanner scandal, where visually plausible character
 substitution silently turned 6s into 8s in scanned documents — is permanently

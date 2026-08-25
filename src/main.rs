@@ -32,12 +32,14 @@ fn defaults_blurb() -> String {
     format!(
         "Boolean defaults (from OptimizeOptions::default()):\n  \
          strip-accessibility {}, strip-metadata {},\n  \
+         strip-private-data {},\n  \
          pack-object-streams {},\n  \
          downsample-flate-images {}, subset-fonts {},\n  \
          convert-type1 {}, strip-hinting {}, recompress-bitonal-images {},\n  \
          allow-lossy {}, collapse-gray-images {}",
         on_off(d.strip_accessibility),
         on_off(d.strip_metadata),
+        on_off(d.strip_private_data),
         on_off(d.pack_object_streams),
         on_off(d.downsample_flate_images),
         on_off(d.subset_fonts),
@@ -101,6 +103,14 @@ struct Cli {
     /// Keep /Metadata (XMP) packets
     #[arg(long)]
     no_strip_metadata: bool,
+
+    /// Strip every /PieceInfo (private authoring-application data); costs
+    /// round-trip editability in the producing application
+    #[arg(long, overrides_with = "no_strip_private_data")]
+    strip_private_data: bool,
+    /// Keep /PieceInfo private application data
+    #[arg(long)]
+    no_strip_private_data: bool,
 
     /// Pack eligible objects into PDF 1.5 object streams
     #[arg(long, overrides_with = "no_pack_object_streams")]
@@ -212,6 +222,11 @@ fn options_from(cli: &Cli) -> OptimizeOptions {
             cli.strip_metadata,
             cli.no_strip_metadata,
             d.strip_metadata,
+        ))
+        .with_strip_private_data(resolve(
+            cli.strip_private_data,
+            cli.no_strip_private_data,
+            d.strip_private_data,
         ))
         .with_pack_object_streams(resolve(
             cli.pack_object_streams,
