@@ -82,16 +82,18 @@ document is optimized exactly as it would have been without the flag:
 | D1 | encrypted, or PDF/A-declared | same posture as every other structural pass |
 | D2 | no `/AcroForm` in the catalog | nothing to flatten; widget annots without a field tree are not guessed at |
 | D3 | `/NeedsRendering true` (catalog) | ISO 32000-1 12.7.8's marker for a **dynamic XFA** form. The static pages are a "please wait" placeholder; there is nothing to flatten and the reader builds the page from the template at view time. `xfa_filled_imm1344e.pdf` is exactly this |
-| D4 | an XFA `datasets` leaf carries text that the AcroForm field tree does not mirror | the data lives only in the XML. See [XFA mirroring](#xfa-mirroring) |
+| D4 | an XFA `datasets` (or `form`) leaf carries text that the AcroForm field tree does not mirror, or `/XFA` is a single-stream XDP rather than a packet array | the data lives only in the XML, and a single-stream XDP cannot be split into packets without an XML parser amatl is not adding. See [XFA mirroring](#xfa-mirroring) |
 | D5 | `/NeedAppearances true` **and** any field has a non-empty value | the reader was told to *generate* appearances from `/V`; the stored `/AP` may be stale or missing and amatl has no text layout engine to generate one |
 | D6 | a `/FT /Sig` field whose `/V` is a dictionary | the document carries a real signature in a form field; flattening would delete it |
 | D7 | a widget with `/OC` | visibility depends on optional-content state; burning it into the page makes it unconditional |
 | D8 | a `Hidden` or `NoView` widget that *does* draw ink | view/print divergence cannot be expressed in a page content stream |
-| D9 | a visible widget with **no** drawable appearance whose field has a non-empty value | the value would vanish. This is the core data-preservation gate |
+| D9 | a field with a non-empty value **none** of whose widgets burns an appearance | the value would vanish. This is the core data-preservation gate. Note that it is per *field*, not per widget: a radio group's unselected buttons all inherit the group's `/V` and paint nothing, and only the selected one has to burn |
 | D10 | `/AP /N` is a state subdictionary and `/AS` is absent | ISO 32000-1 requires `/AS` here; guessing which state to burn is guessing at data |
-| D11 | a field with a non-empty value whose widget is on no page | same as D9, one level out |
+| D11 | a field with a non-empty value that has no widgets at all, or none on any page | the same gate as D9 reaching the case where there was never anything to burn |
 | D12 | a widget to burn whose `/AP` stream has no `/BBox`, a degenerate `/BBox`/`/Rect`, or a non-invertible `/Matrix` | the 12.5.5 mapping is undefined |
 | D13 | a page whose content cannot be parsed, contains an inline image (`BI`), or is not `q`/`Q` balanced | see [Content-stream splicing](#content-stream-splicing) |
+| D15 | a widget to burn whose appearance stream has no `/Resources` and whose operators name one (`Tf`, `Do`, `gs`, `sh`, `BDC`, a non-device `cs`/`CS`, a pattern `scn`) | it was resolving those names against `/AcroForm /DR`, which this pass deletes. Same silent-`Do` failure mode as D14 |
+| D14 | a page to burn into whose `/Resources` or `/Resources /XObject` does not resolve to a dictionary | the burn names would have nowhere to bind, and a `Do` on an undefined name is skipped *silently* — the one way a value could disappear without the document declining |
 
 Degenerate is not "small": a zero-width or zero-height `/Rect` or transformed
 `/BBox` is what D12 rejects.
@@ -190,7 +192,7 @@ already unreferenced when `prune_objects()` runs.
 | --- | ---: | ---: |
 | input | 2,150,352 | 100.0% |
 | amatl defaults (today) | 1,392,531 | 64.8% |
-| amatl defaults + `--flatten-forms` | see `scripts/bench-full.sh` output in the branch report | |
+| amatl defaults + `--flatten-forms` | 250,229 | 11.6% |
 | Ghostscript `/ebook` (destroys the form, would destroy data) | 183,761 | 8.5% |
 
 `census-brief.pdf` gains a small win (a vestigial `/AcroForm` whose `/DR` font
@@ -209,9 +211,10 @@ resources become unreferenced). Every other corpus file is untouched: no
 * **Flattening is one-way and it is a semantic change.** The output is not a
   form any more: no filling, no field export, no FDF round trip, no signing.
   That is the entire point of the flag being off by default.
-* **A `Hidden` field's value disappears with the field.** D9/D11 catch hidden
-  fields that hold a value only because they check the *value*, not the
-  visibility — a hidden widget with a value declines the document.
+* **A `Hidden` field's value disappears with the field.** D9 catches it: a
+  hidden widget paints nothing, so it burns nothing, so a field whose only
+  widgets are hidden has no widget accounting for its value and the document
+  declines.
 * **Ink equality is asserted by construction, and verified by rendering.** The
   burned stream is the original appearance object, unmodified, under the
   spec's own placement matrix; `tests/forms_render.rs` additionally renders the

@@ -54,6 +54,18 @@ fn utf16(value: &str) -> Object {
 /// A form XObject that paints `label` at the given size, plus a visible
 /// border, inside a `w` x `h` box.
 fn appearance(doc: &mut Document, font_id: ObjectId, w: f64, h: f64, label: &str) -> ObjectId {
+    appearance_with(doc, Some(font_id), w, h, label)
+}
+
+/// `font` is `None` to build an appearance with **no** `/Resources` at all,
+/// the shape that was leaning on `/AcroForm /DR`.
+fn appearance_with(
+    doc: &mut Document,
+    font_id: Option<ObjectId>,
+    w: f64,
+    h: f64,
+    label: &str,
+) -> ObjectId {
     let ops = vec![
         Operation::new("q", vec![]),
         Operation::new("g", vec![Object::Real(0.0)]),
@@ -73,13 +85,19 @@ fn appearance(doc: &mut Document, font_id: ObjectId, w: f64, h: f64, label: &str
         Operation::new("ET", vec![]),
         Operation::new("Q", vec![]),
     ];
+    let mut dict = dictionary! {
+        "Type" => "XObject",
+        "Subtype" => "Form",
+        "BBox" => vec![0.into(), 0.into(), Object::Real(w as f32), Object::Real(h as f32)],
+    };
+    if let Some(font_id) = font_id {
+        dict.set(
+            "Resources",
+            dictionary! { "Font" => dictionary! { "Helv" => font_id } },
+        );
+    }
     doc.add_object(Stream::new(
-        dictionary! {
-            "Type" => "XObject",
-            "Subtype" => "Form",
-            "BBox" => vec![0.into(), 0.into(), Object::Real(w as f32), Object::Real(h as f32)],
-            "Resources" => dictionary! { "Font" => dictionary! { "Helv" => font_id } },
-        },
+        dict,
         Content { operations: ops }.encode().unwrap(),
     ))
 }
@@ -106,6 +124,12 @@ struct Fixture {
     drop_appearance_state: bool,
     /// Emit page content with one more `Q` than `q` (D13).
     unbalanced_content: bool,
+    /// Strip `/Resources` off the text field's appearance stream, leaving its
+    /// `Tf` to resolve against `/AcroForm /DR` (D15).
+    appearance_without_dr: bool,
+    /// Put `/Contents` behind an indirect reference to an *array* of streams,
+    /// the shape the splice has to unwrap rather than nest.
+    indirect_contents_array: bool,
 }
 
 /// A one-page filled AcroForm: a text field with a value and an appearance, a
@@ -123,7 +147,13 @@ fn build(fixture: &Fixture) -> Vec<u8> {
     });
 
     // -- text field, filled -------------------------------------------------
-    let text_ap = appearance(&mut doc, font_id, 160.0, 14.0, FILLED_TEXT);
+    let text_ap = appearance_with(
+        &mut doc,
+        (!fixture.appearance_without_dr).then_some(font_id),
+        160.0,
+        14.0,
+        FILLED_TEXT,
+    );
     let mut text_widget = dictionary! {
         "Type" => "Annot",
         "Subtype" => "Widget",
@@ -267,10 +297,15 @@ fn build(fixture: &Fixture) -> Vec<u8> {
         page_ops.push_str("Q\n");
     }
     let content_id = doc.add_object(Stream::new(dictionary! {}, page_ops.into_bytes()));
+    let contents: Object = if fixture.indirect_contents_array {
+        Object::Reference(doc.add_object(Object::Array(vec![Object::Reference(content_id)])))
+    } else {
+        Object::Reference(content_id)
+    };
     let page_id = doc.add_object(dictionary! {
         "Type" => "Page",
         "Parent" => pages_id,
-        "Contents" => content_id,
+        "Contents" => contents,
         "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
         "Resources" => dictionary! { "Font" => dictionary! { "Helv" => font_id } },
         "Annots" => annots,
@@ -644,6 +679,34 @@ fn splice_restores_the_initial_ctm_before_painting() {
     assert_eq!(depth, 1, "the burn runs inside its own q");
 }
 
+/// `/Contents` behind an indirect reference to an array: the splice must
+/// unwrap it, not nest a reference-to-an-array inside the new array, which
+/// would silently drop the page's own drawing.
+#[test]
+fn splices_into_an_indirect_contents_array() {
+    let input = build(&Fixture {
+        indirect_contents_array: true,
+        ..Fixture::default()
+    });
+    let out = optimize_with_options(&input, flatten());
+    let view = View::of(&out);
+    let content = view.page_content();
+    assert!(
+        contains(&content, b"(Form) Tj"),
+        "the page's own drawing must survive the splice"
+    );
+    assert_eq!(
+        Content::decode(&content)
+            .unwrap()
+            .operations
+            .iter()
+            .filter(|op| op.operator == "Do")
+            .count(),
+        3,
+        "and all three burns must be there"
+    );
+}
+
 #[test]
 fn flatten_is_idempotent() {
     let once = optimize_with_options(&flattenable(), flatten());
@@ -816,6 +879,21 @@ fn declines_a_state_appearance_with_no_as() {
             ..Fixture::default()
         },
         "/AP /N subdictionary with no /AS",
+    );
+}
+
+#[test]
+fn declines_an_appearance_that_leans_on_the_acroform_resources() {
+    // D15 — the appearance says `/Helv 9 Tf` and carries no `/Resources`, so
+    // it was resolving `/Helv` against `/AcroForm /DR`. Burning it after the
+    // AcroForm is gone would paint nothing where the value used to be, and a
+    // `Do` on a name with no font is skipped silently.
+    assert_declines(
+        &Fixture {
+            appearance_without_dr: true,
+            ..Fixture::default()
+        },
+        "appearance with no /Resources of its own",
     );
 }
 

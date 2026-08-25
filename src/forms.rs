@@ -190,6 +190,13 @@ pub(crate) fn plan_flatten(doc: &Document) -> Option<FlattenPlan> {
                 }
             } else if let Some(ap_id) = appearance {
                 // P1 — burn the appearance the viewer painted.
+                // D15 — an appearance with no `/Resources` of its own was
+                // resolving its names against `/AcroForm /DR`, which this pass
+                // deletes. Painting it afterwards would draw nothing where the
+                // value used to be.
+                if !appearance_is_self_contained(doc, ap_id) {
+                    return None;
+                }
                 let matrix = burn_matrix(doc, annot, ap_id)?;
                 burns.push(Burn {
                     name: format!("AmXf{next_name}").into_bytes(),
@@ -211,11 +218,21 @@ pub(crate) fn plan_flatten(doc: &Document) -> Option<FlattenPlan> {
         }
 
         let has_contents = page.has(b"Contents");
-        // D13 — the splice needs a page whose content is parseable and whose
-        // graphics-state stack returns to its base level, so the `q` we
-        // prepend survives to be popped by the `Q` we append.
-        if !burns.is_empty() && has_contents && !content_is_spliceable(doc, page_id) {
-            return None;
+        if !burns.is_empty() {
+            // D13 — the splice needs a page whose content is parseable and
+            // whose graphics-state stack returns to its base level, so the `q`
+            // we prepend survives to be popped by the `Q` we append.
+            if has_contents && !content_is_spliceable(doc, page_id) {
+                return None;
+            }
+            // D14 — and a resource dictionary the burn names can actually be
+            // bound into. A `/Resources` or `/XObject` entry that does not
+            // resolve to a dictionary would leave the `Do` operators pointing
+            // at an undefined name, which viewers skip silently — the one
+            // failure mode that would lose a value without saying so.
+            if !resources_are_bindable(doc, page_id) {
+                return None;
+            }
         }
         pages.push(PagePlan {
             page_id,
@@ -646,6 +663,49 @@ fn draws_ink(doc: &Document, ap_id: ObjectId) -> bool {
     }
 }
 
+/// Whether an appearance stream can be drawn once `/AcroForm /DR` is gone.
+///
+/// A form XObject that references resources is supposed to carry its own
+/// `/Resources`, but widget appearances are the one place producers lean on
+/// the AcroForm's default resource dictionary instead. An appearance with no
+/// `/Resources` is only safe to move into the page if it names nothing — and
+/// "names nothing" is decided by the operators it uses, not by guessing.
+///
+/// Only the appearance's own operators are examined; an appearance that *has*
+/// `/Resources` is trusted, including for whatever its nested forms do, which
+/// is the same trust the viewer extended before this pass ran.
+fn appearance_is_self_contained(doc: &Document, ap_id: ObjectId) -> bool {
+    let Ok(Object::Stream(stream)) = doc.get_object(ap_id) else {
+        return false;
+    };
+    if stream.dict.has(b"Resources") {
+        return true;
+    }
+    let Ok(content) = stream.decompressed_content() else {
+        return false;
+    };
+    let Ok(parsed) = Content::decode(&content) else {
+        return false;
+    };
+    !parsed.operations.iter().any(|op| {
+        match op.operator.as_str() {
+            // Font, XObject, ext-gstate, shading, marked-content property
+            // list: every one of these is a lookup into `/Resources`.
+            "Tf" | "Do" | "gs" | "sh" | "BDC" | "DP" => true,
+            // A colour space named by anything other than the device families
+            // (and `/Pattern`, which needs a pattern resource) is a resource
+            // lookup too.
+            "cs" | "CS" => !matches!(
+                op.operands.first().and_then(|o| o.as_name().ok()),
+                Some(b"DeviceGray" | b"DeviceRGB" | b"DeviceCMYK")
+            ),
+            // `scn` with a trailing name operand selects a pattern.
+            "scn" | "SCN" => matches!(op.operands.last(), Some(Object::Name(_))),
+            _ => false,
+        }
+    })
+}
+
 /// Matrix **A** of ISO 32000-1 12.5.5: the four `/BBox` corners are mapped
 /// through the form's `/Matrix`, the axis-aligned bounds of the result are
 /// taken, and those bounds are scaled and translated onto the widget's
@@ -713,6 +773,35 @@ fn numbers(doc: &Document, object: &Object, count: usize) -> Option<Vec<f64>> {
             _ => None,
         })
         .collect()
+}
+
+/// Whether `bind_xobjects` will find somewhere to put the burn names: the
+/// `/Resources` chain must be absent (we create one) or resolve to a
+/// dictionary, and any `/XObject` it already carries must resolve to one too.
+fn resources_are_bindable(doc: &Document, page_id: ObjectId) -> bool {
+    let mut current = page_id;
+    for _ in 0..MAX_DEPTH {
+        let Ok(dict) = doc.get_object(current).and_then(|o| o.as_dict()) else {
+            return false;
+        };
+        match dict.get(b"Resources") {
+            Ok(resources) => {
+                let Ok(resources) = resolve(doc, resources).as_dict() else {
+                    return false;
+                };
+                return match resources.get(b"XObject") {
+                    Ok(xobjects) => resolve(doc, xobjects).as_dict().is_ok(),
+                    Err(_) => true,
+                };
+            }
+            Err(_) => match dict.get(b"Parent") {
+                Ok(Object::Reference(parent)) => current = *parent,
+                // No `/Resources` anywhere in the chain: one gets created.
+                _ => return true,
+            },
+        }
+    }
+    false
 }
 
 // -- content splicing -------------------------------------------------------
@@ -968,16 +1057,30 @@ fn splice_contents(
     prefix: Option<ObjectId>,
     ops_id: ObjectId,
 ) {
+    // `/Contents` is a stream, an array of streams, or an indirect reference
+    // to either. The array-behind-a-reference case has to be unwrapped: an
+    // array element that is itself a reference to an array is not a content
+    // stream, and splicing one in would lose the page's own drawing.
+    let existing: Vec<Object> = {
+        let Ok(page) = doc.get_object(page_id).and_then(|o| o.as_dict()) else {
+            return;
+        };
+        match page.get(b"Contents") {
+            Ok(Object::Array(array)) => array.clone(),
+            Ok(Object::Reference(id)) => match doc.get_object(*id) {
+                Ok(Object::Array(array)) => array.clone(),
+                _ => vec![Object::Reference(*id)],
+            },
+            Ok(other) => vec![other.clone()],
+            Err(_) => Vec::new(),
+        }
+    };
+    let mut parts: Vec<Object> = prefix.into_iter().map(Object::Reference).collect();
+    parts.extend(existing);
+    parts.push(Object::Reference(ops_id));
     let Ok(Object::Dictionary(page)) = doc.get_object_mut(page_id) else {
         return;
     };
-    let mut parts: Vec<Object> = prefix.into_iter().map(Object::Reference).collect();
-    match page.get(b"Contents") {
-        Ok(Object::Array(existing)) => parts.extend(existing.iter().cloned()),
-        Ok(other) => parts.push(other.clone()),
-        Err(_) => {}
-    }
-    parts.push(Object::Reference(ops_id));
     page.set("Contents", Object::Array(parts));
 }
 
