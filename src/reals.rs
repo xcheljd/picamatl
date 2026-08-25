@@ -150,9 +150,6 @@ pub(crate) fn capture(input: &[u8]) -> RealLiterals {
 /// Returns `out` untouched whenever there is nothing to restore or anything at
 /// all about the file's shape is not what lopdf's writer emits.
 pub(crate) fn restore(out: Vec<u8>, literals: &RealLiterals) -> Vec<u8> {
-    if std::env::var_os("AMATL_DEBUG_REALS").is_some() {
-        eprintln!("restore entered: {} literals, {} bytes", literals.exact.len(), out.len());
-    }
     if literals.is_empty() {
         return out;
     }
@@ -208,37 +205,15 @@ fn try_restore(out: &[u8], literals: &RealLiterals) -> Option<Vec<u8>> {
         }
     }
 
-    let dbg = std::env::var_os("AMATL_DEBUG_REALS").is_some();
-    if dbg { eprintln!("edits: {}", edits.len()); }
     let patched = apply_edits(out, &edits);
-    let Some(patched) = repair_offsets(patched, out, &edits) else {
-        if dbg { eprintln!("repair_offsets failed"); }
-        return None;
-    };
+    let patched = repair_offsets(patched, out, &edits)?;
 
     // Proof, in the same shape as the crate's other byte patches: the result
     // must re-parse, and must parse to the same objects as the bytes we
     // started from. The literals differ; every `f32` lopdf holds does not.
     let before = Document::load_mem(out).ok()?;
-    let Ok(after) = Document::load_mem(&patched) else {
-        if dbg { eprintln!("patched failed to load"); }
-        return None;
-    };
+    let after = Document::load_mem(&patched).ok()?;
     if !same_objects(&before, &after) {
-        if dbg {
-            eprintln!("objects differ: {} vs {}", before.objects.len(), after.objects.len());
-            if before.trailer != after.trailer { eprintln!("trailer differs"); }
-            for (id, l) in before.objects.iter() {
-                match after.objects.get(id) {
-                    Some(r) if !equivalent(l, r) => {
-                        eprintln!("  {:?}\n   L={:?}\n   R={:?}", id, l, r);
-                        break;
-                    }
-                    None => { eprintln!("  missing {:?}", id); break; }
-                    _ => {}
-                }
-            }
-        }
         return None;
     }
     Some(patched)
@@ -250,11 +225,7 @@ fn try_restore(out: &[u8], literals: &RealLiterals) -> Option<Vec<u8>> {
 /// that describe it, or `None` when nothing inside it changed (or the stream is
 /// not shaped the way lopdf writes one).
 fn objstm_edits(out: &[u8], tag_at: usize, literals: &RealLiterals) -> Option<Vec<Edit>> {
-    let dbg = std::env::var_os("AMATL_DEBUG_REALS").is_some();
-    let Some((dict_start, dict_end, content_start, content_len)) = locate_stream(out, tag_at) else {
-        if dbg { eprintln!("objstm: locate_stream failed"); }
-        return None;
-    };
+    let (dict_start, dict_end, content_start, content_len) = locate_stream(out, tag_at)?;
     let dict = out.get(dict_start..dict_end)?;
     if find_sub(dict, b"/Filter/FlateDecode", 0).is_none()
         || find_sub(dict, b"/DecodeParms", 0).is_some()
@@ -262,7 +233,7 @@ fn objstm_edits(out: &[u8], tag_at: usize, literals: &RealLiterals) -> Option<Ve
         return None;
     }
     let content = out.get(content_start..content_start.checked_add(content_len)?)?;
-    let payload = inflate_capped(content, MAX_REDEFLATE_BYTES).or_else(|| { if dbg { eprintln!("objstm: inflate failed"); } None })?;
+    let payload = inflate_capped(content, MAX_REDEFLATE_BYTES)?;
 
     let count = usize::try_from(int_value(dict, b"/N ")?.0).ok()?;
     let first = usize::try_from(int_value(dict, b"/First ")?.0).ok()?;
@@ -275,7 +246,6 @@ fn objstm_edits(out: &[u8], tag_at: usize, literals: &RealLiterals) -> Option<Ve
         offsets.push(pairs.next()?.parse().ok()?);
     }
     if pairs.next().is_some() || offsets.first() != Some(&0) {
-        if dbg { eprintln!("objstm: header shape n={count} first={first}"); }
         return None;
     }
 
@@ -310,7 +280,6 @@ fn objstm_edits(out: &[u8], tag_at: usize, literals: &RealLiterals) -> Option<Ve
         }
     }
     if !changed {
-        if dbg { eprintln!("objstm: no body changed ({} bodies)", bodies.len()); }
         return None;
     }
 
@@ -334,13 +303,10 @@ fn objstm_edits(out: &[u8], tag_at: usize, literals: &RealLiterals) -> Option<Ve
     for body in &bodies {
         new_payload.extend_from_slice(body);
     }
-    if dbg { eprintln!("objstm: rebuilt payload {} bytes", new_payload.len()); }
-    let new_content = deflate_level9(&new_payload).or_else(|| { if dbg { eprintln!("objstm: deflate failed"); } None })?;
+    let new_content = deflate_level9(&new_payload)?;
     if inflate_capped(&new_content, new_payload.len())?.as_slice() != new_payload.as_slice() {
-        if dbg { eprintln!("objstm: inflate-back mismatch"); }
         return None;
     }
-    if dbg { eprintln!("objstm: new content {} bytes (was {})", new_content.len(), content_len); }
 
     let (_, len_at, len_len) = int_value(dict, b"/Length ")?;
     let (_, first_at, first_len) = int_value(dict, b"/First ")?;
@@ -669,7 +635,8 @@ fn objstm_payloads(input: &[u8]) -> Vec<Vec<u8>> {
         let Some(dict) = input.get(dict_start..stream_at) else {
             continue;
         };
-        if find_sub(dict, b"FlateDecode", 0).is_none() || find_sub(dict, b"/DecodeParms", 0).is_some()
+        if find_sub(dict, b"FlateDecode", 0).is_none()
+            || find_sub(dict, b"/DecodeParms", 0).is_some()
         {
             continue;
         }
@@ -744,9 +711,9 @@ fn scan_reals_positions(data: &[u8], skip_streams: bool, on_real: &mut dyn FnMut
             b's' if skip_streams
                 && data[i..].starts_with(b"stream")
                 && is_boundary(data, i)
-                && data.get(i + b"stream".len()).is_some_and(|b| {
-                    matches!(*b, b'\r' | b'\n')
-                }) =>
+                && data
+                    .get(i + b"stream".len())
+                    .is_some_and(|b| matches!(*b, b'\r' | b'\n')) =>
             {
                 match find_sub(data, b"endstream", i) {
                     Some(end) => i = end + b"endstream".len(),
@@ -783,29 +750,4 @@ fn is_delimiter(byte: u8) -> bool {
             byte,
             b'(' | b')' | b'<' | b'>' | b'[' | b']' | b'{' | b'}' | b'/' | b'%'
         )
-}
-
-#[doc(hidden)]
-pub(crate) fn debug_probe(input: &[u8]) {
-    let lits = capture(input);
-    eprintln!("captured {} literals", lits.exact.len());
-    for (i, (bits, text)) in lits.exact.iter().enumerate().take(8) {
-        eprintln!("  {} -> {}", f32::from_bits(*bits), String::from_utf8_lossy(text));
-        let _ = i;
-    }
-    let out = crate::optimize(input);
-    let mut n = 0;
-    scan_reals_positions(&out, true, &mut |_, tok| {
-        if lits.replacement(tok).is_some() { n += 1 }
-    });
-    eprintln!("plain tokens still needing restore: {n}");
-    let mut m = 0;
-    for payload in objstm_payloads(&out) {
-        scan_reals_positions(&payload, false, &mut |_, tok| {
-            if lits.replacement(tok).is_some() { m += 1 }
-        });
-    }
-    eprintln!("objstm tokens still needing restore: {m}");
-    let patched = restore(out.clone(), &lits);
-    eprintln!("restore: {} -> {} bytes", out.len(), patched.len());
 }

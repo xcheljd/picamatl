@@ -489,11 +489,6 @@ impl OptimizeOptions {
 /// smaller bytes when possible. On any failure or if the result is not smaller,
 /// the original bytes are returned unchanged. Equivalent to
 /// [`optimize_with_options`] with [`OptimizeOptions::default()`].
-#[doc(hidden)]
-pub fn debug_probe(input: &[u8]) {
-    reals::debug_probe(input);
-}
-
 pub fn optimize(input: &[u8]) -> Vec<u8> {
     optimize_with_options(input, OptimizeOptions::default())
 }
