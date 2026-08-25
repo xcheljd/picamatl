@@ -69,6 +69,16 @@ parser becomes the same graceful fallback as an ordinary error) and pinned by
 regression tests for the three failure shapes: panic, degenerate input, and
 parse error. Amatl is safe to run on untrusted input in an automated pipeline.
 
+**Digital signatures do not survive optimization.** Every amatl run
+re-serializes the whole document, so a `/ByteRange` digest — which pins file
+offsets — is invalid in the output. This has always been true (font
+subsetting, image downsampling and object-stream packing were never gated on
+signatures); as of the current release the three entropy-level passes
+(re-deflate, JPEG Huffman re-optimization, content minification) no longer
+pretend otherwise by declining, which is worth up to 24% of the output on a
+Reader-extended form. If a signature must stay valid, do not optimize the
+file.
+
 ## Usage
 
 ```rust

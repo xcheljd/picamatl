@@ -3509,7 +3509,7 @@ fn replan_content(
 /// Declined wholesale for encrypted, PDF/A-declared, and signed documents,
 /// same posture as `redeflate_flate_streams`.
 fn minify_content_streams(doc: &mut Document, backend: DeflateBackend) -> bool {
-    if doc.is_encrypted() || fonts::pdfa_blocked(doc) || signature_present(doc) {
+    if doc.is_encrypted() || fonts::pdfa_blocked(doc) {
         return false;
     }
     let refcounts = count_object_references(doc);
@@ -4125,9 +4125,10 @@ const MAX_REDEFLATE_BYTES: usize = 128 * 1024 * 1024;
 /// Idempotent: a second pass re-deflates already-level-9 output to the same
 /// size, which fails the strictly-smaller test and changes nothing.
 ///
-/// Declined wholesale for encrypted documents (stream bytes are ciphertext),
-/// PDF/A-declared documents, and signed documents — a signature's byte range
-/// covers offsets this pass would move.
+/// Declined wholesale for encrypted documents (stream bytes are ciphertext)
+/// and PDF/A-declared documents. Signed documents are NOT declined: see the
+/// note above `save_document` for why a signature guard here protects
+/// nothing.
 /// True when at least one raw `/DCTDecode` payload has Huffman tables worth
 /// rebuilding. Read-only; used only to answer "is there any work at all" for
 /// a document nothing else touches (see `try_optimize`). Stops at the first
@@ -4159,7 +4160,7 @@ fn any_jpeg_huffman_work(doc: &Document) -> bool {
 /// path passes through untouched: CMYK/Separation payloads, and any image
 /// whose effective DPI is already at target.
 fn reoptimize_jpeg_streams(doc: &mut Document) {
-    if doc.is_encrypted() || fonts::pdfa_blocked(doc) || signature_present(doc) {
+    if doc.is_encrypted() || fonts::pdfa_blocked(doc) {
         return;
     }
 
@@ -4191,7 +4192,7 @@ fn reoptimize_jpeg_streams(doc: &mut Document) {
 }
 
 fn redeflate_flate_streams(doc: &mut Document, backend: DeflateBackend) {
-    if doc.is_encrypted() || fonts::pdfa_blocked(doc) || signature_present(doc) {
+    if doc.is_encrypted() || fonts::pdfa_blocked(doc) {
         return;
     }
 
@@ -4243,33 +4244,23 @@ fn replan_deflate(content: &[u8], backend: DeflateBackend) -> Option<Vec<u8>> {
     (inflate_capped(&out, plain.len())? == plain).then_some(out)
 }
 
-/// True when the document carries a digital signature. A signature dictionary
-/// pins a `/ByteRange` over the file's bytes; AcroForm `/SigFlags` declares one
-/// exists. Rather than reason about which bytes a range covers, the re-deflate
-/// pass declines such documents entirely.
-fn signature_present(doc: &Document) -> bool {
-    if let Ok(catalog) = doc.catalog() {
-        if let Ok(acroform) = catalog.get(b"AcroForm") {
-            if let Object::Dictionary(d) = resolve(doc, acroform) {
-                if d.get(b"SigFlags").is_ok() {
-                    return true;
-                }
-            }
-        }
-    }
-    doc.objects.values().any(|obj| match obj {
-        Object::Dictionary(d) => is_signature_dict(d),
-        Object::Stream(s) => is_signature_dict(&s.dict),
-        _ => false,
-    })
-}
-
-fn is_signature_dict(dict: &lopdf::Dictionary) -> bool {
-    dict.get(b"ByteRange").is_ok()
-        || matches!(dict.get(b"Type"),
-            Ok(Object::Name(n)) if n == b"Sig" || n == b"DocTimeStamp")
-}
-
+/// Why there is no signature guard here (there used to be).
+///
+/// A `/ByteRange` digest covers file offsets, so it cannot survive *any*
+/// amatl output: every run re-serializes the whole document from scratch,
+/// moving every offset, and font subsetting, image downsampling, object-stream
+/// packing and metadata stripping were never gated on signatures in the first
+/// place. Gating only the three entropy-level passes (JPEG Huffman
+/// re-optimization, whole-document re-deflate, content minification) therefore
+/// protected nothing while costing real bytes -- measured at 477 KB on a
+/// Reader-extended IRS form whose 1.5 MB XFA attachment ships with a weak
+/// deflate.
+///
+/// The honest contract is the one amatl already had in practice: optimizing a
+/// signed PDF invalidates its signature, exactly as it does with every other
+/// PDF optimizer. That is documented in the README; the fail-safe contract
+/// covers rendered content, not offset-pinned digests. Callers who must keep a
+/// signature intact must not optimize the file at all.
 /// Serialize the document, optionally using PDF 1.5 object-stream packing when
 /// `options.pack_object_streams` is true. The packed path produces smaller
 /// output for object-heavy documents but is more complex; the classic path is
@@ -6773,53 +6764,80 @@ mod tests {
         assert_eq!(reloaded, twice, "a second zopfli pass must change nothing");
     }
 
+    /// Stored length of the (single) image stream in a loaded document.
+    fn image_stream_len_of(doc: &Document) -> usize {
+        doc.objects
+            .values()
+            .find_map(|o| match o {
+                Object::Stream(s)
+                    if matches!(s.dict.get(b"Subtype"), Ok(Object::Name(n)) if n == b"Image") =>
+                {
+                    Some(s.content.len())
+                }
+                _ => None,
+            })
+            .unwrap()
+    }
+
     /// A PDF/A conformance claim disables the pass wholesale (same posture as
     /// font subsetting), so a weakly-deflated stream ships untouched.
     #[test]
-    fn redeflate_declines_pdfa_and_signed_documents() {
-        for marker in ["pdfa", "signed"] {
-            let pdf = build_pdf_weakly_deflated(120, 120);
-            let mut doc = Document::load_mem(&pdf).unwrap();
-            let before = image_stream_len(&pdf);
-            match marker {
-                "pdfa" => {
-                    let meta = doc.add_object(Stream::new(
-                        dictionary! { "Type" => "Metadata", "Subtype" => "XML" },
-                        b"<x:xmpmeta><pdfaid:part>2</pdfaid:part></x:xmpmeta>".to_vec(),
-                    ));
-                    doc.catalog_mut().unwrap().set("Metadata", meta);
-                }
-                _ => {
-                    let sig = doc.add_object(dictionary! {
-                        "Type" => "Sig",
-                        "ByteRange" => vec![0.into(), 0.into(), 0.into(), 0.into()],
-                    });
-                    doc.catalog_mut().unwrap().set("Perms", sig);
-                }
-            }
-            let mut marked: Vec<u8> = Vec::new();
-            doc.save_to(&mut marked).unwrap();
+    fn redeflate_declines_pdfa_documents() {
+        let pdf = build_pdf_weakly_deflated(120, 120);
+        let before = image_stream_len(&pdf);
+        let mut doc = Document::load_mem(&pdf).unwrap();
+        let meta = doc.add_object(Stream::new(
+            dictionary! { "Type" => "Metadata", "Subtype" => "XML" },
+            b"<x:xmpmeta><pdfaid:part>2</pdfaid:part></x:xmpmeta>".to_vec(),
+        ));
+        doc.catalog_mut().unwrap().set("Metadata", meta);
+        let mut marked: Vec<u8> = Vec::new();
+        doc.save_to(&mut marked).unwrap();
 
-            redeflate_flate_streams(
-                &mut Document::load_mem(&marked).unwrap(),
-                DeflateBackend::Zlib,
-            );
-            let mut reloaded = Document::load_mem(&marked).unwrap();
-            redeflate_flate_streams(&mut reloaded, DeflateBackend::Zlib);
-            let after = reloaded
-                .objects
-                .values()
-                .find_map(|o| match o {
-                    Object::Stream(s)
-                        if matches!(s.dict.get(b"Subtype"), Ok(Object::Name(n)) if n == b"Image") =>
-                    {
-                        Some(s.content.len())
-                    }
-                    _ => None,
-                })
-                .unwrap();
-            assert_eq!(after, before, "{marker}: stream must be untouched");
-        }
+        let mut reloaded = Document::load_mem(&marked).unwrap();
+        redeflate_flate_streams(&mut reloaded, DeflateBackend::Zlib);
+        assert_eq!(
+            image_stream_len_of(&reloaded),
+            before,
+            "PDF/A: stream must be untouched"
+        );
+    }
+
+    /// A signature is NOT a reason to decline: amatl re-serializes the whole
+    /// document either way, so the `/ByteRange` digest is already broken by
+    /// the passes that were never gated. Declining here only cost bytes.
+    #[test]
+    fn redeflate_runs_on_signed_documents_and_keeps_the_signature_object() {
+        let pdf = build_pdf_weakly_deflated(120, 120);
+        let before = image_stream_len(&pdf);
+        let mut doc = Document::load_mem(&pdf).unwrap();
+        let sig = doc.add_object(dictionary! {
+            "Type" => "Sig",
+            "ByteRange" => vec![0.into(), 0.into(), 0.into(), 0.into()],
+        });
+        doc.catalog_mut().unwrap().set("Perms", sig);
+        doc.catalog_mut().unwrap().set(
+            "AcroForm",
+            dictionary! { "SigFlags" => 3, "Fields" => Object::Array(vec![]) },
+        );
+        let mut marked: Vec<u8> = Vec::new();
+        doc.save_to(&mut marked).unwrap();
+
+        let mut reloaded = Document::load_mem(&marked).unwrap();
+        redeflate_flate_streams(&mut reloaded, DeflateBackend::Zlib);
+        assert!(
+            image_stream_len_of(&reloaded) < before,
+            "signed: the weakly-deflated stream must still be re-deflated"
+        );
+        // The signature dictionary itself is data like any other: carried
+        // through untouched, never rewritten or dropped.
+        assert!(
+            reloaded.objects.values().any(|o| matches!(
+                o,
+                Object::Dictionary(d) if matches!(d.get(b"Type"), Ok(Object::Name(n)) if n == b"Sig")
+            )),
+            "the /Sig object must survive"
+        );
     }
 
     /// Task 3: the flipped default really produces ObjStm-packed output, and
