@@ -1,7 +1,7 @@
 # HUNT2 — Compression Scout Notes (round 2)
 
 Status: IN PROGRESS. Committed incrementally.
-Method: pdffonts / pdfimages -list / pikepdf parsing (scripts_hunt2_fontdup.py). No ghostscript on adobe-spec.pdf.
+Method: pdffonts / pdfimages -list / pikepdf parsing. No ghostscript on adobe-spec.pdf.
 Corpus sizes: adobe-spec 22,491,828 · arxiv-attention 2,233,053 · irs-1040gi 4,434,643 · nist-ssdf 739,891.
 
 ## Font audit (pdffonts + pikepdf stream hashing)
@@ -22,7 +22,7 @@ See above — exact dups: 0 everywhere; family-level multi-embed merge is the re
 
 ## Image census
 
-Method: pikepdf XObject walk (`scripts_hunt2_imagecensus.py`, `scripts_hunt2_csprobe.py`, `scripts_hunt2_idxprobe.py`, `scripts_hunt2_arxiv_reflate.py`). Stored bytes = `len(read_raw_bytes())` (verified vs `/Length`). All FlateDecode images in adobe/nist are `[/Indexed [/ICCBased N=3] ...]`; arxiv's are plain `/DeviceRGB`.
+Method: pikepdf XObject walk (one-off probe scripts, removed 2026-08-25 — superseded by the committed `scripts/h2_*` series). Stored bytes = `len(read_raw_bytes())` (verified vs `/Length`). All FlateDecode images in adobe/nist are `[/Indexed [/ICCBased N=3] ...]`; arxiv's are plain `/DeviceRGB`.
 
 | file | images | total stored | by filter |
 |---|---|---|---|

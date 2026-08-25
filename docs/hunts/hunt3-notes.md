@@ -1,6 +1,6 @@
 # Compression hunt, round 3
 
-Continues HUNT2-NOTES.md. Three commits this round: `e74deff` (strip-hinting),
+Continues `docs/hunts/hunt2-notes.md`. Three commits this round: `e74deff` (strip-hinting),
 `3ccb245` (Type1C family merge), `5d00644` (merge generality fixes). Gates for
 every claim: `cargo test --release` / clippy `-D warnings` / fmt, plus for the
 size claims `pdftoppm` 150dpi sha256 render compare, pass-2 idempotence, and

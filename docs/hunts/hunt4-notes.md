@@ -1,6 +1,6 @@
 # Compression hunt, round 4 — re-audit of every rejected item
 
-Continues HUNT2-NOTES.md / HUNT3-NOTES.md. This round ships **no size change**:
+Continues `docs/hunts/hunt2-notes.md` / `hunt3-notes.md`. This round ships **no size change**:
 it re-measures the twelve items previously rejected or deferred and says, with
 numbers, which rejections hold. Two of them do not.
 

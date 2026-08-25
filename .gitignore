@@ -2,3 +2,4 @@
 Cargo.lock
 /corpus/
 corpus-expanded/
+__pycache__/

@@ -1,6 +1,6 @@
 # Compression hunt, round 5 — implementing the two round-4 overturns
 
-Continues HUNT2/3/4-NOTES.md. Round 4 re-audited twelve rejected items and
+Continues `docs/hunts/hunt2-notes.md` / `hunt3-notes.md` / `hunt4-notes.md`. Round 4 re-audited twelve rejected items and
 overturned two of them without implementing either. This round implements
 both, and reports what each actually recovered against what the probes
 predicted.
