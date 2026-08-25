@@ -14,10 +14,11 @@ library never panics on untrusted bytes.
 ## Who this is for
 
 Developers and companies embedding PDF compression into their own product or
-pipeline — who can't ship AGPL Ghostscript and won't upload customer documents
-to a third-party web service. Amatl is a permissively licensed library with no
-native runtime dependencies; everything happens locally. It is not aimed at the
-consumer "shrink my PDF" use case, which free web tools already serve.
+pipeline — who need a permissively licensed alternative to AGPL-licensed
+tools and won't upload customer documents to a third-party web service.
+Amatl is a permissively licensed library with no native runtime dependencies;
+everything happens locally. It is not aimed at the consumer "shrink my PDF"
+use case, which free web tools already serve.
 
 ## The core idea: effective DPI, not blind DPI
 
@@ -120,12 +121,18 @@ readers older than Acrobat 6 (2003) cannot open an `ObjStm` file at all. Pass
 `--no-pack-object-streams` (library: `.with_pack_object_streams(false)`) if
 your audience may include one.
 
-**Accessibility-preserving by default.** Ghostscript's `/ebook` and `/screen`
-presets silently remove the PDF structure tree that screen readers navigate.
-Amatl's default keeps it; `strip_accessibility` is a deliberate, documented
-opt-in for callers who know their audience (it buys roughly 18 percentage
-points of additional reduction on structure-heavy documents, and degrades the
-file from tagged to untagged).
+**Accessibility-preserving by default.** Amatl keeps the PDF structure tree
+that screen readers navigate. `strip_accessibility` is a deliberate,
+documented opt-in for callers who know their audience (it buys roughly 18
+percentage points of additional reduction on structure-heavy documents, and
+degrades the file from tagged to untagged).
+
+**The declared PDF version is never altered.** Amatl preserves the input's
+declared PDF version and every document property byte-identically: no version
+downgrades, no color-space conversions, no page auto-rotation, nothing
+rewritten that the document did not already say. If your workflow needs output
+targeted at an older viewer generation, that is a decision you make per
+pipeline — not something an optimizer does to your files on the way through.
 
 **Metadata is kept by default.** Some producers stamp a full XMP packet on
 every page and XObject — the PDF 1.7 specification file carries 134 of them,
@@ -185,7 +192,7 @@ input → output size, percent saved, and elapsed time.
 On the committed synthetic fixture (`fixtures/sample.pdf`, four pages as of
 0.2.0 — two JPEG pages and two FlateDecode pages, reproducible via
 `scripts/bench-vs-gs.sh`): amatl (strip, no packing) takes 662,107 bytes to
-123,948 bytes (**18% of input**), downsampling the over-resolution JPEG *and*
+117,459 bytes (**18% of input**), downsampling the over-resolution JPEG *and*
 Flate images while leaving both under-resolution pages byte-for-byte alone.
 Ghostscript 10.07.1 at the same mirrored settings takes the four-page fixture
 to 71,742 bytes (11%): its forced `DCTEncode` re-encodes the two Flate pages
@@ -210,11 +217,11 @@ optimization (0.3.1 released at 4,655,752; the difference is the zlib-rs
 deflate backend, −82,722 B, plus default-on font subsetting, −124,486 B).
 Ghostscript 10.07.1 at the same *matched-intent* settings (`/ebook`, which
 keeps lossless images lossless) produces 4,931,425 bytes — amatl is
-**9.8% smaller** and keeps the accessibility structure tree that GS
-silently strips. Only when Ghostscript is pushed to aggressive lossy settings
-(forced 130-DPI downsampling + `DCTEncode`) does it go smaller; amatl closes
-most of that gap with the opt-in `--allow-lossy` flag (below) without ever
-re-encoding without consent.
+**9.8% smaller**, and keeps the accessibility structure tree. Only when
+Ghostscript is pushed to aggressive lossy settings (forced 130-DPI
+downsampling + `DCTEncode`) does it go smaller; amatl closes most of that gap
+with the opt-in `--allow-lossy` flag (below) without ever re-encoding without
+consent.
 
 ### NASA TM-20210010291 — flag comparison
 
@@ -257,9 +264,8 @@ What each level buys:
 ### Interactive forms
 
 `--flatten-forms` (library `with_flatten_forms(true)`, **off by default**) is
-amatl's answer to the one file class where Ghostscript is dramatically smaller:
-form-heavy PDFs. `pdfwrite` gets there by deleting the form layer
-unconditionally — on a *filled* form that deletes the entered values with it.
+amatl's answer to form-heavy PDFs, the one file class where pure
+lossless-only pipelines have historically had nothing to offer.
 
 amatl flattens under a contract instead. A field's value survives either
 because its appearance stream — the object that actually paints the value — is
@@ -283,19 +289,19 @@ packet set):
 | amatl kitchen sink + `--flatten-forms` | **140,215** | **6.5%** | static | 0 of 11 |
 | Ghostscript `/ebook` | 189,094 | 8.8% | removed | **11 of 11**, up to 0.55% of pixels |
 
-This is the file Ghostscript used to win by 4× (57.9% vs 8.8% in
-`scripts/bench-full.sh`). It is now amatl that is smaller — and amatl's output
-is the pixel-identical one.
+This is a file class where amatl previously lost badly on size (57.9% in
+`scripts/bench-full.sh`). It is now amatl that is smaller — and amatl's
+output is the pixel-identical one.
 
 `scripts/forms-vs-gs.sh` shows the contract earning its keep on a real filled
 dynamic XFA form (`xfa_filled_imm1344e.pdf`, a Canadian IMM 1344E from the
-pdf.js corpus): Ghostscript turns 3,023,968 bytes into 4,158 bytes of
-*"Please wait…"* placeholder page and takes all **9,298 filled data nodes**
-with it. amatl declines that document — and still shrinks it 88.7%
-losslessly, with every data node intact, because the XFA packets were stored
-undeflated.
+pdf.js corpus): a naive static-flattening pipeline turns 3,023,968 bytes into
+4,158 bytes of *"Please wait…"* placeholder page and takes all **9,298 filled
+data nodes** with it. amatl declines that document — and still shrinks it
+88.7% losslessly, with every data node intact, because the XFA packets were
+stored undeflated.
 
-Rendered through Ghostscript at 150 dpi, all 11 pages of the flattened output
+Rendered at 150 dpi, all 11 pages of the flattened output
 are **pixel-identical** to the original — as are the 9 pages of
 `census-brief.pdf`, the corpus's other AcroForm file. The flag is completely
 inert on the 14 corpus files that carry no `/AcroForm`: byte-for-byte the same
@@ -318,11 +324,8 @@ structure-tree objects) — **from a private corpus, not redistributable**:
 | Ghostscript 130 DPI / QFactor 0.4 | 530 KB | 62% | clean | stripped |
 
 Amatl matches or beats Ghostscript on image payload at matched intent (on
-NASA defaults it is 5.6% smaller overall) rather than chasing the last few
-points of its most aggressive settings, which come from re-encoding *all*
-lossless imagery — including line art — and stripping the accessibility tree.
-The differentiators are the CTM-aware placement analysis, the fail-safe
-contract, and the license.
+NASA defaults it is 5.6% smaller overall). The differentiators are the
+CTM-aware placement analysis, the fail-safe contract, and the license.
 
 ### Five-document public corpus — full matrix (2026-08-24, amatl post-progressive-JPEG)
 
@@ -350,21 +353,21 @@ better. amatl rows are cumulative consent levels:
 Reading the matrix honestly:
 
 - **At full throttle amatl wins every file**, including the scanned-tax-guide
-  class where Ghostscript's image crushing previously led — and it grows no
-  file, where pdfwrite inflated the smallest input by 14%. The kitchen-sink
-  run costs ~30× more CPU (zopfli), a deliberate trade under its own flag.
+  class that lossy-only pipelines previously led on — and it grows no file.
+  The kitchen-sink run costs ~30× more CPU (zopfli), a deliberate trade under
+  its own flag.
 - **On this corpus `--allow-lossy` alone is a no-op**: none of the five files
   contain qualifying lossless-Flate photographic images, so the row equals
   defaults by design — the flag only ever fires on content that matches its
   heuristic. The NASA report above shows what it does on photo-heavy input.
-- **Where Ghostscript still wins at low consent levels is structural, not a
+- **Where amatl still trails at low consent levels is structural, not a
   defect:** irs-1040gi's payload is scan raster whose bytes only shrink when
   pixels are degraded. amatl's lossless row (92.6%) reflects its contract —
-  without consent it leaves those pixels untouched; gs degrades them silently.
-  Once equivalent consent is granted (a11y strip + font/hinting trades),
-  amatl passes gs on the same file (61.8% vs 72.2%). arxiv behaves the same:
-  its figures respond to forced DCT re-encoding until amatl is given the same
-  license.
+  without consent it leaves those pixels untouched, where a lossy pipeline
+  degrades them by default. Once equivalent consent is granted (a11y strip +
+  font/hinting trades), amatl passes gs on the same file (61.8% vs 72.2%).
+  arxiv behaves the same: its figures respond to forced DCT re-encoding until
+  amatl is given the same license.
 - **The progressive-JPEG Huffman pass (this release)** removed the last
   outright decline in the entropy-recode path: progressive (`SOF2`) streams
   are now re-tabled like baseline ones, with losslessness proven by an
@@ -396,17 +399,16 @@ Findings from this sweep:
   compressed XML Forms Architecture template that *describes* the form and
   which Acrobat renders dynamically. Amatl correctly refuses to touch it
   (rewriting XFA without Adobe's engine is how forms break), so its lossless
-  row sits at 88.4% while Ghostscript reports 8.8%. But gs's number is not
-  compression — it **discards the entire XFA model and re-renders the pages
-  to static content**, destroying the fillable form. Verify before trusting:
-  after pdfwrite, the W-2 still opens at 11 identical-looking pages, but it
-  is no longer a dynamic form. For this class of document the choice is
-  "88% of original, still works" vs "9%, no longer a form" — amatl's answer
-  is by contract, gs's is silent.
+  row sits at 88.4%. The comparison row's smaller number is not compression —
+  that pipeline **discards the entire XFA model and re-renders the pages to
+  static content**, destroying the fillable form. Verify before trusting any
+  optimizer on this file class: the output still opens at 11 identical-looking
+  pages, but it is no longer a dynamic form. For this class of document the
+  choice is "88% of original, still works" vs "9%, no longer a form".
 - **cmyk-jpeg is the mirror image:** a 374 KB file whose payload is one large
-  CMYK JPEG. Ghostscript's 4.6% comes from re-compressing that single image
-  into submission; amatl re-encodes it as YCCK at `jpeg_quality`, which is a
-  far more conservative trade, so 67.4% is its floor here.
+  CMYK JPEG. Aggressive lossy re-compression takes that single image down to
+  4.6%; amatl re-encodes it as YCCK at `jpeg_quality`, which is a far more
+  conservative trade, so 67.4% is its floor here.
 
   These two cells got *worse* than the numbers first published for this
   corpus (76.7% and 65.9%), and the correction is worth stating plainly: the
@@ -422,11 +424,10 @@ Findings from this sweep:
   NIST SP 800-63B (39.7% vs 70.1%); the Wikipedia render collapses to 22.8%
   once the accessibility tree (26 points of it) is stripped with consent.
   Only the academic preprint class stays marginally ahead under Ghostscript
-  (28.4% vs 32.2%), via forced re-encoding of figure imagery.
-- Combined across both corpora, amatl's kitchen-sink configuration beats
-  Ghostscript on **8 of 11 documents**, never grows a file, keeps dates and
-  provenance unless explicitly stripped, and preserves accessibility by
-  default.
+  (28.4% vs 32.2%).
+- Combined across both corpora, amatl's kitchen-sink configuration wins
+  **8 of 11 documents**, never grows a file, keeps dates and provenance
+  unless explicitly stripped, and preserves accessibility by default.
 
 ### Sixteen-document consolidated matrix (2026-08-24, post CMYK/flatten/f32)
 
@@ -466,20 +467,18 @@ marks the comparison as not apples-to-apples.
 Reading the consolidated matrix:
 
 - **Every non-dynamic-XFA file is an amatl win.** Total: **21.3% of input
-  vs gs's 41.8%** — amatl now lands at roughly half of Ghostscript's
-  output size across the 56 MB corpus while preserving accessibility,
-  form data, and provenance that gs strips.
-- **irs-w2 flipped with `--flatten-forms`**: 2.15 MB → 133.7 KB (6.2%),
-  now *smaller* than gs's 189 KB (8.8%) — and the flattened output keeps
-  the filled values gs throws away. The AcroForm flatten path is
-  pixel-fidelity-verified (see `docs/FORMS-PLAN.md`).
+  vs gs's 41.8%** across the 56 MB corpus while preserving accessibility,
+  form data, and provenance unless explicitly stripped.
+- **irs-w2 flipped with `--flatten-forms`**: 2.15 MB → 133.7 KB (6.2%) —
+  and the flattened output keeps the filled values. The AcroForm flatten
+  path is pixel-fidelity-verified (see `docs/FORMS-PLAN.md`).
 - **cmyk-jpeg now beats gs outright** (3.3% vs 4.6%) after the CMYK
   decode/resample/YCCK work; the old 67.4% floor was the honest
   pre-fix number.
-- **The only gs "wins" are destructive**: dynamic XFA documents where
-  pdfwrite discards the form model and all filled data. amatl's contract
-  declines those; the gap is a deliberate refusal, not a missing feature
-  (see `docs/FORMS-PLAN.md`).
+- **Dynamic XFA documents**: the comparison row's small sizes come from
+  discarding the form model and all filled data. amatl's contract declines
+  those; the gap is a deliberate refusal, not a missing feature (see
+  `docs/FORMS-PLAN.md`).
 
 ## Why not Ghostscript?
 

@@ -29,7 +29,9 @@
 #
 # Measured baseline (2026-08-21, 4-page fixtures/sample.pdf with Flate pages):
 #   input:  662107 bytes
-#   amatl:  123948 bytes (18% of input)
+#   amatl:  117459 bytes (18% of input; re-measured 2026-08-25 — zlib-rs
+#            deflate + default font subsetting improved on the 123948 B of
+#            2026-08-21)
 #   gs:      71742 bytes (11% of input; gs 10.07.1 — its forced DCTEncode
 #            converts the Flate noise pages to JPEG, which amatl refuses by
 #            design, so the gap overstates typical documents)
