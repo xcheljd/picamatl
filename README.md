@@ -233,6 +233,48 @@ What each level buys:
   lossless path declined to change — one consent covers re-encoding only.
   Measured effect on this corpus: −24.9% over defaults, with converted streams
   visually indistinguishable at review zoom.
+- **`--flatten-forms`:** turns an interactive AcroForm document into a static
+  one — every widget appearance is painted into the page it sat on, then
+  `/AcroForm`, the field tree, the XFA packet set and every `/Widget`
+  annotation go. A semantic change (the output cannot be filled in or signed
+  any more), never a silent data loss: a filled-in value survives only because
+  the appearance stream that *showed* it became page content, and a document
+  where some value could not be preserved that way is declined whole. See
+  [Interactive forms](#interactive-forms).
+
+### Interactive forms
+
+`--flatten-forms` (library `with_flatten_forms(true)`, **off by default**) is
+amatl's answer to the one file class where Ghostscript is dramatically smaller:
+form-heavy PDFs. `pdfwrite` gets there by deleting the form layer
+unconditionally — on a *filled* form that deletes the entered values with it.
+
+amatl flattens under a contract instead. A field's value survives either
+because its appearance stream — the object that actually paints the value — is
+moved into the page's content stream at the position ISO 32000-1 12.5.5 places
+it, or because the field has no value to lose. If neither holds for any field,
+the whole document declines and you get the bytes you would have got without
+the flag. Dynamic XFA / LiveCycle forms (`/NeedsRendering true`) always
+decline: their pages are a placeholder the reader builds from an XML template,
+amatl does not render XFA, and pretending otherwise would ship a blank page.
+The full decline table is in [`docs/FORMS-PLAN.md`](docs/FORMS-PLAN.md).
+
+On `corpus-expanded/irs-w2.pdf` (the official IRS Form W-2 — a *static* XFA
+form whose 568 widget annotations draw no ink at all, next to a 1.58 MB XFA
+packet set):
+
+| Pipeline | Size | of input | Form? | Values? |
+| --- | ---: | ---: | --- | --- |
+| input | 2,150,352 | 100.0% | interactive | intact |
+| amatl defaults | 1,392,531 | 64.8% | interactive | intact |
+| amatl `--flatten-forms` | 250,229 | 11.6% | static | intact |
+| Ghostscript `/ebook` | 183,761 | 8.5% | destroyed | destroyed |
+
+Rendered through Ghostscript at 150 dpi, all 11 pages of the flattened output
+are **pixel-identical** to the original — as are the 9 pages of
+`census-brief.pdf`, the corpus's other AcroForm file. The flag is completely
+inert on the 14 corpus files that carry no `/AcroForm`: byte-for-byte the same
+output with and without it.
 
 For calibration: at matched intent (lossless in, lossless out) amatl now
 *beats* Ghostscript on this corpus while preserving the accessibility tree.

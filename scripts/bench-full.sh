@@ -9,6 +9,7 @@
 #   scripts/bench-full.sh          # full corpus
 #   scripts/bench-full.sh adobe-spec arxiv-gpt4   # named files (no extension)
 #   AMATL_BIN=./target/release/amatl scripts/bench-full.sh
+#   AMATL_NO_FLATTEN=1 scripts/bench-full.sh   # kitchen sink minus --flatten-forms
 #
 # Requires: gs, python3 (for the matrix printer).
 set -euo pipefail
@@ -30,11 +31,18 @@ else
   files=("$repo_root"/corpus/*.pdf "$repo_root"/corpus-expanded/*.pdf)
 fi
 
-echo "== amatl kitchen sink =="
+# The kitchen sink is "every opt-in flag", which now includes form flattening.
+# `AMATL_NO_FLATTEN=1` reproduces the pre-0.3.2 kitchen sink for a with/without
+# comparison on form-heavy inputs.
+flatten_flag="--flatten-forms"
+[ -n "${AMATL_NO_FLATTEN:-}" ] && flatten_flag="--no-flatten-forms"
+
+echo "== amatl kitchen sink ($flatten_flag) =="
 for f in "${files[@]}"; do
   name=$(basename "$f" .pdf)
   "$bin" --allow-lossy --strip-accessibility --strip-metadata --strip-private-data \
     --convert-type1 --strip-hinting --recompress-bitonal-images --collapse-gray-images \
+    "$flatten_flag" \
     --deflate-backend zopfli -o "$out/kitchen/$name.pdf" "$f" >/dev/null 2>&1
   echo "  $name: $?"
 done
