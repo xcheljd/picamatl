@@ -17,7 +17,7 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 bin="${AMATL_BIN:-$repo_root/target/release/amatl}"
 out="$repo_root/target/scratch/matrix"
-mkdir -p "$out/kitchen" "$out/gs"
+mkdir -p "$out/lossless" "$out/lossy" "$out/kitchen" "$out/gs"
 
 # Build the file list: either named args or everything in corpus/ + corpus-expanded/
 if [ "$#" -gt 0 ]; then
@@ -36,6 +36,22 @@ fi
 # comparison on form-heavy inputs.
 flatten_flag="--flatten-forms"
 [ -n "${AMATL_NO_FLATTEN:-}" ] && flatten_flag="--no-flatten-forms"
+
+echo "== amatl lossless (defaults) =="
+for f in "${files[@]}"; do
+  name=$(basename "$f" .pdf)
+  "$bin" -o "$out/lossless/$name.pdf" "$f" >/dev/null 2>&1
+  echo "  $name: $?"
+done
+
+echo "== amatl lossy (no form flattening) =="
+for f in "${files[@]}"; do
+  name=$(basename "$f" .pdf)
+  "$bin" --allow-lossy --strip-metadata --strip-private-data --convert-type1 \
+    --strip-hinting --recompress-bitonal-images --collapse-gray-images \
+    --deflate-backend zopfli -o "$out/lossy/$name.pdf" "$f" >/dev/null 2>&1
+  echo "  $name: $?"
+done
 
 echo "== amatl kitchen sink ($flatten_flag) =="
 for f in "${files[@]}"; do
@@ -69,19 +85,48 @@ python3 - "$repo_root" "$out" "${files[@]}" <<'PYEOF'
 import os, sys
 repo, out = sys.argv[1], sys.argv[2]
 files = sys.argv[3:]
-rows = []
+
+def kb(n):
+    return f"{n/1024:.0f} KB" if n < 1024*1024 else f"{n/1024/1024:.1f} MB"
+
+def fmt(label, path, i):
+    try:
+        s = os.path.getsize(path)
+        pct = 100*s/i
+        note = " (grew)" if s > i else ""
+        return f"  {label}: {kb(s)} ({pct:.1f}% of original){note}"
+    except FileNotFoundError:
+        return f"  {label}: FAILED (no output)"
+
+totals = {}
+wins = {"amatl": 0, "gs": 0}
 for f in files:
     i = os.path.getsize(f)
     name = os.path.splitext(os.path.basename(f))[0]
-    k = os.path.getsize(os.path.join(out, "kitchen", name + ".pdf"))
-    g = os.path.getsize(os.path.join(out, "gs", name + ".pdf"))
-    rows.append((name, i, k, g))
-hdr = f"{'file':<24}{'input':>12}{'kitchen':>12}  {'gs':>12}"
-print(hdr)
-ti = tk = tg = 0
-for name, i, k, g in rows:
-    ti += i; tk += k; tg += g
-    w = "AMATL" if k < g else "gs"
-    print(f"{name:<24}{i:>10,}{k:>10,} {100*k/i:>4.1f}%{g:>10,} {100*g/i:>4.1f}%  {w}")
-print(f"{'TOTAL':<24}{ti:>10,}{tk:>10,} {100*tk/ti:>4.1f}%{tg:>10,} {100*tg/ti:>4.1f}%  {'AMATL' if tk<tg else 'gs'}")
+    print(f"{name}: {kb(i)} in")
+    for label, sub in [("lossless", "lossless"), ("lossy", "lossy"), ("kitchen", "kitchen")]:
+        line = fmt(label, os.path.join(out, sub, name + ".pdf"), i)
+        print(line)
+        p = os.path.join(out, sub, name + ".pdf")
+        if os.path.exists(p):
+            totals[sub] = totals.get(sub, 0) + os.path.getsize(p)
+    gpath = os.path.join(out, "gs", name + ".pdf")
+    gline = fmt("gs", gpath, i)
+    print(gline)
+    if os.path.exists(gpath):
+        g = os.path.getsize(gpath)
+        totals["gs"] = totals.get("gs", 0) + g
+    kpath = os.path.join(out, "kitchen", name + ".pdf")
+    if os.path.exists(kpath) and os.path.exists(gpath):
+        w = "AMATL" if os.path.getsize(kpath) < g else "gs"
+        wins[w.lower()] += 1
+        print(f"  winner: {w}")
+    print()
+
+ti = sum(os.path.getsize(f) for f in files)
+print("TOTALS:")
+for sub in ("lossless", "lossy", "kitchen", "gs"):
+    if sub in totals:
+        print(f"  {sub}: {kb(totals[sub])} ({100*totals[sub]/ti:.1f}%)")
+print(f"  head-to-head (kitchen vs gs): AMATL {wins['amatl']}, gs {wins['gs']}")
 PYEOF
