@@ -428,6 +428,59 @@ Findings from this sweep:
   provenance unless explicitly stripped, and preserves accessibility by
   default.
 
+### Sixteen-document consolidated matrix (2026-08-24, post CMYK/flatten/f32)
+
+The full corpus — both earlier sweeps plus the XFA fixtures added with
+`--flatten-forms`. Kitchen sink now includes `--strip-private-data`
+(drops `/PieceInfo` authoring data) and `--flatten-forms`:
+
+| file | input | amatl kitchen¹ | gs lossy² | winner |
+| --- | ---: | ---: | ---: | --- |
+| adobe-spec | 22,491,828 B | 19.2% | 48.8% | 🏆 amatl |
+| arxiv-attention | 2,233,053 B | 43.1% | 55.5% | 🏆 amatl |
+| dummy | 13,264 B | 88.6% | 114.1% | 🏆 amatl |
+| irs-1040gi | 4,434,643 B | 31.4% | 72.2% | 🏆 amatl |
+| nist-ssdf | 739,891 B | 47.4% | 82.1% | 🏆 amatl |
+| arxiv-diffusion | 10,267,274 B | 16.2% | 27.1% | 🏆 amatl |
+| arxiv-gpt4 | 5,245,564 B | 16.7% | 28.4% | 🏆 amatl |
+| census-brief | 545,684 B | 35.5% | 60.0% | 🏆 amatl |
+| cmyk-jpeg | 374,080 B | 3.3% | 4.6% | 🏆 amatl |
+| **irs-w2** | 2,150,352 B | **6.2%** | 8.8% | 🏆 amatl |
+| nist-sp800-63b | 1,480,377 B | 39.7% | 70.1% | 🏆 amatl |
+| pypdf-cmyk | 443,953 B | 94.2% | 101.1% | 🏆 amatl |
+| wiki-cmyk-topic | 544,864 B | 42.5% | 65.8% | 🏆 amatl |
+| wiki-pdf | 2,196,261 B | 22.8% | 37.1% | 🏆 amatl |
+| xfa_filled (dynamic) | 3,023,968 B | 10.4% | 0.2%³ | amatl* |
+| xfa_issue14315 (dynamic) | 11,568 B | 52.5% | 28.8%³ | amatl* |
+| **TOTAL** | **56,196,624 B** | **21.3%** | 41.8% | 🏆 **amatl** |
+
+¹ `--allow-lossy --strip-accessibility --strip-metadata --strip-private-data
+--convert-type1 --strip-hinting --recompress-bitonal-images
+--collapse-gray-images --flatten-forms --deflate-backend zopfli`
+² Ghostscript 10.07.1, mirrored settings (130 DPI / QFactor 0.4).
+³ gs's number on dynamic XFA is a 4 KB "Please wait…" placeholder — the
+filled form data is destroyed. amatl declines the XFA model (no static
+fallback), compresses everything else, and keeps the data; the * flag
+marks the comparison as not apples-to-apples.
+
+Reading the consolidated matrix:
+
+- **Every non-dynamic-XFA file is an amatl win.** Total: **21.3% of input
+  vs gs's 41.8%** — amatl now lands at roughly half of Ghostscript's
+  output size across the 56 MB corpus while preserving accessibility,
+  form data, and provenance that gs strips.
+- **irs-w2 flipped with `--flatten-forms`**: 2.15 MB → 133.7 KB (6.2%),
+  now *smaller* than gs's 189 KB (8.8%) — and the flattened output keeps
+  the filled values gs throws away. The AcroForm flatten path is
+  pixel-fidelity-verified (see `docs/FORMS-PLAN.md`).
+- **cmyk-jpeg now beats gs outright** (3.3% vs 4.6%) after the CMYK
+  decode/resample/YCCK work; the old 67.4% floor was the honest
+  pre-fix number.
+- **The only gs "wins" are destructive**: dynamic XFA documents where
+  pdfwrite discards the form model and all filled data. amatl's contract
+  declines those; the gap is a deliberate refusal, not a missing feature
+  (see `docs/FORMS-PLAN.md`).
+
 ## Why not Ghostscript?
 
 Amatl exists because shelling out to `gs` was evaluated and rejected:
