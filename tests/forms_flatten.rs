@@ -1164,3 +1164,165 @@ fn generate_fixtures() {
         std::fs::write(dir.join(name), build(&fixture)).unwrap();
     }
 }
+
+// -- antialiased render fidelity --------------------------------------------
+
+/// Flatten only: every other pass off, so a render difference here can only
+/// have come from the flatten path.
+fn flatten_only() -> OptimizeOptions {
+    OptimizeOptions::default()
+        .with_flatten_forms(true)
+        .with_target_dpi(0.0)
+        .with_downsample_flate_images(false)
+        .with_subset_fonts(false)
+        .with_pack_object_streams(false)
+}
+
+fn pdftoppm() -> Option<String> {
+    Command::new("pdftoppm")
+        .arg("-v")
+        .output()
+        .ok()
+        .map(|_| "pdftoppm".to_string())
+}
+
+/// Render every page to a greyscale raster, antialiasing on.
+///
+/// Poppler on purpose, rather than the `gs` this file already shells out to,
+/// for two measured reasons.
+///
+/// `render` above pins `-dTextAlphaBits=1 -dGraphicsAlphaBits=1`, quantising
+/// every edge to hard black or white. That only sees a geometry change once it
+/// pushes an edge clean across a pixel centre; a smaller shift moves edge
+/// *coverage* and nothing else. Offsetting the burn `cm` in `burn_operators`
+/// and rerunning both tests: at 0.02 pt both fail, at 0.005 pt only this one
+/// does, at 0.001 pt neither. Roughly four times the resolution on the burn
+/// geometry, for the same renders.
+///
+/// Ghostscript is also blind to page-box drift specifically, at any alpha
+/// setting, because it rounds the box to whole device pixels before fitting
+/// anything to the grid — it even reports a different raster width for the two
+/// files. Poppler grid-fits against the unrounded box. Measured on
+/// `wiki-pdf.pdf` with only `/MediaBox 841.91998` nudged to `841.92`: poppler
+/// 16901 differing subpixels and 3562 outright black/white flips,
+/// `gs -dTextAlphaBits=4` exactly 0.
+fn render_pages(
+    tool: &str,
+    pdf: &std::path::Path,
+    dir: &std::path::Path,
+    dpi: u32,
+) -> Vec<Vec<u8>> {
+    let status = Command::new(tool)
+        .args(["-r", &dpi.to_string(), "-gray"])
+        .arg(pdf)
+        .arg(dir.join("p"))
+        .status()
+        .expect("pdftoppm runs");
+    assert!(status.success(), "pdftoppm failed on {}", pdf.display());
+
+    let mut pages: Vec<_> = std::fs::read_dir(dir)
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|e| e == "pgm"))
+        .collect();
+    pages.sort();
+    assert!(
+        !pages.is_empty(),
+        "pdftoppm wrote no pages for {}",
+        pdf.display()
+    );
+
+    let rasters = pages.iter().map(|p| std::fs::read(p).unwrap()).collect();
+    for page in pages {
+        let _ = std::fs::remove_file(page);
+    }
+    rasters
+}
+
+/// Both DPIs matter: a fractional offset can land on the pixel grid at one
+/// scale and off it at another, so a single-resolution check can pass straight
+/// over a real geometry change.
+fn assert_flatten_moves_no_subpixel(tool: &str, label: &str, input: &[u8], flattened: &[u8]) {
+    let dir = std::env::temp_dir().join(format!("amatl-render-{}-{label}", std::process::id()));
+    let (before, after) = (dir.join("before"), dir.join("after"));
+    std::fs::create_dir_all(&before).unwrap();
+    std::fs::create_dir_all(&after).unwrap();
+    let (a_pdf, b_pdf) = (dir.join("a.pdf"), dir.join("b.pdf"));
+    std::fs::write(&a_pdf, input).unwrap();
+    std::fs::write(&b_pdf, flattened).unwrap();
+
+    for dpi in [100, 150] {
+        let a = render_pages(tool, &a_pdf, &before, dpi);
+        let b = render_pages(tool, &b_pdf, &after, dpi);
+        assert_eq!(
+            a.len(),
+            b.len(),
+            "{label}: page count must survive flattening"
+        );
+
+        for (n, (x, y)) in a.iter().zip(&b).enumerate() {
+            assert_eq!(
+                x.len(),
+                y.len(),
+                "{label}: page {} geometry changed at {dpi} dpi",
+                n + 1
+            );
+            let differing = x.iter().zip(y).filter(|(p, q)| p != q).count();
+            assert_eq!(
+                differing,
+                0,
+                "{label}: page {} differs at {dpi} dpi ({differing} of {} subpixels)",
+                n + 1,
+                x.len()
+            );
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The synthetic fixtures, whose widgets paint real ink at a known `/Rect`.
+/// This is the test that pins the burn *geometry*: matrix **A**, the `q`/`Q`
+/// nesting around the splice, and the stacking of each burn over the page's
+/// own content. Shifting the emitted `cm` by 0.02 pt — a fifth of a pixel at
+/// 100 dpi, far below anything a human would call a difference — fails it.
+#[test]
+fn flatten_render_moves_no_subpixel_on_painted_widgets() {
+    let Some(tool) = pdftoppm() else {
+        eprintln!("skipping: `pdftoppm` not on PATH");
+        return;
+    };
+    for (label, input) in [("one-page", flattenable()), ("two-page", build_two_pages())] {
+        let out = optimize_with_options(&input, flatten());
+        assert_ne!(out, input, "{label}: the fixture must exercise flattening");
+        assert_flatten_moves_no_subpixel(&tool, label, &input, &out);
+    }
+}
+
+/// `corpus-expanded/irs-w2.pdf` — 11 pages, a static XFA packet over a filled
+/// AcroForm, and a decorative flag raster in the page-1 header whose diagonal
+/// stripe boundaries are the most antialiasing-sensitive ink in the corpus.
+///
+/// Complementary to the fixture test above rather than a stronger version of
+/// it. This form's widgets paint nothing, so the burns cannot move a pixel by
+/// construction and the burn geometry is *not* what is under test here. What
+/// is, is everything else flattening does to a real document — the spliced
+/// page content, the rebound resource dictionaries, the dropped `/AcroForm`
+/// and annotation arrays, the page tree it leaves behind. The header raster is
+/// the sensitive witness: it is the ink most likely to shift if any of that
+/// quietly changed the page's geometry.
+#[test]
+fn flatten_render_moves_no_subpixel_on_irs_w2() {
+    let Some(tool) = pdftoppm() else {
+        eprintln!("skipping: `pdftoppm` not on PATH");
+        return;
+    };
+    let fixture =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("corpus-expanded/irs-w2.pdf");
+    let Ok(input) = std::fs::read(&fixture) else {
+        eprintln!("skipping: {} not present", fixture.display());
+        return;
+    };
+    let out = optimize_with_options(&input, flatten_only());
+    assert_ne!(out, input, "the fixture must actually exercise flattening");
+    assert_flatten_moves_no_subpixel(&tool, "irs-w2", &input, &out);
+}
