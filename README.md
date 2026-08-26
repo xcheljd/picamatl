@@ -3,13 +3,24 @@
 [![CI](https://github.com/xcheljd/amatl/actions/workflows/rust.yml/badge.svg)](https://github.com/xcheljd/amatl/actions/workflows/rust.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
-Pure-Rust PDF size optimization. Named for the Nahuatl word *āmatl*, the
-fig-bark paper of pre-Columbian Mesoamerican codices.
+**A pure-Rust PDF size optimizer that downsamples over-resolution images to
+their effective on-page DPI — lossless by default, never larger, safe on
+untrusted input. No AGPL, no native runtime dependencies.**
 
-Amatl shrinks PDFs by downsampling over-resolution embedded JPEGs to the
-resolution they are **actually rendered at** — and nothing else. Text and
-vectors are never touched, output is never larger than the input, and the
-library never panics on untrusted bytes.
+Named for the Nahuatl word *āmatl*, the fig-bark paper of pre-Columbian
+Mesoamerican codices.
+
+- **Defaults are lossless** — encoding classes preserved, accessibility kept,
+  metadata kept.
+- **Never larger** — any optimization that can't prove it shrinks is declined.
+- **Fail-safe** — malformed or hostile PDFs come back byte-for-byte unchanged,
+  never corrupted, never a panic.
+- **Effective-DPI aware** — an image reused across pages is sized to its largest
+  placement; only genuinely over-resolved images are downsampled.
+
+→ **Architecture**: see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the
+pipeline, invariants, and source map.
+
 
 ## Who this is for
 
