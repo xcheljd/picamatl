@@ -265,7 +265,7 @@ settings — 130 DPI, 1.15 threshold, DCTEncode QFactor 0.4):
 
 On a public real-world document —
 [NASA TM-20210010291](https://ntrs.nasa.gov/citations/20210010291), a 16.8 MB
-58-page technical report — amatl 0.3.1-dev at defaults takes 16,804,107 bytes
+58-page technical report — amatl 0.4.0 at defaults takes 16,804,107 bytes
 to **4,448,544 bytes, a 73.5% reduction**, byte-stable under repeated
 optimization (0.3.1 released at 4,655,752; the difference is the zlib-rs
 deflate backend, −82,722 B, plus default-on font subsetting, −124,486 B).
@@ -559,7 +559,7 @@ text-heavy PDFs with default options it will honestly do very little, and by
 contract it returns the input unchanged rather than a worse file.
 
 Embedded fonts are subset to the glyphs actually shown — on by default since
-0.3.1-dev (opt out with `--no-subset-fonts` / `with_subset_fonts(false)`;
+0.4.0 (opt out with `--no-subset-fonts` / `with_subset_fonts(false)`;
 introduced opt-in in 0.2.1). Two font classes are covered, and neither ever
 rewrites content-stream text bytes:
 
@@ -569,7 +569,7 @@ rewrites content-stream text bytes:
   pre/post — the "rewrote your text wrong" bug class is structurally
   impossible.
 - **Simple TrueType** (nonsymbolic, WinAnsi/MacRoman encodings incl.
-  `/Differences`, since 0.3.1-dev): the subset font gets a freshly written
+  `/Differences`, since 0.4.0): the subset font gets a freshly written
   `cmap` replicating the original's subtables (restricted to retained
   glyphs), so every viewer lookup path of ISO 32000-1 9.6.6.4 resolves each
   code to the same outline as before; codes, `/Encoding`, `/Widths`, and
