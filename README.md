@@ -151,6 +151,46 @@ that file) and 240 KB inside a 2.2 MB paper. `--strip-private-data`
 It is pixel-identical — verified page by page — but the producing application
 loses its round trip, so it is opt-in.
 
+**Figures can keep a higher DPI than photos.** `--figure-dpi <DPI>`
+(library: `.with_figure_dpi(195.0)`, **unset by default**) is a *quality knob*,
+not a consent tier: images that a cheap pixel-statistic heuristic classifies as
+figure-like — charts, graphs, and diagrams carrying rendered text, where the
+ordinary target turns axis labels and wordmarks to mush while a photograph at
+the same DPI looks fine — are downsampled to this higher target instead of
+`--target-dpi`. Everything else keeps compressing at the ordinary target.
+
+```sh
+amatl report.pdf --figure-dpi 195
+```
+
+The classifier is heuristic-only — no OCR, no new dependencies, and it reuses
+the metrics pass the line-art guard already runs. An image is promoted when its
+dominant color covers 25–75% of the pixels *and* at least 10% of pixels sit on
+a sharp edge: rendered text and plot rules produce many short high-contrast
+runs on flat paper, while a photograph's tonal gradients leave no flat
+background at all. The upper bound is exactly the line-art guard's lower bound,
+so the two defer to each other rather than overlapping. The operating point is
+tuned to be **false-positive-free** — it would rather leave a chart at the
+ordinary target than spend bytes on a photograph.
+
+It never makes output lossier. A higher figure target only raises the geometry
+fed to the candidates the pipeline was already going to build, so output is
+more faithful and at most larger than with the flag unset — and the
+never-larger-than-the-original contract is untouched. Values at or below
+`--target-dpi` are inert (that is what keeps the promise true), and it requires
+a positive `--target-dpi`, since `<= 0` already means "do not downsample".
+
+Measured on `corpus-expanded/nist-sp800-63b.pdf` (80 pages, 69
+over-resolution images) at `--figure-dpi 195`: two images promoted from 130 to
+195 DPI — the NIST wordmark on p1 and a diagram on p26, both `/SMask` pairs
+whose masks followed their base to the same geometry — for **+8,301 bytes**
+(867,951 → 876,252, 0.96%). Rendered at 150 DPI and compared page by page
+against the *original*, both pages land measurably closer to it than the
+defaults do (mean absolute difference 0.333 → 0.225 and 0.106 → 0.046) and the
+other 78 pages are unchanged. Classification costs one full-resolution decode
+per over-resolution image; on the two heaviest corpus files the flag is inside
+run-to-run noise (`irs-1040gi` 15.98s → 16.04s, `adobe-spec` 22.65s → 22.64s).
+
 **Amatl will never lossy-symbol-encode your scans.** Symbol-mode JBIG2 — the
 encoding behind the Xerox scanner scandal, where visually plausible character
 substitution silently turned 6s into 8s in scanned documents — is permanently
@@ -178,6 +218,9 @@ amatl scan.pdf --force --target-dpi 150 --jpeg-quality 70 \
 
 # Keep the output readable by pre-PDF-1.5 viewers (no ObjStm packing)
 amatl report.pdf --no-pack-object-streams
+
+# Keep charts and diagrams legible at a higher DPI than photographic content
+amatl paper.pdf --figure-dpi 195
 ```
 
 Every flag maps 1:1 to an `OptimizeOptions` builder method, and all defaults —
