@@ -411,8 +411,10 @@ fn strip_index(name: &[u8]) -> Vec<u8> {
 fn text_string(bytes: &[u8]) -> Vec<u8> {
     if let Some(body) = bytes.strip_prefix(&[0xFE, 0xFF]) {
         let units: Vec<u16> = body
-            .chunks_exact(2)
-            .map(|pair| u16::from_be_bytes([pair[0], pair[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| u16::from_be_bytes(*pair))
             .collect();
         return match char::decode_utf16(units).collect::<Result<String, _>>() {
             Ok(text) => text.into_bytes(),

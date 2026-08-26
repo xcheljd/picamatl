@@ -2940,7 +2940,7 @@ fn resize_cmyk_lanczos3(img: &CmykImage, target_w: u32, target_h: u32) -> Option
     let mut out = vec![0u8; out_pixels.checked_mul(4)?];
     let mut plane = vec![0u8; pixels];
     for c in 0..4usize {
-        for (dst, src) in plane.iter_mut().zip(img.data.chunks_exact(4)) {
+        for (dst, src) in plane.iter_mut().zip(img.data.as_chunks::<4>().0.iter()) {
             *dst = src[c];
         }
         let gray = image::GrayImage::from_raw(img.width, img.height, std::mem::take(&mut plane))?;
@@ -2953,7 +2953,7 @@ fn resize_cmyk_lanczos3(img: &CmykImage, target_w: u32, target_h: u32) -> Option
         if resized.len() != out_pixels {
             return None;
         }
-        for (dst, src) in out.chunks_exact_mut(4).zip(resized.iter()) {
+        for (dst, src) in out.as_chunks_mut::<4>().0.iter_mut().zip(resized.iter()) {
             dst[c] = *src;
         }
         // Reuse the source plane buffer for the next channel.
@@ -9643,7 +9643,7 @@ mod tests {
 
         // C,M,Y,K -> M,Y,K,C: the classic component-order slip.
         let mut rotated = src.data.clone();
-        for px in rotated.chunks_exact_mut(4) {
+        for px in rotated.as_chunks_mut::<4>().0.iter_mut() {
             px.rotate_left(1);
         }
         let rotated = CmykImage {
