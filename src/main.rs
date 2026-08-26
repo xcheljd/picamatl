@@ -91,6 +91,11 @@ struct Cli {
           default_value_t = OptimizeOptions::default().dpi_margin)]
     dpi_margin: f32,
 
+    /// Higher target DPI for chart/diagram images with rendered text; requires
+    /// a positive --target-dpi and only acts above it; <= 0 disables
+    #[arg(long, value_name = "DPI", default_value_t = 0.0)]
+    figure_dpi: f32,
+
     /// Strip the accessibility structure tree (accessibility-lossy)
     #[arg(long, overrides_with = "no_strip_accessibility")]
     strip_accessibility: bool,
@@ -225,6 +230,7 @@ fn options_from(cli: &Cli) -> OptimizeOptions {
     d.with_target_dpi(cli.target_dpi)
         .with_jpeg_quality(cli.jpeg_quality)
         .with_dpi_margin(cli.dpi_margin)
+        .with_figure_dpi(cli.figure_dpi)
         .with_strip_accessibility(resolve(
             cli.strip_accessibility,
             cli.no_strip_accessibility,
