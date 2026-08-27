@@ -8,7 +8,7 @@ predicted.
 Both landed. One has a scope gap, stated plainly in §3.
 
 Probe/driver scripts are committed as `scripts/h5_*.py`; measurements are
-taken on **amatl's own output**, never on the inputs, with the round-4 binary
+taken on **picamatl's own output**, never on the inputs, with the round-4 binary
 (`88d05ae`) rebuilt for the before column.
 
 ## 0. Headline
@@ -78,7 +78,7 @@ I evaluated the crate ecosystem as instructed and found no fit:
   stream, and a decode→re-encode round trip is *not* lossless (it re-runs the
   IDCT/FDCT).
 * `mozjpeg` — already a dependency, and already emits optimal tables for
-  everything amatl re-encodes. Its C API has no "re-optimize this existing
+  everything picamatl re-encodes. Its C API has no "re-optimize this existing
   stream" entry point exposed by the Rust bindings, and routing pass-through
   JPEGs through it would mean decoding to pixels: lossy.
 * `jpegli-encoder`, `turbojpeg` — encoders / FFI wrappers; `turbojpeg` also
@@ -101,7 +101,7 @@ same additional bits, i.e. the same coefficients. Nothing ships unverified.
 ### Measured
 
 `scripts/h5_jpegcorpus.sh` over 270 raw `/DCTDecode` payloads extracted from
-amatl's round-4 output:
+picamatl's round-4 output:
 
 | | streams | bytes |
 |---|---|---|
@@ -169,7 +169,7 @@ Two layers, both on by default in the product, not just in tests:
 Plus the usual strictly-smaller guard.
 
 `scripts/h5_cff_declines.py` and the `cffhint::tests::corpus_report` harness
-(`#[ignore]`, needs `AMATL_CFF_DIR`) over all 80 Type1C programs in amatl's
+(`#[ignore]`, needs `AMATL_CFF_DIR`) over all 80 Type1C programs in picamatl's
 own output:
 
 ```

@@ -1,4 +1,4 @@
-# amatl architecture
+# picamatl architecture
 
 The design map for this codebase. README.md has the *why*; this has the *how*.
 Hunt notes (`docs/hunts/huntN-notes.md`) have the *history* — each phase's
@@ -10,8 +10,8 @@ investigation, rejected alternatives, and measured tradeoffs.
 unless it is provably strictly-smaller, and anything we can't prove is left
 byte-for-byte untouched.**
 
-That posture — not any individual optimization — is the thing that makes amatl
-amatl. Every feature below is a special case of it.
+That posture — not any individual optimization — is the thing that makes picamatl
+picamatl. Every feature below is a special case of it.
 
 ## Non-negotiable invariants (do not break these)
 

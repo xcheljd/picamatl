@@ -10,22 +10,22 @@ in [Corpus survey](#corpus-survey), not recalled.
 
 ## Why this exists
 
-amatl leaves every piece of form machinery alone by default, and will keep
+picamatl leaves every piece of form machinery alone by default, and will keep
 doing so. Form structure is where documents break and — much worse — where
-*entered data lives*. Ghostscript is 4× smaller than amatl on
+*entered data lives*. Ghostscript is 4× smaller than picamatl on
 `corpus-expanded/irs-w2.pdf` (183,761 B vs 1,392,531 B) purely because
 `pdfwrite` deletes `/AcroForm`, all 568 widget annotations and the 1.58 MB XFA
 packet set unconditionally — including, on a *filled* form, the values.
 
 `--flatten-forms` is the consent to trade interactivity for bytes, under a
 contract that Ghostscript does not offer: **no value is ever silently lost.**
-Where a value cannot be preserved, amatl declines the whole document and hands
+Where a value cannot be preserved, picamatl declines the whole document and hands
 back the input bytes.
 
 The difference is not theoretical. `scripts/forms-vs-gs.sh` runs both tools
 over three inputs:
 
-| input | Ghostscript `/ebook` | amatl `--flatten-forms` |
+| input | Ghostscript `/ebook` | picamatl `--flatten-forms` |
 | --- | --- | --- |
 | filled AcroForm, values **with** appearance streams | flattens; 2,469 → **2,780 B** (grew) | flattens; 2,469 → **1,248 B** |
 | filled AcroForm, a value with **no** appearance | drops `/AcroForm`; the field data is gone, the ink is regenerated | **declines** (D9); 2,454 → 1,450 B, form and all four values intact |
@@ -95,8 +95,8 @@ document is optimized exactly as it would have been without the flag:
 | D1 | encrypted, or PDF/A-declared | same posture as every other structural pass |
 | D2 | no `/AcroForm` in the catalog | nothing to flatten; widget annots without a field tree are not guessed at |
 | D3 | `/NeedsRendering true` (catalog) | ISO 32000-1 12.7.8's marker for a **dynamic XFA** form. The static pages are a "please wait" placeholder; there is nothing to flatten and the reader builds the page from the template at view time. `xfa_filled_imm1344e.pdf` is exactly this |
-| D4 | an XFA `datasets` (or `form`) leaf carries text that the AcroForm field tree does not mirror, or `/XFA` is a single-stream XDP rather than a packet array | the data lives only in the XML, and a single-stream XDP cannot be split into packets without an XML parser amatl is not adding. See [XFA mirroring](#xfa-mirroring) |
-| D5 | `/NeedAppearances true` **and** any field has a non-empty value | the reader was told to *generate* appearances from `/V`; the stored `/AP` may be stale or missing and amatl has no text layout engine to generate one |
+| D4 | an XFA `datasets` (or `form`) leaf carries text that the AcroForm field tree does not mirror, or `/XFA` is a single-stream XDP rather than a packet array | the data lives only in the XML, and a single-stream XDP cannot be split into packets without an XML parser picamatl is not adding. See [XFA mirroring](#xfa-mirroring) |
+| D5 | `/NeedAppearances true` **and** any field has a non-empty value | the reader was told to *generate* appearances from `/V`; the stored `/AP` may be stale or missing and picamatl has no text layout engine to generate one |
 | D6 | a `/FT /Sig` field whose `/V` is a dictionary | the document carries a real signature in a form field; flattening would delete it |
 | D7 | a widget with `/OC` | visibility depends on optional-content state; burning it into the page makes it unconditional |
 | D8 | a `Hidden` or `NoView` widget that *does* draw ink | view/print divergence cannot be expressed in a page content stream |
@@ -118,7 +118,7 @@ mirror of the XFA `datasets` data. That mirror is what makes flattening safe:
 if every piece of data in the XML also exists as an AcroForm `/V`, then
 flattening the AcroForm faithfully flattens the XFA data too.
 
-amatl checks exactly that, with a ~90-line dependency-free XML leaf scanner
+picamatl checks exactly that, with a ~90-line dependency-free XML leaf scanner
 (`datasets_leaves`, no XML crate, no namespaces resolved — it only needs
 element names and character data):
 
@@ -176,7 +176,7 @@ concatenates `/Matrix` itself, so the effective form-space→page-space matrix i
 
 To make that `cm` mean what it says, the page's own content must start from the
 initial CTM. A content stream may legally leave an arbitrary CTM behind (a
-top-level `cm` outside any `q`), so amatl prepends a stream containing `q` and
+top-level `cm` outside any `q`), so picamatl prepends a stream containing `q` and
 appends one containing `Q` before the widget operators, restoring the initial
 graphics state. That is only sound if the original content never pops past its
 own base level and ends balanced, so the plan parses the concatenated content
@@ -200,13 +200,13 @@ already unreferenced when `prune_objects()` runs.
 
 ## Results
 
-`corpus-expanded/irs-w2.pdf`, amatl defaults plus the flag:
+`corpus-expanded/irs-w2.pdf`, picamatl defaults plus the flag:
 
 | | bytes | of input |
 | --- | ---: | ---: |
 | input | 2,150,352 | 100.0% |
-| amatl defaults (today) | 1,392,531 | 64.8% |
-| amatl defaults + `--flatten-forms` | 250,229 | 11.6% |
+| picamatl defaults (today) | 1,392,531 | 64.8% |
+| picamatl defaults + `--flatten-forms` | 250,229 | 11.6% |
 | Ghostscript `/ebook` (deletes the form layer unconditionally) | 183,761 | 8.5% |
 
 And with the rest of the opt-in flags on (the `scripts/bench-full.sh` kitchen
@@ -214,12 +214,12 @@ sink, zlib backend):
 
 | | bytes | of input | pages differing from the original render |
 | --- | ---: | ---: | ---: |
-| amatl kitchen sink, `--no-flatten-forms` | 1,281,292 | 59.6% | — |
-| amatl kitchen sink, `--flatten-forms` | **140,215** | **6.5%** | 0 of 11 vs the line above |
+| picamatl kitchen sink, `--no-flatten-forms` | 1,281,292 | 59.6% | — |
+| picamatl kitchen sink, `--flatten-forms` | **140,215** | **6.5%** | 0 of 11 vs the line above |
 | Ghostscript `/ebook` | 189,094 | 8.8% | **11 of 11**, up to 0.55% of pixels |
 
 That is the whole point of the exercise: on the file Ghostscript used to win by
-4× it is now amatl that is smaller, and amatl's output is the pixel-identical
+4× it is now picamatl that is smaller, and picamatl's output is the pixel-identical
 one.
 
 Render fidelity was measured with `scripts/forms-verify.py` (Ghostscript, 100
@@ -253,12 +253,12 @@ resources become unreferenced). Every other corpus file is untouched: no
 
 ## Honest limits
 
-* **Dynamic XFA is not rendered.** amatl will never grow an XFA layout engine;
+* **Dynamic XFA is not rendered.** picamatl will never grow an XFA layout engine;
   D3 declines those documents forever. That is the honest answer, not a
   placeholder.
 * **Appearances are copied, not generated.** If a producer wrote `/V` without
   an `/AP` and set `/NeedAppearances`, only the reader can lay that text out.
-  amatl declines (D5/D9) rather than guess a font, size, quadding or comb
+  picamatl declines (D5/D9) rather than guess a font, size, quadding or comb
   layout.
 * **Flattening is one-way and it is a semantic change.** The output is not a
   form any more: no filling, no field export, no FDF round trip, no signing.

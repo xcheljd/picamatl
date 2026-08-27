@@ -2,14 +2,14 @@
 """hunt5 driver: regenerate the corpus outputs and print the size delta against
 the round-4 baseline in target/scratch/h4.
 
-Usage: python3 scripts/h5_run.py [--suffix def] [-- amatl flags...]
+Usage: python3 scripts/h5_run.py [--suffix def] [-- picamatl flags...]
 """
 import os
 import subprocess
 import sys
 
 FILES = ["adobe-spec", "arxiv-attention", "irs-1040gi", "nist-ssdf"]
-BIN = "./target/release/amatl"
+BIN = "./target/release/picamatl"
 OUT = "target/scratch/h5"
 
 argv = sys.argv[1:]

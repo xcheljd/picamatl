@@ -20,7 +20,7 @@ which side is authoritative (compare object bytes w/ original) + full-file count
 ## UPSTREAM SITE (t+7min)
 lopdf 0.42.0 src/writer.rs:175 -> `index: index_in_stream as u16` (hardcoded),
 written as u16 BE with /W [1 4 2] (writer.rs ~226,462-463). ObjStm indices
->=65536 wrap silently. amatl bug = trusting upstream width for huge ObjStms.
+>=65536 wrap silently. picamatl bug = trusting upstream width for huge ObjStms.
 
 ## FIX (t+12min): cap max_objects_per_stream at 65_535
 src/lib.rs pack_and_save(): 100_000_000 -> 65_535. lopdf starts a fresh ObjStm

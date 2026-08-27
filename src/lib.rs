@@ -1,7 +1,7 @@
-//! **amatl** — pure-Rust PDF size optimization.
+//! **picamatl** — pure-Rust PDF size optimization.
 //!
 //! Named for the Nahuatl word for the fig-bark paper used in pre-Columbian
-//! Mesoamerican codices. Amatl shrinks PDFs by downsampling over-resolution
+//! Mesoamerican codices. Picamatl shrinks PDFs by downsampling over-resolution
 //! embedded images to the resolution they are actually rendered at.
 //!
 //! For the dominant input shape this targets — business documents (flyers,
@@ -84,7 +84,7 @@ const DPI_MARGIN: f32 = 1.15;
 /// Options for [`optimize_with_options`]. Defaults preserve the input's
 /// accessibility data and use the simpler (non-packed) save path.
 ///
-/// As a library, amatl is accessibility-preserving by default. Callers who
+/// As a library, picamatl is accessibility-preserving by default. Callers who
 /// know their audience (e.g. sighted-only retail promotions) can opt in to
 /// `strip_accessibility` for ~18 percentage points of additional reduction.
 /// Stripping removes the PDF structure tree (`/StructTreeRoot`, `/MarkInfo`,
@@ -110,7 +110,7 @@ const DPI_MARGIN: f32 = 1.15;
 /// # Example
 ///
 /// ```
-/// use amatl::OptimizeOptions;
+/// use picamatl::OptimizeOptions;
 /// let opts = OptimizeOptions::default()
 ///     .with_strip_accessibility(true)
 ///     .with_target_dpi(110.0);
@@ -118,7 +118,7 @@ const DPI_MARGIN: f32 = 1.15;
 ///
 /// `#[non_exhaustive]`: construct via [`OptimizeOptions::default()`] plus the
 /// `with_*` setters, never a struct literal. This lets future options ship in a
-/// *minor* release instead of a breaking one once amatl is published.
+/// *minor* release instead of a breaking one once picamatl is published.
 #[derive(Debug, Clone, Copy)]
 #[non_exhaustive]
 pub struct OptimizeOptions {
@@ -313,7 +313,7 @@ pub struct OptimizeOptions {
     /// or a button's `/Off`); anything else declines the entire document and
     /// the run proceeds byte-for-byte as if the flag were off. Dynamic XFA
     /// forms (`/NeedsRendering true`) always decline — their pages are a
-    /// placeholder the reader builds from the XFA template, and amatl does not
+    /// placeholder the reader builds from the XFA template, and picamatl does not
     /// render XFA. XFA data that the AcroForm field tree does not mirror
     /// declines. So does a value with no appearance to burn, a hidden field
     /// carrying data, `/NeedAppearances true` over a filled form, a signature
@@ -548,7 +548,7 @@ pub fn optimize(input: &[u8]) -> Vec<u8> {
 /// and `invalid_pdf_falls_back_to_original` pin the three failure shapes
 /// (panic, degenerate input, parse error); do not remove them.
 pub fn optimize_with_options(input: &[u8], options: OptimizeOptions) -> Vec<u8> {
-    // amatl optimizes arbitrary user-supplied PDFs, and its contract is to
+    // picamatl optimizes arbitrary user-supplied PDFs, and its contract is to
     // return the original bytes on ANY failure. try_optimize handles the
     // expected error paths (Result::Err), but a crafted PDF could still trigger
     // a panic deep in the JPEG decoder, the mozjpeg encoder, or lopdf. Catch it
@@ -4637,7 +4637,7 @@ fn try_optimize(input: &[u8], options: OptimizeOptions) -> Result<Option<Vec<u8>
 /// This is not hypothetical. `corpus/adobe-spec.pdf` (Distiller 8.1.0) ends in
 /// a *classic* `trailer` dictionary that nonetheless carries a full xref-stream
 /// key set, including `/DecodeParms<</Columns 5/Predictor 12>>`. Carried into
-/// amatl's output that predictor declaration sat on top of the unpredicted
+/// picamatl's output that predictor declaration sat on top of the unpredicted
 /// 7-bytes-per-row payload `compress_xref_stream` had just deflated, so every
 /// strict reader failed to decode the table and fell back to reconstruction
 /// (Ghostscript: "The /Prev entry in an XrefStm dictionary did not point to an
@@ -4674,7 +4674,7 @@ const MAX_REDEFLATE_BYTES: usize = 128 * 1024 * 1024;
 /// verifies its own output decodes back to the identical token sequence — so
 /// unlike the image paths it needs no pixel contract and no opt-in.
 ///
-/// Streams amatl re-encoded itself carry mozjpeg's already-optimal tables and
+/// Streams picamatl re-encoded itself carry mozjpeg's already-optimal tables and
 /// simply decline (nothing is smaller). The headroom is in the JPEGs the image
 /// path passes through untouched: CMYK/Separation payloads, and any image
 /// whose effective DPI is already at target.
@@ -4791,7 +4791,7 @@ fn replan_deflate(content: &[u8], backend: DeflateBackend) -> Option<Vec<u8>> {
 /// Why there is no signature guard here (there used to be).
 ///
 /// A `/ByteRange` digest covers file offsets, so it cannot survive *any*
-/// amatl output: every run re-serializes the whole document from scratch,
+/// picamatl output: every run re-serializes the whole document from scratch,
 /// moving every offset, and font subsetting, image downsampling, object-stream
 /// packing and metadata stripping were never gated on signatures in the first
 /// place. Gating only the three entropy-level passes (JPEG Huffman
@@ -4800,7 +4800,7 @@ fn replan_deflate(content: &[u8], backend: DeflateBackend) -> Option<Vec<u8>> {
 /// Reader-extended IRS form whose 1.5 MB XFA attachment ships with a weak
 /// deflate.
 ///
-/// The honest contract is the one amatl already had in practice: optimizing a
+/// The honest contract is the one picamatl already had in practice: optimizing a
 /// signed PDF invalidates its signature, exactly as it does with every other
 /// PDF optimizer. That is documented in the README; the fail-safe contract
 /// covers rendered content, not offset-pinned digests. Callers who must keep a
@@ -4844,7 +4844,7 @@ fn save_document(
 /// `writer.rs::write_cross_reference_stream` — there is no `SaveOptions` knob
 /// for it, and `doc.compress()` cannot reach the object because it does not
 /// exist in `Document::objects`: the writer synthesizes it during save, after
-/// every document-level pass has run. So amatl's output shipped a raw
+/// every document-level pass has run. So picamatl's output shipped a raw
 /// 7-bytes-per-entry xref stream (17,479 B on the 2,497-object NASA reference,
 /// where Ghostscript spends 5,375 B).
 ///
@@ -7331,7 +7331,7 @@ mod tests {
     /// the *input's* table (`corpus/adobe-spec.pdf` ends in a classic `trailer`
     /// holding `/DecodeParms<</Columns 5/Predictor 12>>`). lopdf copies the
     /// trailer into the xref stream it synthesizes, so those keys would sit on
-    /// top of amatl's freshly deflated, unpredicted payload and make every
+    /// top of picamatl's freshly deflated, unpredicted payload and make every
     /// strict reader repair the file. None may survive.
     #[test]
     fn stale_xref_keys_in_the_input_trailer_do_not_reach_the_output() {
@@ -7745,7 +7745,7 @@ mod tests {
         );
     }
 
-    /// A signature is NOT a reason to decline: amatl re-serializes the whole
+    /// A signature is NOT a reason to decline: picamatl re-serializes the whole
     /// document either way, so the `/ByteRange` digest is already broken by
     /// the passes that were never gated. Declining here only cost bytes.
     #[test]
@@ -8000,7 +8000,7 @@ mod tests {
         // re-encode matches a DeviceGray /ColorSpace. Encoding 3-channel data
         // into a DeviceGray stream would corrupt the image.
         //
-        // NOTE: build the fixture with amatl's own encoder. image's JpegEncoder
+        // NOTE: build the fixture with picamatl's own encoder. image's JpegEncoder
         // writes a Luma8 buffer as a 3-component YCbCr JPEG, which is NOT a
         // grayscale JPEG and would not exercise this path.
         let mut gray = image::GrayImage::new(600, 600);
@@ -10695,7 +10695,7 @@ mod tests {
         let out = optimize_with_options(&pdf, OptimizeOptions::default());
         let (_, content) = only_image_stream(&out);
 
-        let dir = std::env::temp_dir().join("amatl-cmyk-crosscheck");
+        let dir = std::env::temp_dir().join("picamatl-cmyk-crosscheck");
         std::fs::create_dir_all(&dir).unwrap();
         let (a, b) = (dir.join("src.jpg"), dir.join("out.jpg"));
         std::fs::write(&a, &src).unwrap();

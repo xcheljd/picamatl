@@ -22,7 +22,7 @@ def main():
     print("render-identity:", "OK" if ha == hb else f"MISMATCH {ha} != {hb}")
 
     p2 = out + ".pass2"
-    subprocess.run(["./target/release/amatl", "-o", p2, out], stdout=subprocess.DEVNULL, check=True)
+    subprocess.run(["./target/release/picamatl", "-o", p2, out], stdout=subprocess.DEVNULL, check=True)
     same = open(p2, "rb").read() == open(out, "rb").read()
     print(f"idempotence: {'OK' if same else 'DIFFERS'} ({os.path.getsize(out)} -> {os.path.getsize(p2)})")
 

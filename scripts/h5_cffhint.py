@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""hunt5: isolate the Type1C hint-strip contribution by running amatl twice
+"""hunt5: isolate the Type1C hint-strip contribution by running picamatl twice
 with the same flags, once with AMATL_NO_CFFHINT=1 (a temporary escape hatch
 kept only while measuring).
 
-Usage: python3 scripts/h5_cffhint.py [amatl flags...]
+Usage: python3 scripts/h5_cffhint.py [picamatl flags...]
 """
 import os
 import subprocess
@@ -22,7 +22,7 @@ for f in FILES:
             env["AMATL_NO_CFFHINT"] = "1"
         dst = f"target/scratch/h5/{f}.{tag}.{name}.pdf"
         subprocess.run(
-            ["./target/release/amatl", *flags, f"corpus/{f}.pdf", "-o", dst],
+            ["./target/release/picamatl", *flags, f"corpus/{f}.pdf", "-o", dst],
             check=True,
             capture_output=True,
             env=env,

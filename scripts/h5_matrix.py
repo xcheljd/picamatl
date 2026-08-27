@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""hunt5 config matrix: run one amatl binary over the corpus in each flag
+"""hunt5 config matrix: run one picamatl binary over the corpus in each flag
 configuration and print a size table.
 
 Usage:

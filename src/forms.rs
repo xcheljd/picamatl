@@ -77,7 +77,7 @@ pub(crate) fn plan_flatten(doc: &Document) -> Option<FlattenPlan> {
 
     // D3 — ISO 32000-1 12.7.8: the marker for a dynamic XFA form, whose pages
     // are a placeholder the reader replaces by laying out the XFA template.
-    // There is nothing static to flatten and amatl will never render XFA.
+    // There is nothing static to flatten and picamatl will never render XFA.
     if let Ok(needs) = catalog.get(b"NeedsRendering") {
         if matches!(resolve(doc, needs), Object::Boolean(true)) {
             return None;
@@ -99,7 +99,7 @@ pub(crate) fn plan_flatten(doc: &Document) -> Option<FlattenPlan> {
     }
 
     // D5 — the reader was told to generate appearances from `/V`; the stored
-    // ones may be stale or absent, and amatl has no text layout engine.
+    // ones may be stale or absent, and picamatl has no text layout engine.
     if let Ok(need) = acroform.get(b"NeedAppearances") {
         if matches!(resolve(doc, need), Object::Boolean(true)) && scan.any_value {
             return None;
@@ -923,7 +923,7 @@ pub(crate) fn apply_flatten(doc: &mut Document, plan: FlattenPlan) {
         catalog.remove(b"NeedsRendering");
         if plan.drop_ur3 {
             // The Reader usage-rights signature grants exactly the local form
-            // filling and saving this pass removes (and any amatl rewrite has
+            // filling and saving this pass removes (and any picamatl rewrite has
             // already invalidated it). `/DocMDP` is left alone.
             let perms_id = match catalog.get(b"Perms") {
                 Ok(Object::Reference(id)) => Some(*id),

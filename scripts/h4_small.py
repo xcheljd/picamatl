@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""hunt4 items 1-8: re-measure the small/marginal rejections on amatl output.
+"""hunt4 items 1-8: re-measure the small/marginal rejections on picamatl output.
 
   1 jpegtran-style DCT cleanup  (lossless JPEG re-optimisation)
   2 payload-only dedup residue  (beyond the shipped dict-aware dedup)

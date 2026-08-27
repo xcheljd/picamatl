@@ -293,7 +293,7 @@ fn table_checksum(data: &[u8]) -> u32 {
 /// masking them makes byte-equal subsets *actually* byte-equal and the
 /// document-wide stream dedup collapses them. Names in the `name` table play
 /// no part in rendering an embedded PDF font — the viewer takes the subset
-/// tag from `/BaseFont`, which amatl rewrites from a content hash anyway, so
+/// tag from `/BaseFont`, which picamatl rewrites from a content hash anyway, so
 /// the mask is no more of a mismatch than what already ships.
 ///
 /// Both 1-byte and UTF-16BE name strings are handled. `None` on any

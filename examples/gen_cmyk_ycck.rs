@@ -8,7 +8,7 @@
 //! this generates the transform = 2 fixture. It deliberately calls libjpeg
 //! directly rather than reusing the library's own private helpers, and the
 //! result is validated against `djpeg` and Pillow (see docs/CMYK-JPEG.md) —
-//! the fixture is therefore not simply "whatever amatl happens to emit".
+//! the fixture is therefore not simply "whatever picamatl happens to emit".
 use mozjpeg::{ColorSpace, Compress, Decompress};
 
 fn main() {

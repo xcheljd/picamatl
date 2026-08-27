@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""hunt2 bench: run amatl over the corpus with given flags and print sizes.
+"""hunt2 bench: run picamatl over the corpus with given flags and print sizes.
 
 Usage: python3 scripts/h2_bench.py TAG [flags...]
 """
@@ -17,7 +17,7 @@ def main():
     for f in CORPUS:
         src = f"corpus/{f}.pdf"
         dst = f"{OUT}/{f}-{tag}.pdf"
-        subprocess.run(["./target/release/amatl", *flags, "-o", dst, src],
+        subprocess.run(["./target/release/picamatl", *flags, "-o", dst, src],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
         a = os.path.getsize(src)
         b = os.path.getsize(dst) if os.path.exists(dst) else 0

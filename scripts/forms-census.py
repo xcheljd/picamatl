@@ -39,7 +39,7 @@ def appearance_draws(pdf, annot):
         return len(normal.read_bytes().strip()) > 0
     state = annot.get("/AS")
     if state is None:
-        return False  # malformed: amatl declines, but it draws nothing today
+        return False  # malformed: picamatl declines, but it draws nothing today
     selected = normal.get(str(state))
     if selected is None or not is_stream(selected):
         return False

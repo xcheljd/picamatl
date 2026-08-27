@@ -1,21 +1,21 @@
 #!/usr/bin/env bash
-# bench-full.sh — repeatable full-corpus benchmark for amatl vs Ghostscript.
+# bench-full.sh — repeatable full-corpus benchmark for picamatl vs Ghostscript.
 #
 # Runs every corpus PDF (corpus/ + corpus-expanded/) through:
-#   amatl lossless (defaults), amatl kitchen sink, Ghostscript forced lossy
+#   picamatl lossless (defaults), picamatl kitchen sink, Ghostscript forced lossy
 # and prints a comparison matrix. Outputs land in target/scratch/matrix/.
 #
 # Usage:
 #   scripts/bench-full.sh          # full corpus
 #   scripts/bench-full.sh adobe-spec arxiv-gpt4   # named files (no extension)
-#   AMATL_BIN=./target/release/amatl scripts/bench-full.sh
+#   AMATL_BIN=./target/release/picamatl scripts/bench-full.sh
 #   AMATL_NO_FLATTEN=1 scripts/bench-full.sh   # kitchen sink minus --flatten-forms
 #
 # Requires: gs, python3 (for the matrix printer).
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
-bin="${AMATL_BIN:-$repo_root/target/release/amatl}"
+bin="${AMATL_BIN:-$repo_root/target/release/picamatl}"
 out="$repo_root/target/scratch/matrix"
 mkdir -p "$out/lossless" "$out/lossy" "$out/kitchen" "$out/gs" "$out/gs-custom"
 
@@ -37,14 +37,14 @@ fi
 flatten_flag="--flatten-forms"
 [ -n "${AMATL_NO_FLATTEN:-}" ] && flatten_flag="--no-flatten-forms"
 
-echo "== amatl lossless (defaults) =="
+echo "== picamatl lossless (defaults) =="
 for f in "${files[@]}"; do
   name=$(basename "$f" .pdf)
   "$bin" -o "$out/lossless/$name.pdf" "$f" >/dev/null 2>&1
   echo "  $name: $?"
 done
 
-echo "== amatl lossy (no form flattening) =="
+echo "== picamatl lossy (no form flattening) =="
 for f in "${files[@]}"; do
   name=$(basename "$f" .pdf)
   "$bin" --allow-lossy --strip-metadata --strip-private-data --convert-type1 \
@@ -53,7 +53,7 @@ for f in "${files[@]}"; do
   echo "  $name: $?"
 done
 
-echo "== amatl kitchen sink ($flatten_flag) =="
+echo "== picamatl kitchen sink ($flatten_flag) =="
 for f in "${files[@]}"; do
   name=$(basename "$f" .pdf)
   "$bin" --allow-lossy --strip-accessibility --strip-metadata --strip-private-data \
@@ -120,7 +120,7 @@ def fmt(label, path, i):
         return f"  {label}: FAILED (no output)"
 
 totals = {}
-wins = {"amatl": 0, "gs": 0}
+wins = {"picamatl": 0, "gs": 0}
 for f in files:
     i = os.path.getsize(f)
     name = os.path.splitext(os.path.basename(f))[0]
@@ -156,5 +156,5 @@ print("TOTALS:")
 for sub in ("lossless", "lossy", "kitchen", "gs", "gs-custom"):
     if sub in totals:
         print(f"  {sub}: {kb(totals[sub])} ({100*totals[sub]/ti:.1f}%)")
-print(f"  head-to-head (kitchen vs gs): AMATL {wins['amatl']}, gs {wins['gs']}")
+print(f"  head-to-head (kitchen vs gs): AMATL {wins['picamatl']}, gs {wins['gs']}")
 PYEOF

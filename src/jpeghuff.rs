@@ -1786,7 +1786,7 @@ mod tests {
     }
 
     /// Corpus harness: point `AMATL_JPEG_DIR` at a directory of raw JPEG
-    /// streams (e.g. every `/DCTDecode` payload extracted from amatl's own
+    /// streams (e.g. every `/DCTDecode` payload extracted from picamatl's own
     /// output) and this reports the aggregate saving and, when `jpegtran` is
     /// on PATH, how the rebuilt stream compares to it. Ignored by default —
     /// it needs an external corpus.

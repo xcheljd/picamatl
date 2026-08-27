@@ -6,7 +6,7 @@ Corpus sizes: adobe-spec 22,491,828 · arxiv-attention 2,233,053 · irs-1040gi 4
 
 ## Font audit (pdffonts + pikepdf stream hashing)
 
-amatl src has NO CFF-subsetting of already-CFF (/Type1C) input fonts (grep 'cff' → only Type1→Type1C conversion + CIDFontType0 note "requires show-string rewriting — C-M2/M3"). All corpus CFF embeds are producer-subsetted already, so CFF re-subsetting headroom is small.
+picamatl src has NO CFF-subsetting of already-CFF (/Type1C) input fonts (grep 'cff' → only Type1→Type1C conversion + CIDFontType0 note "requires show-string rewriting — C-M2/M3"). All corpus CFF embeds are producer-subsetted already, so CFF re-subsetting headroom is small.
 
 Byte-exact duplicate font programs: ZERO in all 4 files (sha256 over decoded stream). Exact-dup dedup table = dead end.
 
@@ -60,7 +60,7 @@ Confirmed dead ends this round: gray-in-RGB conversion (0 B), adobe indexed repa
 
 # Implementation pass (same round, output-side measurements)
 
-Everything below measures **amatl's output**, not the input, using
+Everything below measures **picamatl's output**, not the input, using
 `scripts/h2_*.py` (bench, byte census, TTF table dump, TTF near-dup diff, CFF
 dup, depth-reduction repack, family-merge headroom, verify harness). Gates for
 every lossless claim: `pdftoppm` sha256 render-identity, pass-2 idempotence,
@@ -83,13 +83,13 @@ audit and turned out to be the single largest addressable item in the corpus.
 ### 1. `name`-table subset-tag masking → duplicate TT subsets dedup (2eca424)
 
 The "arxiv ArialMT ×5" group above does **not** need union subsetting to
-collapse most of the way. After amatl's own subsetting, those programs are
+collapse most of the way. After picamatl's own subsetting, those programs are
 byte-identical **except** the six-letter `ABCDEF+` tag inside the `name` table
 and `head.checkSumAdjustment` (which the tag perturbs) — glyf/loca/cmap/hmtx
 match exactly (`scripts/h2_ttf_diff.py`). Masking the tags to `AAAAAA` and
 repairing both checksums makes them byte-equal, so the existing stream dedup
 shares one program. The subset tag a viewer reads comes from `/BaseFont`,
-which amatl already rewrites from a content hash.
+which picamatl already rewrites from a content hash.
 
 arxiv-attention 1,553,042 → **1,475,800** (−77,242, −5.0%): 4 of 5 Arial-Bold
 embeds and 3 of 5 ArialMT collapsed. irs −26, nist −53, adobe +1.
@@ -125,7 +125,7 @@ provenance and breaks PDF/A and PDF/UA identification, hence opt-in beside
   8,259 B (0.19%), adobe 0, arxiv 0; exact CFF dups 0. Does not pay.
 - **Lossless bit-depth reduction on the output** (`scripts/h2_depth.py`, real
   repack + re-deflate): nist **1,700 B (0.3%)**, adobe 117 B, arxiv/irs 0.
-  (The input-side estimate of 3,797 B above shrinks once amatl's own
+  (The input-side estimate of 3,797 B above shrinks once picamatl's own
   downsampling has already run.) `/DeviceGray` images on an n-bit ladder:
   none. Confirms the image-census verdict with post-pipeline numbers.
 - **Form-XObject dedup beyond exact:** arxiv has 2,513 form XObjects (median

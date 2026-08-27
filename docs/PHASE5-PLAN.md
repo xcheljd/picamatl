@@ -6,7 +6,7 @@ Baseline evidence: NASA TM-20210010291 (16,804,107 B) head-to-head vs Ghostscrip
 
 ## Measured problem
 
-amatl 0.2.1 (strip, no packing): 11,511,039 B (68%).
+picamatl 0.2.1 (strip, no packing): 11,511,039 B (68%).
 Ghostscript pdfwrite (mirrored 130dpi/q~0.4): 3,722,562 B (22%).
 
 Payload census of the ORIGINAL nasa.pdf:
@@ -77,7 +77,7 @@ or not at all. Combined 5% minimum-savings guard; decode-back on both sides
 (exact for the lossless mask). Shared-mask fail-safe: a mask referenced by
 more than one image is never resized (dedup merges byte-identical masks before
 planning, making sharing reachable in practice — NASA page-33 repro). Measured
-on the reference corpus: amatl 11.51 MB (D-M1) → 6.03 MB vs Ghostscript's
+on the reference corpus: picamatl 11.51 MB (D-M1) → 6.03 MB vs Ghostscript's
 3.72 MB; idempotent across repeated passes.
 
 ## D-M2 — SMask-coupled downsampling (the big one)
@@ -103,7 +103,7 @@ noted in CHANGELOG.
 
 Estimated effect on NASA corpus: masked JPEGs are scan-like photos at 200-300
 ppi; downsampling to 130 dpi ≈ 2.3x linear reduction ≈ ~5x area. Expect the
-9.16 MB masked-JPEG class to fall to roughly 1.5-2.5 MB. amatl total lands
+9.16 MB masked-JPEG class to fall to roughly 1.5-2.5 MB. picamatl total lands
 around 4-6 MB vs gs 3.7 MB — competitive band reached.
 
 ## D-M3 — Flate masked-image handling
@@ -125,7 +125,7 @@ never-larger/5% guard uses the exact D-M2 arithmetic (incl.
 rules carry over; the pair honors `downsample_flate_images`. Under-resolution
 pairs are untouched — no requantization analogue exists for lossless payloads
 without a lossy re-encode consent surface. Measured on the reference corpus:
-amatl 6.03 MB (D-M2) → 5,547,684 B (5.55 MB, 33.0% of the 16,804,107 B
+picamatl 6.03 MB (D-M2) → 5,547,684 B (5.55 MB, 33.0% of the 16,804,107 B
 original) vs Ghostscript's 3.72 MB; byte-stable on a second pass.
 
 ## D-M4 — Indexed/palette and low-bpc images (stretch)
@@ -137,7 +137,7 @@ color science, do only after D-M1..3 land and re-measure.
 **D-M4 CLOSED WITHOUT IMPLEMENTATION** (2026-08-22 re-measurement): the plan's
 own gate ("do only after D-M1..3 land and re-measure") was applied and the
 measured pool is empty. Census of every real corpus on hand — the 16.8 MB NASA
-report (original AND amatl-optimized), both watch-repair one-pagers, the amatl
+report (original AND picamatl-optimized), both watch-repair one-pagers, the picamatl
 fixture, and Ghostscript's own outputs — found ZERO `/Indexed` images and
 zero non-8-bit-per-component images. The palette images seen in earlier
 `pdfimages -list` output were Ghostscript's *output* conversions (26 gray→
@@ -146,7 +146,7 @@ resampling for a class that does not occur in any observed document would be
 unmeasured complexity; if a palette-heavy corpus ever shows up, reopen with
 that corpus as the benchmark.
 
-Where the remaining gap to Ghostscript actually lives (amatl 5.55 MB output
+Where the remaining gap to Ghostscript actually lives (picamatl 5.55 MB output
 census): FlateDecode images 2.54 MB (122 streams, already at 130 DPI,
 lossless-by-contract) + JPEG 2.12 MB + fonts/structure 0.64 MB. GS's edge is
 its conversion of lossless image payloads to JPEG — exactly the consent-gated
@@ -164,7 +164,7 @@ its conversion of lossless image payloads to JPEG — exactly the consent-gated
 
 ## Phase 6 addendum — requantization reach extensions (2026-08-22)
 
-Byte-census probes on amatl's own NASA output found two classes of
+Byte-census probes on picamatl's own NASA output found two classes of
 scanner-quality JPEG that the Phase 5 pipeline never reached. Both fixes are
 dimension-preserving requantizations — the same transform D-M1 established,
 with the same 5% minimum-savings guard, decode-back verification, and
@@ -184,7 +184,7 @@ or below the DPI threshold were previously left at scanner quality forever;
 they now take the same dimension-preserving requantization. FlateDecode bases
 remain excluded (lossless contract), bitonal remains owned by the G4 pass.
 
-Measured: amatl 5,547,684 B (D-M3) → 4,958,148 B on the reference corpus
+Measured: picamatl 5,547,684 B (D-M3) → 4,958,148 B on the reference corpus
 (70.5% of the 16,804,107 B original) vs Ghostscript's 3,722,562 B — gap now
 1.33×. Byte-stable on second pass; all 74 mask/base pairs dimensionally
 aligned; renders clean in Ghostscript.

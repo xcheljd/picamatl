@@ -1,9 +1,9 @@
 #!/bin/sh
 # hunt5: regenerate the corpus outputs under target/scratch/h5 and print the
 # size delta against the round-4 baseline in target/scratch/h4.
-# Usage: scripts/h5_run.sh [amatl flags...]
+# Usage: scripts/h5_run.sh [picamatl flags...]
 set -e
-BIN=./target/release/amatl
+BIN=./target/release/picamatl
 OUT=target/scratch/h5
 SUF="${SUF:-def}"
 mkdir -p "$OUT"

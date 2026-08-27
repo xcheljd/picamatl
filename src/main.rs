@@ -1,4 +1,4 @@
-//! The `amatl` CLI: a thin binary over [`amatl::optimize_with_options`].
+//! The `picamatl` CLI: a thin binary over [`picamatl::optimize_with_options`].
 //!
 //! Every optimization default is taken from [`OptimizeOptions::default()`] at
 //! runtime — the CLI never hardcodes a tunable value that could drift from
@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Instant;
 
-use amatl::{DeflateBackend, OptimizeOptions};
+use picamatl::{DeflateBackend, OptimizeOptions};
 use clap::Parser;
 
 /// How far into the file to look for `%PDF-`. The PDF spec's implementation
@@ -55,7 +55,7 @@ fn defaults_blurb() -> String {
 
 #[derive(Parser)]
 #[command(
-    name = "amatl",
+    name = "picamatl",
     version,
     about = "Pure-Rust PDF size optimizer: CTM-aware effective-DPI downsampling \
              with a hard fail-safe contract (never larger, never corrupt)",
@@ -197,7 +197,7 @@ struct Cli {
     deflate_backend: Option<DeflateBackendArg>,
 }
 
-/// CLI mirror of [`amatl::DeflateBackend`] so the library type stays free of
+/// CLI mirror of [`picamatl::DeflateBackend`] so the library type stays free of
 /// clap derives. `None` (flag absent) keeps the library default.
 #[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 enum DeflateBackendArg {
@@ -329,7 +329,7 @@ fn run(cli: &Cli) -> Result<(), String> {
     // returns the input bytes unchanged, so the only failures the CLI can see
     // are I/O.
     let started = Instant::now();
-    let optimized = amatl::optimize_with_options(&input, options_from(cli));
+    let optimized = picamatl::optimize_with_options(&input, options_from(cli));
     let secs = started.elapsed().as_secs_f64();
 
     std::fs::write(&output_path, &optimized)

@@ -3,7 +3,7 @@
 **Status: DRAFT ONLY. Not published.** Target repo: `J-F-Liu/lopdf`
 (confirm against the crate's own `Cargo.toml` `repository` field before
 filing, as with `docs/upstream-lopdf-u16.md`). Observed on `lopdf 0.44.0`,
-the version amatl pins.
+the version picamatl pins.
 
 ---
 
@@ -59,7 +59,7 @@ doc.save("out.pdf")?;
 // out.pdf now says MediaBox 595.92 x 841.92; render both and diff.
 ```
 
-Confirmed as the *sole* cause in amatl's corpus by restoring only the
+Confirmed as the *sole* cause in picamatl's corpus by restoring only the
 `/MediaBox` literals in the output and re-rendering: 27 of 28 differing
 pages and 8 of 10 on a second file both drop to **0**, at 100 and 150
 dpi. Across 11 corpus documents / 267 pages, the two files whose
@@ -67,7 +67,7 @@ dpi. Across 11 corpus documents / 267 pages, the two files whose
 two files that render differently. No other object needed touching.
 
 `/MediaBox` is not the bulk of it, only the visible part. A census of
-every real literal in amatl's 16-file corpus — counting the ones whose
+every real literal in picamatl's 16-file corpus — counting the ones whose
 value changes across an `f32` round trip — puts page boxes eighth by
 frequency:
 
@@ -115,7 +115,7 @@ The information is destroyed at parse time, so there is no fix available
 are gone, and no `Object` variant can hold `841.91998` to put them back.
 
 A caller that still has the input bytes can work around it outside the
-model, which is what amatl now does (`src/reals.rs`): read the literals
+model, which is what picamatl now does (`src/reals.rs`): read the literals
 from the raw input before the parse, and splice them back into the saved
 file afterwards, keyed by the `f32` bit pattern lopdf will hold. That
 means reaching through the deflated `ObjStm` payload the page
@@ -124,16 +124,16 @@ dictionaries are packed into — rewriting its offset header, `/First` and
 It works, and it is a lot of machinery to carry for a one-word change to
 an enum.
 
-### Why amatl cares
+### Why picamatl cares
 
-amatl's contract is that a lossless run renders identically to its input.
+picamatl's contract is that a lossless run renders identically to its input.
 It already defends the *content stream* side of this exact hazard — see
 `content_number_values` and `replan_content` in `src/lib.rs`, which splice
 the original numeric literals back into re-emitted content streams
 specifically because "lopdf holds operands as f32, so its re-emit can
 print a shorter decimal that maps to the same f32 but a different f64."
-That defence cannot extend to object dictionaries, where amatl never sees
+That defence cannot extend to object dictionaries, where picamatl never sees
 the original bytes.
 
-Until this is fixed upstream, amatl carries `src/reals.rs` to undo it.
+Until this is fixed upstream, picamatl carries `src/reals.rs` to undo it.
 `docs/FORMS-PLAN.md` records which corpus files are affected.

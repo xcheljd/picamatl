@@ -19,7 +19,7 @@ fixture **by default** (not opt-in): measured runtime is ~0.1 s in a debug
 build, cheap enough to keep in every `cargo test` run. Override the input with
 `AMATL_TEST_PDF=/path/to/other.pdf`; `AMATL_TEST_PACK=1` opts into
 object-stream packing and `AMATL_TEST_OUT=/path` saves the optimized output.
-`scripts/bench-vs-gs.sh` benchmarks amatl against Ghostscript using the same
+`scripts/bench-vs-gs.sh` benchmarks picamatl against Ghostscript using the same
 harness.
 
 `forms/` holds four synthetic one-page AcroForm fixtures for the

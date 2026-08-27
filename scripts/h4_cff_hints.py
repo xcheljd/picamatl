@@ -2,7 +2,7 @@
 """hunt4 item 12: what would an opt-in *CFF* hint strip (the Type1C analogue of
 --strip-hinting) recover, on top of what already ships?
 
-For every /FontFile3 /Type1C program in an amatl output: re-encode each
+For every /FontFile3 /Type1C program in an picamatl output: re-encode each
 charstring from its outline with no hint operators (h/vstem, hintmask,
 cntrmask, hstemhm, vstemhm), drop the Private DICT hint keys (BlueValues,
 StdHW, StemSnap*, ...) and all subrs, then measure the zlib-9 stream size

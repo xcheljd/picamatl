@@ -4,7 +4,7 @@ Continues `docs/hunts/hunt2-notes.md` / `hunt3-notes.md`. This round ships **no 
 it re-measures the twelve items previously rejected or deferred and says, with
 numbers, which rejections hold. Two of them do not.
 
-All measurements are taken on **amatl's own output** (`target/scratch/h4/`,
+All measurements are taken on **picamatl's own output** (`target/scratch/h4/`,
 regenerated at HEAD; the default numbers reproduce the HUNT3 table exactly),
 never on the inputs. Probe scripts are committed as `scripts/h4_*.py`.
 
@@ -43,9 +43,9 @@ decoded pixels on all 200 streams. The split:
 Marker dropping (`-copy none`) adds only **16 B** on top — this is Huffman
 coding, not metadata.
 
-Why round 1 saw 242 B: it measured streams amatl had **re-encoded**, where
+Why round 1 saw 242 B: it measured streams picamatl had **re-encoded**, where
 mozjpeg already emits optimised tables (hence NASA's near-zero). The headroom
-lives entirely in JPEGs amatl **passes through untouched** — above all irs's two
+lives entirely in JPEGs picamatl **passes through untouched** — above all irs's two
 DeviceCMYK / Separation images (1.58 MB, 38% of that file's output), which the
 image path skips because they are not RGB or gray. Those two streams alone are
 1.3% of the irs output.

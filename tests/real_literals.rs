@@ -15,7 +15,7 @@
 
 use std::process::Command;
 
-use amatl::{optimize_with_options, OptimizeOptions};
+use picamatl::{optimize_with_options, OptimizeOptions};
 
 /// Every lossy pass off, so a surviving pixel difference can only be geometry.
 fn lossless() -> OptimizeOptions {
@@ -69,7 +69,7 @@ fn render_pages(
 /// Both DPIs: a fractional offset can land on the pixel grid at one scale and
 /// off it at another.
 fn assert_renders_identically(tool: &str, label: &str, input: &[u8], output: &[u8]) {
-    let dir = std::env::temp_dir().join(format!("amatl-reals-{}-{label}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("picamatl-reals-{}-{label}", std::process::id()));
     let (before, after) = (dir.join("before"), dir.join("after"));
     std::fs::create_dir_all(&before).unwrap();
     std::fs::create_dir_all(&after).unwrap();

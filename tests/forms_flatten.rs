@@ -14,7 +14,7 @@
 use std::collections::HashSet;
 use std::process::Command;
 
-use amatl::{optimize_with_options, OptimizeOptions};
+use picamatl::{optimize_with_options, OptimizeOptions};
 use lopdf::content::{Content, Operation};
 use lopdf::{dictionary, Dictionary, Document, Object, ObjectId, Stream, StringFormat};
 
@@ -801,7 +801,7 @@ fn declines_need_appearances_over_a_filled_form() {
 
 #[test]
 fn declines_a_dynamic_xfa_form() {
-    // D3 — the pages are a placeholder; amatl does not render XFA.
+    // D3 — the pages are a placeholder; picamatl does not render XFA.
     assert_declines(
         &Fixture {
             needs_rendering: true,
@@ -931,7 +931,7 @@ fn flatten_render_is_pixel_identical() {
         eprintln!("skipping: `gs` not on PATH");
         return;
     };
-    let dir = std::env::temp_dir().join(format!("amatl-forms-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("picamatl-forms-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
 
     let input = flattenable();
@@ -1243,7 +1243,7 @@ fn render_pages(
 /// scale and off it at another, so a single-resolution check can pass straight
 /// over a real geometry change.
 fn assert_flatten_moves_no_subpixel(tool: &str, label: &str, input: &[u8], flattened: &[u8]) {
-    let dir = std::env::temp_dir().join(format!("amatl-render-{}-{label}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("picamatl-render-{}-{label}", std::process::id()));
     let (before, after) = (dir.join("before"), dir.join("after"));
     std::fs::create_dir_all(&before).unwrap();
     std::fs::create_dir_all(&after).unwrap();

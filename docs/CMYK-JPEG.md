@@ -32,7 +32,7 @@ original render:
 | this branch | 0.188 | 30 | 0 (0.00%) |
 
 The damage is confined to exactly the image bounding box, `(27, 28)-(227, 178)`
-— the 200×150 CMYK image. The README's claim that "amatl's conservative CMYK
+— the 200×150 CMYK image. The README's claim that "picamatl's conservative CMYK
 fallback path declines it" was wrong; it re-encoded it, and the smaller number
 main reported for this file was bought with a corrupt page. That number moves
 from 76.7% to 78.2% on this branch, which is the honest one.
@@ -54,7 +54,7 @@ Everything works in **raw stored-sample space** and never interprets it.
   the marker and the pixel transform cannot disagree — which is precisely the
   mechanism that produces channel-swapped CMYK JPEGs.
 
-**amatl never parses APP14 and never inverts a channel.** The "is it
+**picamatl never parses APP14 and never inverts a channel.** The "is it
 inverted?" question — Adobe writes CMYK JPEGs with `255-x` samples, most other
 producers do not — is a property of the sample values, and those pass through
 unchanged. Whatever convention the input used, the output uses the same one, so
@@ -159,7 +159,7 @@ idempotent like the rest of the pipeline.
 
 All well inside ordinary q78 requantization noise, and the two independent CMYK
 decoders agree to the byte on sample polarity (MAD 0.000 between them), which
-is what rules out an inversion that both amatl and one decoder share.
+is what rules out an inversion that both picamatl and one decoder share.
 
 ## Fixtures
 
@@ -183,7 +183,7 @@ cargo run --release --example gen_cmyk_ycck -- \
 
 No YCCK encoder is available in this tree's Python or ImageMagick tooling
 (this ImageMagick build does not accept `-colorspace YCCK`), so `cmyk_ycck.jpg`
-is generated here. It is not simply "whatever amatl emits": the generator calls
+is generated here. It is not simply "whatever picamatl emits": the generator calls
 libjpeg directly rather than reusing the library's private helpers, and the
 result is validated against Pillow, ImageMagick and `djpeg` above.
 

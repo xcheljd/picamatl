@@ -1034,7 +1034,7 @@ mod tests {
     }
 
     /// Real-corpus harness: point `AMATL_CFF_DIR` at a directory of raw
-    /// `Type1C` programs (every `/FontFile3` payload extracted from amatl's
+    /// `Type1C` programs (every `/FontFile3` payload extracted from picamatl's
     /// own output) and this strips each one, re-verifying every glyph's
     /// outline and advance from the *emitted* bytes and reporting the size
     /// delta. Ignored by default — it needs an external corpus, and the fonts

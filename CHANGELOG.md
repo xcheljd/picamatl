@@ -32,10 +32,10 @@ pipeline in full.
   value is provably preserved — including dynamic XFA (`/NeedsRendering true`)
   and any value with no appearance to burn. On the IRS W-2: 1,392,531 → 250,229 B
   with all 11 pages pixel-identical; flips the file from a GS "win" to an
-  amatl win.
+  picamatl win.
 - **`--strip-private-data`** (opt-in). Removes every `/PieceInfo` page-piece
   dictionary (Illustrator/InDesign keep editable copies there). On
-  `cmyk-jpeg.pdf`: 261,453 B — 96% of amatl's output — removed, pixel-identical.
+  `cmyk-jpeg.pdf`: 261,453 B — 96% of picamatl's output — removed, pixel-identical.
 - **`--strip-metadata`** (opt-in). Drops every `/Metadata` (XMP) packet;
   breaks PDF/A and PDF/UA identification. adobe-spec: 134 packets, 860 KB.
 - **`--strip-hinting`** (opt-in). Now covers Type1C (CFF) programs too, not
@@ -71,7 +71,7 @@ pipeline in full.
   same level 9; a `--deflate-backend zopfli` option adds an exhaustive-search
   pass for the final re-deflate + xref (≈30× CPU for ~1% more).
 - **The signature guard on the entropy-level passes is gone.** It protected
-  nothing (amatl re-serializes the whole doc, so `/ByteRange` digests were
+  nothing (picamatl re-serializes the whole doc, so `/ByteRange` digests were
   already invalid); removing it is worth ~507 KB on the Reader-extended IRS
   form. README now states plainly: optimizing a signed PDF invalidates its
   signature.

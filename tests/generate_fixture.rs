@@ -9,13 +9,13 @@
 //!
 //! Shape (chosen to exercise both optimizer paths):
 //! - Page 1 embeds an 800x800 deterministic-pattern JPEG drawn into a 144pt
-//!   box → effective ~400 DPI, well over the 130 DPI x 1.15 margin, so amatl
+//!   box → effective ~400 DPI, well over the 130 DPI x 1.15 margin, so picamatl
 //!   downsamples and re-encodes it.
 //! - Page 2 embeds a 200x200 JPEG drawn into a 150pt box → effective ~96 DPI,
-//!   under the target, so amatl must leave it untouched.
+//!   under the target, so picamatl must leave it untouched.
 //! - Page 3 embeds a 400x400 FlateDecode RGB image (PNG Up-predictor rows,
 //!   `/DecodeParms /Predictor 15`) drawn into a 72pt box → effective ~400
-//!   DPI, so amatl's Flate path downsamples it in place.
+//!   DPI, so picamatl's Flate path downsamples it in place.
 //! - Page 4 embeds a 150x150 FlateDecode image drawn into a 150pt box →
 //!   effective ~72 DPI, under the target, so it must stay untouched.
 
@@ -72,7 +72,7 @@ fn noisy_pixels(width: u32, height: u32) -> Vec<u8> {
 /// Deflate `raw` (level 9) as PNG Up-predictor-filtered rows via lopdf's
 /// `filters::png::encode_row`, returning the stream payload for a
 /// `/DecodeParms << /Predictor 15 /Colors 3 /BitsPerComponent 8 /Columns w >>`
-/// image — this exercises amatl's predictor decode path end to end.
+/// image — this exercises picamatl's predictor decode path end to end.
 fn flate_up_payload(raw: &[u8], width: u32) -> Vec<u8> {
     let bpr = width as usize * 3;
     let mut filtered = Vec::with_capacity(raw.len() + raw.len() / bpr);

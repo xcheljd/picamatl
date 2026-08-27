@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# bench-vs-gs.sh — compare amatl's output size against Ghostscript pdfwrite on
+# bench-vs-gs.sh — compare picamatl's output size against Ghostscript pdfwrite on
 # the same input PDF.
 #
 # Usage:
@@ -8,12 +8,12 @@
 # Defaults to the committed fixture fixtures/sample.pdf. Requires
 # `gs` (Ghostscript) and a working Rust toolchain.
 #
-# How it drives amatl: the library's real-file test harness. Setting
+# How it drives picamatl: the library's real-file test harness. Setting
 # AMATL_TEST_PDF makes `real_file_shrinks_when_present` optimize that file with
 # a size-focused configuration (strip_accessibility=true, packing off unless
 # AMATL_TEST_PACK=1) and AMATL_TEST_OUT saves the optimized bytes.
 #
-# What "equivalent settings" means: amatl's defaults downsample images whose
+# What "equivalent settings" means: picamatl's defaults downsample images whose
 # effective on-page DPI exceeds 130 x 1.15 down to 130 DPI and re-encode as
 # JPEG at libjpeg quality 78. The gs invocation mirrors that: DCTEncode with
 # 130 DPI image resolution, a 1.15 downsample threshold, and QFactor 0.4
@@ -29,14 +29,14 @@
 #
 # Measured baseline (2026-08-21, 4-page fixtures/sample.pdf with Flate pages):
 #   input:  662107 bytes
-#   amatl:  117459 bytes (18% of input; re-measured 2026-08-25 — zlib-rs
+#   picamatl:  117459 bytes (18% of input; re-measured 2026-08-25 — zlib-rs
 #            deflate + default font subsetting improved on the 123948 B of
 #            2026-08-21)
 #   gs:      71742 bytes (11% of input; gs 10.07.1 — its forced DCTEncode
-#            converts the Flate noise pages to JPEG, which amatl refuses by
+#            converts the Flate noise pages to JPEG, which picamatl refuses by
 #            design, so the gap overstates typical documents)
 #
-# Previous 2-page JPEG-only fixture (gs 10.07.1): 193668 -> amatl 27087 (13%),
+# Previous 2-page JPEG-only fixture (gs 10.07.1): 193668 -> picamatl 27087 (13%),
 # gs 43722 (22%).
 set -euo pipefail
 
@@ -45,10 +45,10 @@ in="${1:-$repo_root/fixtures/sample.pdf}"
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
-amatl_out="$tmp/amatl.pdf"
+amatl_out="$tmp/picamatl.pdf"
 gs_out="$tmp/gs.pdf"
 
-echo "== amatl (via real-file test harness) =="
+echo "== picamatl (via real-file test harness) =="
 AMATL_TEST_PDF="$in" AMATL_TEST_OUT="$amatl_out" \
     cargo test --manifest-path "$repo_root/Cargo.toml" \
     --lib real_file_shrinks_when_present -- --nocapture
@@ -72,5 +72,5 @@ gs_size=$(stat -c %s "$gs_out")
 echo
 echo "== results =="
 printf 'input:  %8d bytes  %s\n' "$in_size" "$in"
-printf 'amatl:  %8d bytes  (%d%% of input)\n' "$amatl_size" $((amatl_size * 100 / in_size))
+printf 'picamatl:  %8d bytes  (%d%% of input)\n' "$amatl_size" $((amatl_size * 100 / in_size))
 printf 'gs:     %8d bytes  (%d%% of input)\n' "$gs_size" $((gs_size * 100 / in_size))

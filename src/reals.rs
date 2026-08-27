@@ -886,7 +886,7 @@ mod tests {
         let mut doc = lopdf::Document::with_version("1.5");
         let pages_id = doc.new_object_id();
         // Two pages carrying byte-identical content streams, so the document
-        // has real work for amatl to do: without a win it hands the input
+        // has real work for picamatl to do: without a win it hands the input
         // straight back and there is nothing to restore into.
         let body = b"BT /F1 12 Tf 72 720 Td (hello) Tj ET\n".repeat(200);
         let kids: Vec<Object> = (0..2)

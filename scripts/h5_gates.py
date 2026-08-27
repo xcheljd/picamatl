@@ -82,10 +82,10 @@ with tempfile.TemporaryDirectory() as td:
             print("  (install Pillow for a magnitude report)")
     print(f"pdftotext identical = {text(ref) == text(new)}")
 
-    # Second pass: running amatl again must not change the bytes.
+    # Second pass: running picamatl again must not change the bytes.
     p2 = os.path.join(td, "pass2.pdf")
     subprocess.run(
-        ["./target/release/amatl", *pass2_flags, new, "-o", p2],
+        ["./target/release/picamatl", *pass2_flags, new, "-o", p2],
         check=True,
         capture_output=True,
     )

@@ -1,7 +1,7 @@
 # Phase 3 Implementation Plan — More Image Filters & Font Subsetting
 
 Status: **planning document — no code yet.** Approved scope per
-`talaria/docs/amatl-roadmap.md` §7 ("More image filters" and "Font subsetting")
+`talaria/docs/picamatl-roadmap.md` §7 ("More image filters" and "Font subsetting")
 and its "Dependency philosophy — the two-axis rule" section.
 
 Every API name, crate version, and behavior claim below was verified on
@@ -689,7 +689,7 @@ tables for a shrinking legacy corpus). Decided-by is noted per item.
    compatibility is preserved, not reduced.
    *Decided: Xchel via delegation, 2026-08-22.*
 8. **Symbol-mode JBIG2: permanent public commitment against it** — add the
-   "amatl will never lossy-symbol-encode your scans" statement to the README
+   "picamatl will never lossy-symbol-encode your scans" statement to the README
    alongside the accessibility angle. Lens: never silently corrupting glyphs
    (the Xerox hazard) is itself a compatibility/trust differentiator vs
    less-careful pipelines.

@@ -1,10 +1,10 @@
 [package]
-name = "amatl"
+name = "picamatl"
 version = "0.4.0"
-description = "Pure-Rust PDF size optimizer: CTM-aware effective-DPI downsampling of embedded JPEG and Flate images, opt-in Type0 font subsetting, with a hard fail-safe contract"
+description = "Pure-Rust PDF size optimizer: CTM-aware effective-DPI downsampling of embedded JPEG and Flate images, opt-in Type0 font subsetting, with a hard fail-safe contract. No Ghostscript; everything stays on your machine."
 authors = ["Xchel Dominguez <xjdom2@gmail.com>"]
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/xcheljd/amatl"
+repository = "https://github.com/xcheljd/picamatl"
 readme = "README.md"
 keywords = ["pdf", "compression", "optimizer", "jpeg", "mozjpeg"]
 categories = ["compression", "multimedia::images"]
@@ -19,7 +19,7 @@ targets = ["x86_64-unknown-linux-gnu"]
 [dependencies]
 # Verified 2026-08-24: lopdf 0.44 compiles clean against time 0.3.55 (the old
 # FormatItem::StringLiteral break is gone), and with default-features off the
-# chrono/jiff/time datetime backends drop out of the tree entirely. amatl never
+# chrono/jiff/time datetime backends drop out of the tree entirely. picamatl never
 # parses PDF datetimes itself, and corpus outputs are byte-identical either way.
 lopdf = { version = "0.44", default-features = false }
 image = { version = "0.25", default-features = false, features = ["jpeg"] }
@@ -48,7 +48,7 @@ subsetter = { version = "0.2.6", default-features = false }
 # docs/PHASE3-PLAN.md §B.3: MIT, #![deny(unsafe_code)], rust-version 1.71,
 # zero transitive dependencies.
 fax = "0.3.0"
-# CLI argument parsing for the `amatl` binary only; the library does not
+# CLI argument parsing for the `picamatl` binary only; the library does not
 # depend on it. clap 4.6 declares rust-version 1.85, inside our 1.88 MSRV.
 clap = { version = "4.6.6", features = ["derive"] }
 # Pure-Rust JPEG 2000 (Part 1 + HTJ2K) decoder for the opt-in JPXDecode →
@@ -62,7 +62,7 @@ clap = { version = "4.6.6", features = ["derive"] }
 dicom-toolkit-jpeg2000 = "0.5.0"
 
 [[bin]]
-name = "amatl"
+name = "picamatl"
 path = "src/main.rs"
 
 [dev-dependencies]
