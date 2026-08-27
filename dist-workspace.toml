@@ -1,0 +1,26 @@
+[workspace]
+members = ["cargo:."]
+
+# Config for 'dist'
+[dist]
+# The preferred dist version to use in CI (Cargo.toml SemVer syntax)
+cargo-dist-version = "0.32.0"
+# CI backends to support
+ci = "github"
+# The installers to generate for each app
+installers = []
+# Target platforms to build apps for (Rust target-triple syntax)
+targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
+# Where to host releases
+hosting = "github"
+
+# Build dependencies: mozjpeg compiles libjpeg-turbo, which needs NASM on
+# x86_64 targets for the SIMD paths (aarch64 uses intrinsics, no NASM).
+[dist.dependencies.apt]
+nasm = { version = "*", targets = ["x86_64-unknown-linux-gnu"] }
+
+[dist.dependencies.homebrew]
+nasm = { version = "*", targets = ["x86_64-apple-darwin"] }
+
+[dist.dependencies.chocolatey]
+nasm = { version = "*", targets = ["x86_64-pc-windows-msvc"] }
