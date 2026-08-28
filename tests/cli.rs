@@ -122,8 +122,8 @@ fn output_dir_batch_processes_a_directory_into_new_files() {
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&in_dir).unwrap();
     // Two inputs: one shrinks, one is unchanged — batch must handle both.
-    std::fs::copy("corpus/dummy.pdf", in_dir.join("dummy.pdf")).unwrap();
-    std::fs::copy("corpus/nist-ssdf.pdf", in_dir.join("nist-ssdf.pdf")).unwrap();
+    std::fs::copy("fixtures/forms/filled-acroform.pdf", in_dir.join("dummy.pdf")).unwrap();
+    std::fs::copy("fixtures/sample.pdf", in_dir.join("nist-ssdf.pdf")).unwrap();
 
     let out = picamatl()
         .arg("--output-dir").arg(&out_dir)
@@ -146,7 +146,7 @@ fn suffix_writes_beside_the_input_and_leaves_the_input_alone() {
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp).unwrap();
     let input = tmp.join("doc.pdf");
-    std::fs::copy("corpus/dummy.pdf", &input).unwrap();
+    std::fs::copy("fixtures/forms/filled-acroform.pdf", &input).unwrap();
 
     let out = picamatl()
         .arg("--suffix=-small")
@@ -174,7 +174,7 @@ fn output_dir_and_suffix_combine() {
     let out_dir = tmp.join("out");
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&in_dir).unwrap();
-    std::fs::copy("corpus/dummy.pdf", in_dir.join("report.pdf")).unwrap();
+    std::fs::copy("fixtures/forms/filled-acroform.pdf", in_dir.join("report.pdf")).unwrap();
 
     let out = picamatl()
         .arg("--output-dir").arg(&out_dir)
@@ -194,7 +194,7 @@ fn batch_continues_past_a_bad_file_and_reports_failure() {
     let out_dir = tmp.join("out");
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&in_dir).unwrap();
-    std::fs::copy("corpus/dummy.pdf", in_dir.join("good.pdf")).unwrap();
+    std::fs::copy("fixtures/forms/filled-acroform.pdf", in_dir.join("good.pdf")).unwrap();
     std::fs::write(in_dir.join("broken.pdf"), b"not a pdf at all").unwrap();
 
     let out = picamatl()
@@ -214,7 +214,7 @@ fn batch_continues_past_a_bad_file_and_reports_failure() {
 #[test]
 fn output_conflicts_with_suffix_and_output_dir() {
     let out = picamatl()
-        .arg("corpus/dummy.pdf")
+        .arg("fixtures/forms/filled-acroform.pdf")
         .arg("-o").arg("/tmp/never.pdf")
         .arg("--suffix=-x")
         .output()
@@ -230,8 +230,8 @@ fn multiple_inputs_with_single_file_output_flags_are_rejected() {
     let in_dir = tmp.join("in");
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&in_dir).unwrap();
-    std::fs::copy("corpus/dummy.pdf", in_dir.join("a.pdf")).unwrap();
-    std::fs::copy("corpus/dummy.pdf", in_dir.join("b.pdf")).unwrap();
+    std::fs::copy("fixtures/forms/filled-acroform.pdf", in_dir.join("a.pdf")).unwrap();
+    std::fs::copy("fixtures/forms/filled-acroform.pdf", in_dir.join("b.pdf")).unwrap();
 
     let out = picamatl()
         .arg(&in_dir)

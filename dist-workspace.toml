@@ -23,4 +23,4 @@ nasm = { version = "*", targets = ["x86_64-unknown-linux-gnu"] }
 nasm = { version = "*", targets = ["x86_64-apple-darwin"] }
 
 [dist.dependencies.chocolatey]
-nasm = { version = "*", targets = ["x86_64-pc-windows-msvc"] }
+nasm = { version = "2.16.01", targets = ["x86_64-pc-windows-msvc"] }
