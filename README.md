@@ -223,8 +223,17 @@ can be verified by exact decode-back comparison.
 picamatl ships as a library and a command-line binary:
 
 ```sh
-# Install from source (crates.io publishing is a later roadmap phase)
+## Install
+
+```bash
+# From crates.io (compiles locally; needs a Rust toolchain + NASM)
 cargo install picamatl
+```
+
+Prebuilt binaries for Linux/macOS/Windows, a `curl | sh` installer script,
+and Homebrew/AUR packages are planned — see
+[docs/ROADMAP.md](docs/ROADMAP.md) Phase 0 for the current distribution
+status.
 
 # Optimize with accessibility-preserving defaults; writes sample.optimized.pdf
 picamatl report.pdf
