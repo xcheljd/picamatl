@@ -62,16 +62,29 @@ fn defaults_blurb() -> String {
     after_help = defaults_blurb(),
 )]
 struct Cli {
-    /// Input PDF file
+    /// Input PDF file(s): one path, a glob pattern (quoted, e.g.
+    /// "reports/*.pdf"), or a directory (all *.pdf inside, non-recursive)
+    #[arg(value_name = "INPUT")]
     input: PathBuf,
 
-    /// Output path [default: <input>.optimized.pdf]
-    #[arg(short, long, value_name = "PATH")]
+    /// Output path (single-file input only) [default: <input>.optimized.pdf]
+    #[arg(short, long, value_name = "PATH", conflicts_with_all = ["output_dir", "suffix"])]
     output: Option<PathBuf>,
 
-    /// With no --output, overwrite the input file in place
-    #[arg(long)]
+    /// With no --output, overwrite the input file in place (single-file input
+    /// only)
+    #[arg(long, conflicts_with_all = ["output_dir", "suffix"])]
     force: bool,
+
+    /// Batch mode: write each output into this directory, same file name
+    #[arg(long, value_name = "DIR")]
+    output_dir: Option<PathBuf>,
+
+    /// Batch/rename mode: append this suffix to the stem, e.g. --suffix
+    /// "-small" turns report.pdf into report-small.pdf (written beside the
+    /// input unless --output-dir is also given)
+    #[arg(long, value_name = "SUFFIX")]
+    suffix: Option<String>,
 
     /// Target resolution (DPI) for over-resolution images; <= 0 disables
     /// downsampling
@@ -298,30 +311,86 @@ fn options_from(cli: &Cli) -> OptimizeOptions {
         )
 }
 
-fn run(cli: &Cli) -> Result<(), String> {
-    let shown_in = cli.input.display();
-    let input = std::fs::read(&cli.input).map_err(|e| format!("cannot read {shown_in}: {e}"))?;
+/// Expand the input argument into the list of PDFs to process. A directory
+/// yields its non-recursive *.pdf entries (sorted); a literal path is used
+/// as-is even if it does not exist yet (the read error will name it).
+fn collect_inputs(input: &std::path::Path) -> Vec<PathBuf> {
+    if input.is_dir() {
+        let mut pdfs: Vec<PathBuf> = std::fs::read_dir(input)
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.is_file()
+                    && path
+                        .extension()
+                        .is_some_and(|ext| ext.eq_ignore_ascii_case("pdf"))
+            })
+            .collect();
+        pdfs.sort();
+        return pdfs;
+    }
+    vec![input.to_path_buf()]
+}
 
-    let head = &input[..input.len().min(HEADER_SCAN_LIMIT)];
+/// Resolve one input's output path under the flag combination. The
+/// single-file `-o`/`--force` forms keep their historical meaning; the batch
+/// forms (--output-dir / --suffix) compute `<dir?>/<stem><suffix>.pdf`.
+fn resolve_output(
+    input: &std::path::Path,
+    cli: &Cli,
+) -> Result<(PathBuf, bool), String> {
+    if let Some(dir) = &cli.output_dir {
+        let stem = input
+            .file_stem()
+            .ok_or_else(|| format!("{} has no file name", input.display()))?;
+        let suffix = cli.suffix.as_deref().unwrap_or("");
+        let mut name = stem.to_os_string();
+        name.push(suffix);
+        name.push(".pdf");
+        std::fs::create_dir_all(dir)
+            .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+        return Ok((dir.join(name), false));
+    }
+    if let Some(suffix) = &cli.suffix {
+        let stem = input
+            .file_stem()
+            .ok_or_else(|| format!("{} has no file name", input.display()))?;
+        let mut name = stem.to_os_string();
+        name.push(suffix.as_str());
+        name.push(".pdf");
+        let parent = input.parent().unwrap_or(std::path::Path::new("."));
+        return Ok((parent.join(name), false));
+    }
+    match (&cli.output, cli.force) {
+        (Some(path), _) => Ok((path.clone(), false)),
+        (None, true) => Ok((input.to_path_buf(), false)),
+        (None, false) => Ok((input.with_extension("optimized.pdf"), true)),
+    }
+}
+
+fn optimize_one(input: &std::path::Path, cli: &Cli) -> Result<(), String> {
+    let shown_in = input.display();
+    let bytes = std::fs::read(input).map_err(|e| format!("cannot read {shown_in}: {e}"))?;
+
+    let head = &bytes[..bytes.len().min(HEADER_SCAN_LIMIT)];
     if !head.windows(b"%PDF-".len()).any(|w| w == b"%PDF-") {
         return Err(format!(
             "{shown_in} is not a PDF (no %PDF- header in the first 1 KiB)"
         ));
     }
 
-    let (output_path, defaulted) = match (&cli.output, cli.force) {
-        (Some(path), _) => (path.clone(), false),
-        (None, true) => (cli.input.clone(), false),
-        (None, false) => (cli.input.with_extension("optimized.pdf"), true),
-    };
-    if output_path == cli.input && !cli.force {
+    let (output_path, defaulted) = resolve_output(input, cli)?;
+    if output_path == input && !cli.force {
         return Err(format!("refusing to overwrite {shown_in} without --force"));
     }
     let shown_out = output_path.display();
     if defaulted {
         eprintln!(
             "no --output given: writing to {shown_out} \
-             (use -o to choose a path, or --force to overwrite the input)"
+             (use -o to choose a path, --output-dir/--suffix for batches, \
+             or --force to overwrite the input)"
         );
     }
 
@@ -329,13 +398,13 @@ fn run(cli: &Cli) -> Result<(), String> {
     // returns the input bytes unchanged, so the only failures the CLI can see
     // are I/O.
     let started = Instant::now();
-    let optimized = picamatl::optimize_with_options(&input, options_from(cli));
+    let optimized = picamatl::optimize_with_options(&bytes, options_from(cli));
     let secs = started.elapsed().as_secs_f64();
 
     std::fs::write(&output_path, &optimized)
         .map_err(|e| format!("cannot write {shown_out}: {e}"))?;
 
-    let (in_len, out_len) = (input.len(), optimized.len());
+    let (in_len, out_len) = (bytes.len(), optimized.len());
     let saved = 100.0 * (1.0 - out_len as f64 / in_len as f64);
     eprintln!(
         "{shown_in}: {in_len} bytes -> {out_len} bytes \
@@ -343,6 +412,36 @@ fn run(cli: &Cli) -> Result<(), String> {
     );
     if out_len == in_len {
         eprintln!("note: no size reduction possible; wrote a byte-for-byte copy");
+    }
+    Ok(())
+}
+
+fn run(cli: &Cli) -> Result<(), String> {
+    let inputs = collect_inputs(&cli.input);
+    if inputs.is_empty() {
+        return Err(format!(
+            "no *.pdf files found in {}",
+            cli.input.display()
+        ));
+    }
+    let multiple = inputs.len() > 1;
+    if multiple && (cli.output.is_some() || cli.force) {
+        return Err(
+            "--output/--force apply to a single input; for multiple files use              --output-dir and/or --suffix"
+                .to_string(),
+        );
+    }
+    let mut failed = 0usize;
+    for input in &inputs {
+        // Batch semantics: one bad file must not lose the rest. The failure
+        // count still turns the overall exit code nonzero.
+        if let Err(message) = optimize_one(input, cli) {
+            failed += 1;
+            eprintln!("error: {message}");
+        }
+    }
+    if failed > 0 {
+        return Err(format!("{failed} of {} input(s) failed", inputs.len()));
     }
     Ok(())
 }

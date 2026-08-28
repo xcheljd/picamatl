@@ -241,6 +241,15 @@ picamatl report.pdf
 # Choose the output path explicitly
 picamatl report.pdf -o report.small.pdf
 
+# Batch: every *.pdf in a folder, outputs into another folder
+picamatl ~/scans --output-dir ~/scans-small
+
+# Batch: keep outputs beside the inputs with a suffix
+picamatl ~/scans --suffix "-small"
+
+# Both together: ~/scans/*.pdf -> ~/small/report-min.pdf ...
+picamatl ~/scans --output-dir ~/small --suffix "-min"
+
 # Overwrite in place, tune the pipeline
 picamatl scan.pdf --force --target-dpi 150 --jpeg-quality 70 \
   --recompress-bitonal-images

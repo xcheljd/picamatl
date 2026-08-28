@@ -1,6 +1,6 @@
 [package]
 name = "picamatl"
-version = "0.4.0"
+version = "0.4.1"
 description = "Pure-Rust PDF size optimizer: CTM-aware effective-DPI downsampling of embedded JPEG and Flate images, opt-in Type0 font subsetting, with a hard fail-safe contract. No Ghostscript; everything stays on your machine."
 authors = ["Xchel Dominguez <xjdom2@gmail.com>"]
 license = "MIT OR Apache-2.0"

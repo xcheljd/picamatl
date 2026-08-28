@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.1] - 2026-08-27
+
+### Added
+
+- **Batch output options.** `<INPUT>` now accepts a directory (its
+  non-recursive `*.pdf` entries, sorted) in addition to a single path. Two new
+  flags control where outputs go: `--output-dir <DIR>` (same file names, into
+  one folder; created on demand) and `--suffix <SUFFIX>` (rename the stem, e.g.
+  `report.pdf` → `report-min.pdf`, beside the input unless `--output-dir` is
+  also given; combinable). Inputs are never consumed or overwritten by the
+  batch forms. Batch semantics: one failing file does not lose the rest, but
+  the run exits nonzero with a `N of M input(s) failed` summary.
+- **First crates.io release** — `cargo install picamatl` (package 2.6 MiB
+  after untracking 24 benchmark-output PDFs that predated the corpus
+  ignore rule).
+
+### Changed
+
+- README install section now shows only real channels.
+
 ## [0.4.0] - 2026-08-26
 
 The "compression hunt" release: ~96 commits since 0.3.1, a wave of new
