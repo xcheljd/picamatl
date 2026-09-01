@@ -645,3 +645,12 @@ Unless you explicitly state otherwise, any contribution intentionally
 submitted for inclusion in the work by you, as defined in the Apache-2.0
 license, shall be dual licensed as above, without any additional terms or
 conditions.
+
+**Third-party code.** The embedded JPEG codec is
+[mozjpeg](https://github.com/mozilla/mozjpeg) (built on
+libjpeg-turbo), licensed under the
+[IJG license](https://www.ijg.org/files/copyright.htm) with an added
+BSD-3-Clause component — a permissive, BSD-style license that requires this
+acknowledgment in derivative works' documentation. All other dependencies are
+MIT, Apache-2.0, BSD, Zlib, CC0, or the Unicode license — no copyleft code is
+compiled into any release binary.
