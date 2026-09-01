@@ -3,42 +3,71 @@
 [![CI](https://github.com/xcheljd/picamatl/actions/workflows/rust.yml/badge.svg)](https://github.com/xcheljd/picamatl/actions/workflows/rust.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
-**A pure-Rust PDF size optimizer that downsamples over-resolution images to
-their effective on-page DPI — lossless by default, never larger, safe on
-untrusted input. No AGPL, no native runtime dependencies.**
+**Shrink PDFs up to 80% without uploading them anywhere.** Picamatl is a
+pure-Rust optimizer that downsamples over-resolution images to their
+effective on-page DPI — lossless by default, never larger than the input,
+and safe on untrusted files. No AGPL, no Ghostscript, no network.
+
+**Your documents never leave your machine.** Free web tools make you upload
+client contracts, medical forms, and financial records to someone else's
+server. Picamatl makes zero network calls — the entire dependency tree is
+local-only. What happens on your disk stays on your disk.
+
+**Your PDFs come out working.** Accessibility tags survive. Forms survive.
+Text extracts identically. Output is never larger than the input — any
+change that can't prove it shrinks is declined. Malformed or hostile PDFs
+come back byte-for-byte unchanged, never corrupted.
+
+**No Ghostscript.** Picamatl is pure Rust — no shelled-out processors, no
+AGPL license contaminating your product, no PostScript interpreter CVE
+surface pointed at untrusted input. One of the very few PDF compressors
+that can say that.
+
+- **Defaults are lossless** — encoding classes preserved, accessibility
+  kept, metadata kept.
+- **Effective-DPI aware** — an image reused across pages is sized to its
+  largest placement; only genuinely over-resolved images are downsampled.
 
 The name fuses *pico-* (tiny) with *āmatl*, the Nahuatl word for the
 fig-bark paper of pre-Columbian Mesoamerican codices — small pages of
 āmatl.
 
-- **Defaults are lossless** — encoding classes preserved, accessibility kept,
-  metadata kept.
-- **Never larger** — any optimization that can't prove it shrinks is declined.
-- **Fail-safe** — malformed or hostile PDFs come back byte-for-byte unchanged,
-  never corrupted, never a panic.
-- **Effective-DPI aware** — an image reused across pages is sized to its largest
-  placement; only genuinely over-resolved images are downsampled.
+## Quick start
 
-→ **Architecture**: see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the
-pipeline, invariants, and source map.
+```bash
+cargo install picamatl
+picamatl report.pdf
+# report.pdf: 16,804,107 bytes -> 4,448,544 bytes (73.5% saved) in 0.67s
+```
 
-**No Ghostscript.** Picamatl is pure Rust with no shelled-out processors —
-no AGPL, no PostScript interpreter, no CVE surface from `gs`. It is one of
-the very few PDF compressors that does not.
+No toolchain? Prebuilt binaries for Linux, macOS, and Windows are on the
+[releases page](https://github.com/xcheljd/picamatl/releases) — download,
+extract, run.
 
-**Everything stays on your machine.** No uploads, no servers, no network
-calls — the entire dependency tree is local-only. Your documents never
-leave the process.
+Batch a whole folder:
 
+```bash
+picamatl ~/scans --output-dir ~/scans-small
+```
 
 ## Who this is for
 
-Developers and companies embedding PDF compression into their own product or
-pipeline — who need a permissively licensed alternative to AGPL-licensed
-tools and won't upload customer documents to a third-party web service.
-Picamatl is a permissively licensed library with no native runtime dependencies;
-everything happens locally. It is not aimed at the consumer "shrink my PDF"
-use case, which free web tools already serve.
+**You embed PDF handling in a product** — and need a permissively licensed
+(MIT/Apache) compressor without AGPL contamination, a C-library bundling
+tax, or an upload-to-our-servers privacy policy. Picamatl is a library with
+a stable API and a hard fail-safe contract, built for pipelines that
+process untrusted input.
+
+**You handle sensitive documents professionally** — client files, legal,
+medical, financial — and "just upload it to our free tool" has never been
+an acceptable answer. Picamatl is a local command that never phones home.
+
+**You maintain infrastructure that processes PDFs in bulk** — and you need
+the guarantee that malformed input cannot crash the worker: picamatl
+returns the input unchanged on any error, panic, or non-shrinking result.
+
+→ **Architecture**: see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the
+pipeline, invariants, and source map.
 
 ## The core idea: effective DPI, not blind DPI
 
@@ -112,7 +141,7 @@ pretend otherwise by declining, which is worth up to 24% of the output on a
 Reader-extended form. If a signature must stay valid, do not optimize the
 file.
 
-## Usage
+## Library usage
 
 ```rust
 // Accessibility-preserving defaults:
@@ -222,19 +251,7 @@ can be verified by exact decode-back comparison.
 
 picamatl ships as a library and a command-line binary:
 
-```sh
-## Install
-
 ```bash
-# From crates.io (compiles locally; needs a Rust toolchain + NASM)
-cargo install picamatl
-```
-
-Prebuilt binaries for Linux/macOS/Windows, a `curl | sh` installer script,
-and Homebrew/AUR packages are planned — see
-[docs/ROADMAP.md](docs/ROADMAP.md) Phase 0 for the current distribution
-status.
-
 # Optimize with accessibility-preserving defaults; writes sample.optimized.pdf
 picamatl report.pdf
 
