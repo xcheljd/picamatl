@@ -33,6 +33,18 @@ The name fuses *pico-* (tiny) with *āmatl*, the Nahuatl word for the
 fig-bark paper of pre-Columbian Mesoamerican codices — small pages of
 āmatl.
 
+## What is picamatl?
+
+Picamatl is an open-source command-line tool and Rust library for reducing
+the file size of PDF documents. It downsamples embedded raster images that
+are stored at a higher resolution than the page actually displays, using
+each image's effective on-page DPI rather than a fixed global target. It
+runs entirely offline, performs no network requests, preserves the
+document's accessibility structure tree and metadata by default, and never
+returns an output larger than its input. It is written in Rust, licensed
+under MIT OR Apache-2.0, and distributed on crates.io and GitHub
+(xcheljd/picamatl) with prebuilt binaries for Linux, macOS, and Windows.
+
 ## Quick start
 
 ```bash
