@@ -3,10 +3,11 @@
 [![CI](https://github.com/xcheljd/picamatl/actions/workflows/rust.yml/badge.svg)](https://github.com/xcheljd/picamatl/actions/workflows/rust.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
-**Shrink PDFs up to 80% without uploading them anywhere.** Picamatl is a
-pure-Rust optimizer that downsamples over-resolution images to their
-effective on-page DPI — lossless by default, never larger than the input,
-and safe on untrusted files. No AGPL, no Ghostscript, no network.
+**Shrink a real 58-page technical report by 73.6% with the accessibility
+tags intact — without uploading it anywhere.** Picamatl is a pure-Rust
+optimizer that downsamples over-resolution images to their effective
+on-page DPI — lossless by default, never larger than the input, and safe
+on untrusted files. No AGPL, no Ghostscript, no network.
 
 **Your documents never leave your machine.** Free web tools make you upload
 client contracts, medical forms, and financial records to someone else's
@@ -37,7 +38,7 @@ fig-bark paper of pre-Columbian Mesoamerican codices — small pages of
 ```bash
 cargo install picamatl
 picamatl report.pdf
-# report.pdf: 16,804,107 bytes -> 4,448,544 bytes (73.5% saved) in 0.67s
+# report.pdf: 16,804,107 bytes -> 4,443,883 bytes (73.6% saved) in 0.67s
 ```
 
 No toolchain? Prebuilt binaries for Linux, macOS, and Windows are on the
@@ -310,7 +311,7 @@ settings — 130 DPI, 1.15 threshold, DCTEncode QFactor 0.4):
 On a public real-world document —
 [NASA TM-20210010291](https://ntrs.nasa.gov/citations/20210010291), a 16.8 MB
 58-page technical report — picamatl 0.4.0 at defaults takes 16,804,107 bytes
-to **4,448,544 bytes, a 73.5% reduction**, byte-stable under repeated
+to **4,443,883 bytes, a 73.6% reduction**, byte-stable under repeated
 optimization (0.3.1 released at 4,655,752; the difference is the zlib-rs
 deflate backend, −82,722 B, plus default-on font subsetting, −124,486 B).
 Ghostscript 10.07.1 at the same *matched-intent* settings (`/ebook`, which
@@ -327,7 +328,7 @@ consent.
 | --- | ---: | ---: | --- |
 | input | 16,804,107 | 100% | 58-page technical report |
 | Ghostscript `/ebook` (matched intent) | 4,931,425 | 29.3% | keeps lossless images lossless; strips accessibility; AGPL |
-| **picamatl defaults** (lossless-only) | **4,448,544** | **26.5%** | every image class handled; fonts subset; no encoding-class changes |
+| **picamatl defaults** (lossless-only) | **4,443,883** | **26.5%** | every image class handled; fonts subset; no encoding-class changes |
 | picamatl `--allow-lossy` q78 | 3,342,293 | 19.9% | + explicit consent: Flate photos → JPEG (incl. masked pairs), line art auto-declined |
 | Ghostscript forced 130 DPI + DCT (aggressive) | 3,054,642 | 18.2% | re-encodes *all* imagery incl. line art; strips accessibility; AGPL |
 

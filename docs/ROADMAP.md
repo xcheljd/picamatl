@@ -25,7 +25,6 @@ Feature roadmap. Last revised: 2026-08-27.
 
 ## In progress
 
-- First cargo-dist release (v0.4.1 artifacts) — pending CI minutes reset.
 - Homebrew tap pointing at release artifacts.
 
 ## Next

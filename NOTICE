@@ -1,0 +1,18 @@
+picamatl
+Copyright 2026 Xchel Dominguez
+
+This product includes software developed by the Mozilla JPEG project
+(mozjpeg, https://github.com/mozilla/mozjpeg), built on libjpeg-turbo.
+
+mozjpeg and libjpeg-turbo are distributed under the IJG license terms
+(see below) with additional BSD-3-Clause components (mozjpeg's own
+modifications). The IJG license requires the following acknowledgment
+in documentation of derivative works:
+
+  The authors make NO WARRANTY of any kind, expressed or implied,
+  including the warranties of design, merchantability and fitness for
+  a particular purpose, arising from any use of the software or any
+  part of it.
+
+All other dependencies are MIT, Apache-2.0, BSD, Zlib, CC0, or the
+Unicode license. No copyleft code is compiled into any release binary.

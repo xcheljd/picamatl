@@ -153,8 +153,8 @@ The suite is the best documentation of the invariants. Key groups:
 - `scripts/bench-full.sh` — four/five-lane matrix (lossless/lossy/kitchen/gs/
   gs-custom) over the corpus; prints per-file paragraphs.
 - `scripts/bench-vs-gs.sh` — fixture vs Ghostscript.
-- NASA TM-20210010291: input at `~/Labs/talaria/.extraction-tmp/nasa.pdf`
-  (not in the repo; re-downloadable from ntrs.nasa.gov). Defaults →
+- NASA TM-20210010291: input re-downloadable from
+  [ntrs.nasa.gov](https://ntrs.nasa.gov/citations/20210010291). Defaults →
   4,443,883 B (73.6%); `--figure-dpi 195` → 5,404,689 B (67.8%);
   `--target-dpi 0` → 15,654,875 B (93.2%, pixel-exact).
 
@@ -163,7 +163,8 @@ The suite is the best documentation of the invariants. Key groups:
 - MSRV 1.88 (dependency-driven). CI runs 3-OS matrix; clippy `-D warnings`
   tracks latest stable (a new lint can break CI even on docs-only commits —
   see `9fec5e3`).
-- `Cargo.lock` is gitignored (library crate); only `Cargo.toml` ships.
+- `Cargo.lock` is committed: picamatl is also a binary crate with prebuilt
+  release artifacts, so builds must be reproducible.
 - mozjpeg (C) is the only native code; libjpeg-turbo compiled in. Build needs
   NASM. No native *runtime* deps.
 - Dependencies all permissive (MIT/Apache/BSD/Zlib). AGPL is a hard no

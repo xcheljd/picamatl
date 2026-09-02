@@ -9,7 +9,7 @@ Every API name, crate version, and behavior claim below was verified on
 (rustdoc + an empirical probe test, since docs.rs was unreachable from this
 session) and against crates.io via `cargo info` / `cargo tree`. Nothing here is
 from memory alone; the few remaining unknowns were flagged inline and are now
-resolved in [Decisions — RESOLVED](#decisions--resolved).
+resolved in [Decisions — RESOLVED](#resolved-decision-set).
 
 ---
 
@@ -58,7 +58,7 @@ Recommended order: **A-M1 → C-M1 → B-M1**, then the M2s as interest warrants
 ## Resolved decision set
 
 All nine open questions are resolved (details and rationale in
-[Decisions — RESOLVED](#decisions--resolved)). The compact outcomes an
+[Decisions — RESOLVED](#resolved-decision-set)). The compact outcomes an
 implementer should internalize before reading further:
 
 1. `downsample_flate_images` **defaults ON** (0.2.0, minor bump + changelog).
@@ -216,7 +216,7 @@ documented behavior (over-resolution → target DPI) applied to a second filter,
 not a new kind of lossiness; semver-wise `#[non_exhaustive]` protects the API
 and 0.x allows the behavior delta with a changelog entry (ship as 0.2.0, not
 0.1.x). Callers who need bit-stable output across upgrades can pin. **RESOLVED
-as Q1: default ON** (see [Decisions — RESOLVED](#decisions--resolved)).
+as Q1: default ON** (see [Decisions — RESOLVED](#resolved-decision-set)).
 
 ### A.4 Test strategy
 

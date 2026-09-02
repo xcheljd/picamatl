@@ -1,6 +1,6 @@
-# XREF-WT diagnosis notes (agent run 2026-08-23)
+# XREF-WT diagnosis notes (2026-08-23)
 
-Facts taken as given from orchestrator brief. Plan: walk page 19 resource graph
+Working notes. Plan: walk page 19 resource graph
 in original via pypdf; collect indirect ref numbers; resolve each in
 /tmp/xf-adobe2.pdf via RAW decoded xref stream rows + ObjStm header pairs;
 look for free/missing/misindexed entries.

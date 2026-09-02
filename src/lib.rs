@@ -8450,11 +8450,39 @@ mod tests {
 
     #[test]
     fn default_options_preserve_accessibility() {
-        // Default options must NOT strip the structure tree even when present.
-        let pdf = build_pdf(400, 100); // has no StructTreeRoot, but verify options work
-        let out = optimize_with_options(&pdf, OptimizeOptions::default());
-        assert!(out.len() < pdf.len(), "expected shrink from downsampling");
-        assert!(Document::load_mem(&out).is_ok());
+        // Default options must NOT strip the structure tree. A fixture WITH a
+        // StructTreeRoot is mandatory here: the survival claim ("accessibility
+        // tags survive optimization") is only evidenced if the tree existed on
+        // input and is verifiably present on output. Mirrors the injection
+        // setup of strip_accessibility_runs_even_without_image_work.
+        let pdf = build_pdf(400, 100);
+        let mut doc = Document::load_mem(&pdf).unwrap();
+        let struct_id = doc.add_object(dictionary! {
+            "Type" => "StructTreeRoot",
+            "RoleMap" => dictionary!{},
+        });
+        if let Ok(catalog) = doc.catalog_mut() {
+            catalog.set("StructTreeRoot", Object::Reference(struct_id));
+            catalog.set("MarkInfo", dictionary! { "Marked" => true });
+        }
+        let mut reencoded: Vec<u8> = Vec::new();
+        doc.save_to(&mut reencoded).unwrap();
+
+        let out = optimize_with_options(&reencoded, OptimizeOptions::default());
+        assert!(
+            out.len() < reencoded.len(),
+            "expected shrink from downsampling"
+        );
+        let out_doc = Document::load_mem(&out).expect("output must load");
+        let catalog = out_doc.catalog().expect("catalog present");
+        assert!(
+            catalog.get(b"StructTreeRoot").is_ok(),
+            "defaults must preserve /StructTreeRoot"
+        );
+        assert!(
+            catalog.get(b"MarkInfo").is_ok(),
+            "defaults must preserve /MarkInfo"
+        );
     }
 
     #[test]
