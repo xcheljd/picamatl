@@ -336,6 +336,17 @@ pub struct OptimizeOptions {
     /// way — the final pass revisits their output. Default:
     /// [`DeflateBackend::Zlib`].
     pub deflate_backend: DeflateBackend,
+
+    /// What to do when the input carries a digital signature. Every run
+    /// re-serializes the whole document, so a `/ByteRange` digest — which
+    /// pins file offsets — is invalid in the output. Detection covers
+    /// signature dictionaries reachable from `/AcroForm/Fields`, the
+    /// catalog's `/Perms` usage-rights entry, and `/DocMDP` certification
+    /// dictionaries.
+    ///
+    /// [`SignatureHandling::Warn`] (the default) prints one stderr line and
+    /// proceeds; [`SignatureHandling::Silence`] proceeds without it.
+    pub on_signature: SignatureHandling,
 }
 
 /// Which deflate implementation the final re-deflate and xref-stream passes
@@ -348,6 +359,20 @@ pub enum DeflateBackend {
     /// Exhaustive-search deflate (pure-Rust `zopfli` crate) — smallest
     /// output, ~30× the CPU. Opt-in for callers who value bytes over speed.
     Zopfli,
+}
+
+/// What to do when the input document carries a digital signature.
+/// See [`OptimizeOptions::on_signature`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SignatureHandling {
+    /// Proceed, printing one stderr warning that the signature will be
+    /// invalidated. The default — same behavior as always, but no longer
+    /// silent.
+    #[default]
+    Warn,
+    /// Proceed without any warning, for callers that already know (batch
+    /// pipelines that pre-filter signed files, etc.).
+    Silence,
 }
 
 /// Written by hand, NOT derived: a derived `Default` would zero the numeric
@@ -374,6 +399,7 @@ impl Default for OptimizeOptions {
             collapse_gray_images: false,
             flatten_forms: false,
             deflate_backend: DeflateBackend::Zlib,
+            on_signature: SignatureHandling::Warn,
         }
     }
 }
@@ -517,6 +543,13 @@ impl OptimizeOptions {
     #[must_use]
     pub fn with_deflate_backend(mut self, backend: DeflateBackend) -> Self {
         self.deflate_backend = backend;
+        self
+    }
+
+    /// Set what happens when the input carries a digital signature. See
+    /// [`OptimizeOptions::on_signature`].
+    pub fn with_on_signature(mut self, on_signature: SignatureHandling) -> Self {
+        self.on_signature = on_signature;
         self
     }
 }
@@ -4232,6 +4265,35 @@ fn try_optimize(input: &[u8], options: OptimizeOptions) -> Result<Option<Vec<u8>
     let literals = reals::capture(input);
     let mut doc = Document::load_mem(input)?;
 
+    // Signature warning. Every save path re-serializes from scratch, so a
+    // /ByteRange digest is invalidated whether or not any pass touches the
+    // signature objects themselves. Detection happens BEFORE the dedup
+    // passes so the warning reports the input's signature objects, not
+    // whatever survives dedup.
+    if options.on_signature == SignatureHandling::Warn {
+        let sigs = detect_signatures(&doc);
+        if !sigs.is_empty() {
+            let named: Vec<String> = sigs
+                .iter()
+                .map(|s| match s.id {
+                    Some(id) => format!("{} (object {} {})", s.kind, id.0, id.1),
+                    None => format!("{} (direct dict, no object number)", s.kind),
+                })
+                .collect();
+            eprintln!(
+                "warning: {} digital signature{} detected — optimization \
+                 re-serializes the document, so the /ByteRange digest{} \
+                 invalidated in the output: {}. Proceeding; pass \
+                 --on-signature silence to suppress this warning.",
+                sigs.len(),
+                if sigs.len() == 1 { "" } else { "s" },
+                if sigs.len() == 1 { "is" } else { "s are" },
+                named.join("; ")
+            );
+        }
+    }
+
+
     // Fail-safe: if any page's /Contents cannot be resolved to stream objects
     // lopdf actually LOADED, the parse lost content — seen in the wild with a
     // malformed /Length whose recovery scan swallowed the whole object.
@@ -4788,23 +4850,151 @@ fn replan_deflate(content: &[u8], backend: DeflateBackend) -> Option<Vec<u8>> {
     (inflate_capped(&out, plain.len())? == plain).then_some(out)
 }
 
-/// Why there is no signature guard here (there used to be).
+/// One detected signature that a rewrite would invalidate. `id` is the
+/// object carrying the `/ByteRange` when the signature dict is indirect
+/// (`None` for a direct dict — the warning still fires, it just can't name
+/// an object number).
+#[derive(Debug, PartialEq)]
+struct SigReport {
+    id: Option<ObjectId>,
+    kind: &'static str,
+}
+
+/// Detect digital signatures that optimization would invalidate.
+///
+/// Walks the parsed document and reports every signature-bearing object:
+/// signature fields under `/AcroForm/Fields` (which carry `/ByteRange`
+/// digests), and the catalog's `/Perms` usage-rights entry (Reader-extended
+/// UR3 grants). Returns the object ids whose digests a full re-serialization
+/// would invalidate.
+///
+/// Conservative by design: any dict carrying a `/ByteRange` key counts as a
+/// signature even if malformed — a broken range is still a signature the
+/// user placed. Uncertainty biases toward detection: a missed signature
+/// means a silently invalidated one.
+fn detect_signatures(doc: &Document) -> Vec<SigReport> {
+    let mut found: Vec<SigReport> = Vec::new();
+
+    // Signature fields under /AcroForm/Fields: a field dict with /FT /Sig
+    // whose /V value dict carries /ByteRange, or a merged widget/field dict
+    // that carries /ByteRange directly.
+    // /AcroForm may be an indirect reference (the common case) or a direct
+    // dictionary — both must resolve.
+    let acro = doc
+        .catalog()
+        .ok()
+        .and_then(|c| c.get(b"AcroForm").ok())
+        .and_then(|a| match a {
+            Object::Reference(id) => doc.get_object(*id).ok(),
+            Object::Dictionary(_) => Some(a),
+            _ => None,
+        })
+        .and_then(|o| o.as_dict().ok());
+    if let Some(acro) = acro {
+        if let Ok(Object::Array(fields)) = acro.get(b"Fields") {
+            for field in fields.iter() {
+                // Fields may be indirect references or direct dicts; a
+                // dict-carrying field is only reportable when it has an id to
+                // name in the warning.
+                let field_dict = match field {
+                    Object::Reference(id) => doc
+                        .get_object(*id)
+                        .ok()
+                        .and_then(|o| o.as_dict().ok().map(|d| (d, Some(*id)))),
+                    Object::Dictionary(d) => Some((d, None)),
+                    _ => None,
+                };
+                let Some((d, field_id)) = field_dict else {
+                    continue;
+                };
+                // Some minimal writers store the leading slash inside the
+                // name bytes ("/Sig"); conforming ones don't ("Sig"). Accept
+                // both — a missed signature is the expensive mistake.
+                let is_sig_field = matches!(
+                    d.get(b"FT").map(|ft| ft.as_name()),
+                    Ok(Ok(name)) if name == b"Sig" || name == b"/Sig"
+                );
+                if is_sig_field {
+                    // The /V value may be an indirect reference (conforming
+                    // writers) or a direct signature dict (minimal writers).
+                    // Both carry the /ByteRange that a rewrite invalidates.
+                    match d.get(b"V") {
+                        Ok(Object::Reference(value_id)) => {
+                            found.push(SigReport {
+                                id: Some(*value_id),
+                                kind: "signature field",
+                            });
+                        }
+                        Ok(Object::Dictionary(v)) if v.get(b"ByteRange").is_ok() => {
+                            found.push(SigReport {
+                                id: field_id,
+                                kind: "signature field",
+                            });
+                        }
+                        _ => {}
+                    }
+                }
+                if d.get(b"ByteRange").is_ok() {
+                    if let Some(id) = field_id {
+                        found.push(SigReport {
+                            id: Some(id),
+                            kind: "signature dictionary",
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    // Catalog /Perms: Reader usage-rights (UR3) or MDP transform dicts. Each
+    // value typically points at (or contains) the Sig object whose digest a
+    // rewrite invalidates.
+    if let Ok(catalog) = doc.catalog() {
+        if let Ok(Object::Dictionary(perms)) = catalog.get(b"Perms") {
+            for (_key, value) in perms.iter() {
+                if let Ok(id) = value.as_reference() {
+                    if let Ok(Object::Dictionary(pd)) = doc.get_object(id) {
+                        if let Ok(sig_id) = pd
+                            .get(b"DocMDP")
+                            .or_else(|_| pd.get(b"Sig"))
+                            .and_then(|o| o.as_reference())
+                        {
+                            found.push(SigReport {
+                                id: Some(sig_id),
+                                kind: "permissions/usage-rights entry",
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Dedup by object id (a Sig reached through both /AcroForm and /Perms
+    // is one invalidated signature).
+    found.dedup_by(|a, b| a.id == b.id && a.kind == b.kind);
+    found
+}
+
+/// Signature handling (there used to be a guard here; now there is detection).
 ///
 /// A `/ByteRange` digest covers file offsets, so it cannot survive *any*
 /// picamatl output: every run re-serializes the whole document from scratch,
 /// moving every offset, and font subsetting, image downsampling, object-stream
 /// packing and metadata stripping were never gated on signatures in the first
 /// place. Gating only the three entropy-level passes (JPEG Huffman
-/// re-optimization, whole-document re-deflate, content minification) therefore
-/// protected nothing while costing real bytes -- measured at 477 KB on a
+/// re-optimization, whole-document re-deflate, content minification) would
+/// have protected nothing while costing real bytes -- measured at 477 KB on a
 /// Reader-extended IRS form whose 1.5 MB XFA attachment ships with a weak
 /// deflate.
 ///
-/// The honest contract is the one picamatl already had in practice: optimizing a
-/// signed PDF invalidates its signature, exactly as it does with every other
-/// PDF optimizer. That is documented in the README; the fail-safe contract
-/// covers rendered content, not offset-pinned digests. Callers who must keep a
-/// signature intact must not optimize the file at all.
+/// The honest contract: optimizing a signed PDF invalidates its signature,
+/// exactly as with every other PDF optimizer. [`OptimizeOptions::on_signature`]
+/// controls whether the user is TOLD at runtime (the default `Warn` prints one
+/// stderr line via [`detect_signatures`]) or the pipeline proceeds silently
+/// (`Silence`). The fail-safe contract covers rendered content, not
+/// offset-pinned digests; callers who must keep a signature intact should not
+/// optimize the file at all.
 /// Serialize the document, optionally using PDF 1.5 object-stream packing when
 /// `options.pack_object_streams` is true. The packed path produces smaller
 /// output for object-heavy documents but is more complex; the classic path is
@@ -8484,6 +8674,80 @@ mod tests {
             "defaults must preserve /MarkInfo"
         );
     }
+    #[test]
+    fn detect_signatures_finds_acroform_sig_field() {
+        // Direct-dict AcroForm (pikepdf-style minimal file) with a /FT /Sig
+        // field whose /V carries /ByteRange. The warning must see it.
+        let pdf = build_pdf(400, 100);
+        let mut doc = Document::load_mem(&pdf).unwrap();
+        let sig_value_id = doc.add_object(dictionary! {
+            "ByteRange" => Object::Array(vec![
+                Object::Integer(0), Object::Integer(10),
+                Object::Integer(20), Object::Integer(10),
+            ]),
+            "Contents" => Object::String(b"fake".to_vec(), lopdf::StringFormat::Hexadecimal),
+            "SubFilter" => Object::Name(b"/adbe.pkcs7.detached".to_vec()),
+        });
+        let field_id = doc.add_object(dictionary! {
+            "FT" => Object::Name(b"/Sig".to_vec()),
+            "V" => Object::Reference(sig_value_id),
+        });
+        if let Ok(catalog) = doc.catalog_mut() {
+            catalog.set(
+                "AcroForm",
+                Object::Dictionary(dictionary! {
+                    "Fields" => Object::Array(vec![Object::Reference(field_id)]),
+                }),
+            );
+        }
+        let mut reencoded: Vec<u8> = Vec::new();
+        doc.save_to(&mut reencoded).unwrap();
+
+        let doc2 = Document::load_mem(&reencoded).unwrap();
+        let sigs = detect_signatures(&doc2);
+        assert!(
+            sigs.iter().any(|s| s.id == Some(sig_value_id)),
+            "detect_signatures missed the /Sig field's /V dict; got {sigs:?}"
+        );
+    }
+
+    #[test]
+    fn detect_signatures_finds_direct_dict_acroform() {
+        // Same, but with the field stored DIRECTLY in /AcroForm/Fields (no
+        // indirection) — the shape pikepdf and minimal writers emit.
+        let pdf = build_pdf(400, 100);
+        let mut doc = Document::load_mem(&pdf).unwrap();
+        let sig_value_id = doc.add_object(dictionary! {
+            "ByteRange" => Object::Array(vec![
+                Object::Integer(0), Object::Integer(10),
+                Object::Integer(20), Object::Integer(10),
+            ]),
+        });
+        if let Ok(catalog) = doc.catalog_mut() {
+            catalog.set(
+                "AcroForm",
+                Object::Dictionary(dictionary! {
+                    "Fields" => Object::Array(vec![
+                        Object::Dictionary(dictionary! {
+                            "FT" => Object::Name(b"/Sig".to_vec()),
+                            "V" => Object::Reference(sig_value_id),
+                        }),
+                    ]),
+                }),
+            );
+        }
+        let mut reencoded: Vec<u8> = Vec::new();
+        doc.save_to(&mut reencoded).unwrap();
+
+        let doc2 = Document::load_mem(&reencoded).unwrap();
+        let sigs = detect_signatures(&doc2);
+        assert!(
+            sigs.iter().any(|s| s.id == Some(sig_value_id)),
+            "direct-dict AcroForm signature not detected; got {sigs:?}"
+        );
+    }
+
+
 
     #[test]
     fn strip_accessibility_runs_even_without_image_work() {

@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.2] - 2026-09-02
+
+### Added
+
+- **Signature detection and warning.** Picamatl now detects signature
+  dictionaries reachable from `/AcroForm/Fields` (both indirect and
+  direct-dict forms), catalog `/Perms` usage-rights and MDP entries, and
+  prints one stderr warning naming what it found before optimizing — a
+  signed PDF's `/ByteRange` digest is invalidated by any re-serialization,
+  and until now nothing at runtime said so. New
+  `--on-signature warn|silence` flag (`OptimizeOptions::on_signature`,
+  `SignatureHandling::Warn` default / `Silence` for pre-filtering
+  pipelines).
+
+### Changed
+
+- README signature paragraph updated to describe the runtime warning.
+
 ## [0.4.1] - 2026-08-27
 
 ### Added

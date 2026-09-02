@@ -144,15 +144,15 @@ alone: 27 of 28 pages of the LibreOffice document in the corpus rendered
 differently before, and 0 of 28 do now. Where the input spells one value two
 ways, picamatl leaves the number as-is rather than pick.
 
-**Digital signatures do not survive optimization.** Every picamatl run
-re-serializes the whole document, so a `/ByteRange` digest — which pins file
-offsets — is invalid in the output. This has always been true (font
-subsetting, image downsampling and object-stream packing were never gated on
-signatures); as of the current release the three entropy-level passes
-(re-deflate, JPEG Huffman re-optimization, content minification) no longer
-pretend otherwise by declining, which is worth up to 24% of the output on a
-Reader-extended form. If a signature must stay valid, do not optimize the
-file.
+**Digital signatures do not survive optimization — and picamatl tells you.**
+Every run re-serializes the whole document, so a `/ByteRange` digest — which
+pins file offsets — is invalid in the output. Picamatl detects signature
+fields, usage-rights entries, and certification dictionaries before
+optimizing and prints a warning naming what it found; pass
+`--on-signature silence` in pipelines that pre-filter signed files. (There
+is no mode that preserves a signature: any re-serialization moves offsets.
+This is true of every PDF optimizer; the difference is that picamatl says
+so at runtime instead of silently.)
 
 ## Library usage
 

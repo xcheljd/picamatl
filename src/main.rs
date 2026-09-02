@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Instant;
 
-use picamatl::{DeflateBackend, OptimizeOptions};
+use picamatl::{DeflateBackend, OptimizeOptions, SignatureHandling};
 use clap::Parser;
 
 /// How far into the file to look for `%PDF-`. The PDF spec's implementation
@@ -208,6 +208,30 @@ struct Cli {
     /// zopfli is ~30x the CPU for a few percent smaller output
     #[arg(long, value_enum, value_name = "BACKEND")]
     deflate_backend: Option<DeflateBackendArg>,
+
+    /// What to do when the input carries a digital signature. Optimization
+    /// re-serializes the document, invalidating /ByteRange digests. warn
+    /// (default) prints one stderr line and proceeds; silence proceeds
+    /// without the warning
+    #[arg(long, value_enum, value_name = "MODE")]
+    on_signature: Option<SignatureHandlingArg>,
+}
+
+/// CLI mirror of [`picamatl::SignatureHandling`] so the library type stays
+/// free of clap derives. `None` (flag absent) keeps the library default.
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum SignatureHandlingArg {
+    Warn,
+    Silence,
+}
+
+impl From<SignatureHandlingArg> for SignatureHandling {
+    fn from(arg: SignatureHandlingArg) -> Self {
+        match arg {
+            SignatureHandlingArg::Warn => SignatureHandling::Warn,
+            SignatureHandlingArg::Silence => SignatureHandling::Silence,
+        }
+    }
 }
 
 /// CLI mirror of [`picamatl::DeflateBackend`] so the library type stays free of
@@ -308,6 +332,11 @@ fn options_from(cli: &Cli) -> OptimizeOptions {
             cli.deflate_backend
                 .map(DeflateBackend::from)
                 .unwrap_or(d.deflate_backend),
+        )
+        .with_on_signature(
+            cli.on_signature
+                .map(SignatureHandling::from)
+                .unwrap_or(d.on_signature),
         )
 }
 
