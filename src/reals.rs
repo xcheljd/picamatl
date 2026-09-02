@@ -14,7 +14,7 @@
 //! On `/MediaBox` that shifts the page-to-device origin and re-grid-fits every
 //! glyph on the page; on `/BBox`, `/Rect`, `/W` and `/Bounds` it moves a clip,
 //! a hit region, an advance or a shading stop by the same amount. See
-//! `docs/upstream-lopdf-f32-reals.md` for the upstream report.
+//! the upstream f32-reals issue draft (held privately pending filing) for the upstream report.
 //!
 //! The digits are destroyed at parse time, so there is nothing to fix inside
 //! the `Document`: no `Object` variant can hold `841.91998`, and no writer
@@ -31,7 +31,7 @@
 //!
 //! Both halves are keyed by *value*, not by dictionary key or object id, so
 //! this covers every real in the document (the corpus census in
-//! `docs/upstream-lopdf-f32-reals.md` finds `/Rect`, `/XYZ`, `/BBox`, `/W`,
+//! the upstream f32-reals issue draft (held privately pending filing) finds `/Rect`, `/XYZ`, `/BBox`, `/W`,
 //! `/MediaBox`, `/FontBBox`, `/Bounds`, `/Domain`, ... in that order of
 //! frequency) rather than a hand-maintained list of "load-bearing" keys.
 //!

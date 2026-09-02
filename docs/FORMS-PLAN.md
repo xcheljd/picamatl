@@ -244,7 +244,7 @@ reproduces with every flag off. It is `lopdf`'s `Object::Real(f32)` rewriting
 `/MediaBox [0 0 595.91998 841.91998]` as `595.92 x 841.92`, which moves the
 origin of the page-to-device transform by 2e-5 pt and re-grid-fits every glyph
 on the page. Restoring only those four literals takes both files to 0 differing
-pages. See `docs/upstream-lopdf-f32-reals.md`; there is no fix available
+pages. See the upstream f32-reals issue draft (held privately pending filing); there is no fix available
 downstream, because the digits are gone by the time `Document::load` returns.
 
 `census-brief.pdf` gains a small win (a vestigial `/AcroForm` whose `/DR` font

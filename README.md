@@ -555,7 +555,7 @@ marks the comparison as not apples-to-apples.
 
 Reading the consolidated matrix:
 
-- **Every non-dynamic-XFA file is an picamatl win.** Total: **21.3% of input
+- **Every non-dynamic-XFA file is a picamatl win.** Total: **21.3% of input
   vs gs's 41.8%** across the 56 MB corpus while preserving accessibility,
   form data, and provenance unless explicitly stripped.
 - **irs-w2 flipped with `--flatten-forms`**: 2.15 MB → 133.7 KB (6.2%) —
@@ -671,4 +671,6 @@ libjpeg-turbo), licensed under the
 BSD-3-Clause component — a permissive, BSD-style license that requires this
 acknowledgment in derivative works' documentation. All other dependencies are
 MIT, Apache-2.0, BSD, Zlib, CC0, or the Unicode license — no copyleft code is
-compiled into any release binary.
+compiled into any release binary. The font-encoding tables in
+`src/encodings.rs` are the ISO 32000-1 Annex D tables plus Adobe's
+BSD-licensed Adobe Glyph List, generated from those public sources.

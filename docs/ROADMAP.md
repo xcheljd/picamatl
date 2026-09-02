@@ -40,6 +40,8 @@ Feature roadmap. Last revised: 2026-08-27.
 
 ## Considering
 
+- Multi-OS test matrix (macOS/Windows runners for the test suite, not just
+  release builds).
 - Shell completions (bash/zsh/fish) via clap_complete.
 - JSON output mode for scripting (`--json` machine-readable summary).
 - A Tauri desktop front-end (drag-and-drop, presets, preview) — separate

@@ -160,7 +160,8 @@ The suite is the best documentation of the invariants. Key groups:
 
 ## Maintenance notes
 
-- MSRV 1.88 (dependency-driven). CI runs 3-OS matrix; clippy `-D warnings`
+- Tests run on ubuntu-latest; macOS and Windows are build-verified by the
+  release pipeline (`release.yml`). MSRV 1.88 (dependency-driven). Clippy `-D warnings`
   tracks latest stable (a new lint can break CI even on docs-only commits —
   see `9fec5e3`).
 - `Cargo.lock` is committed: picamatl is also a binary crate with prebuilt

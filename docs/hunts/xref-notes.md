@@ -31,7 +31,7 @@ GATES (pdftoppm -r 72, cmp/magick AE vs corpus/adobe-spec.pdf):
   page 752: 195 px diff — byte-for-byte same residual as main-adobe.pdf,
             i.e. caused by another optimizer pass, NOT the xref bug.
 Committed on fix/xref-prev. Upstream-worthy: lopdf writer.rs should widen W or
-assert index < 65536. Issue drafted (not filed) in docs/upstream-lopdf-u16.md.
+assert index < 65536. Issue drafted (not filed) in the upstream u16-ObjStm issue draft (held privately pending filing).
 
 ## RENDER RESIDUAL RESOLVED (follow-up run 2026-08-23)
 The 21 differing pages (211 311-315 543-545 548 553 554 644 742-744 746

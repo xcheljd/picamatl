@@ -1,6 +1,6 @@
 # HUNT2 — Compression Scout Notes (round 2)
 
-Status: IN PROGRESS. Committed incrementally.
+Status: COMPLETE. Committed incrementally.
 Method: pdffonts / pdfimages -list / pikepdf parsing. No ghostscript on adobe-spec.pdf.
 Corpus sizes: adobe-spec 22,491,828 · arxiv-attention 2,233,053 · irs-1040gi 4,434,643 · nist-ssdf 739,891.
 

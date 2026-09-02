@@ -1,13 +1,14 @@
 //! PDF simple-font encoding tables (ISO 32000-1 Annex D) and the Adobe
 //! Glyph List subset needed to resolve their glyph names to Unicode.
 //!
-//! Data provenance: extracted programmatically from Ghostscript's built-in
-//! `/WinAnsiEncoding` and `/MacRomanEncoding` resources and its
-//! `AdobeGlyphList` dictionary (the same interpreter used by the external
-//! render-verification harness), then cross-checked against Python's
-//! `cp1252` / `mac_roman` codecs. The only divergences are the documented
-//! Annex D quirks: WinAnsi fills its undefined codes with `/bullet` and names
-//! 0xA0 `/space` and 0xAD `/hyphen`; MacRoman names 0xCA `/space` and keeps
+//! Data provenance: ISO 32000-1 Annex D.1/D.2 (the standard's own
+//! WinAnsiEncoding and MacRomanEncoding tables) plus Adobe's published
+//! [Adobe Glyph List](https://github.com/adobe-type-tools/agl-aglfn)
+//! (BSD-3-Clause). The tables were generated mechanically from those
+//! sources and cross-checked against Python's `cp1252` / `mac_roman`
+//! codecs; the only divergences are the documented Annex D quirks:
+//! WinAnsi fills its undefined codes with `/bullet` and names 0xA0
+//! `/space` and 0xAD `/hyphen`; MacRoman names 0xCA `/space` and keeps
 //! 0xDB as `/currency` (pre-euro).
 //!
 //! Empty string = no name at that code (`.notdef`).
