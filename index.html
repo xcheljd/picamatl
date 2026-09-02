@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>picamatl — pure-Rust PDF size optimizer</title>
+<meta name="description" content="Shrink a real 58-page technical report by 73.6% with accessibility tags intact — entirely on your machine. Pure-Rust PDF optimizer: effective-DPI image downsampling, lossless by default, never larger, no Ghostscript, no network.">
+<link rel="canonical" href="https://xcheljd.github.io/picamatl/">
+<style>
+  :root { --ink:#1a1d21; --paper:#fbfaf7; --accent:#0f6b4f; }
+  * { box-sizing:border-box; }
+  body { font:17px/1.65 Georgia,serif; color:var(--ink); background:var(--paper);
+         max-width:46rem; margin:0 auto; padding:3rem 1.5rem 5rem; }
+  h1 { font-size:2.1rem; margin:.2rem 0; letter-spacing:-.02em; }
+  .tag { color:var(--accent); font-style:italic; margin-bottom:2rem; display:block; }
+  h2 { font-size:1.05rem; text-transform:uppercase; letter-spacing:.08em;
+       color:var(--accent); margin-top:2.5rem; }
+  code, pre { font:14px/1.5 ui-monospace,Menlo,monospace; background:#f0eee9;
+              border-radius:6px; }
+  code { padding:.15em .4em; }
+  pre { padding:1rem 1.2rem; overflow-x:auto; border:1px solid #e4e1da; }
+  pre code { background:none; padding:0; }
+  a { color:var(--accent); }
+  .cta { display:flex; gap:1rem; margin:1.5rem 0 0; flex-wrap:wrap; }
+  .btn { border:1.5px solid var(--accent); color:var(--accent); padding:.5rem 1.1rem;
+         border-radius:8px; text-decoration:none; font-family:system-ui,sans-serif;
+         font-size:.95rem; }
+  .btn:hover { background:var(--accent); color:var(--paper); }
+  table { border-collapse:collapse; width:100%; margin:1rem 0; font-size:.95rem; }
+  th,td { border:1px solid #e4e1da; padding:.45rem .7rem; text-align:left; }
+  .stat { font-size:2.6rem; font-weight:700; color:var(--accent); }
+  .stat-label { color:#666; font-size:.9rem; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(160px,1fr));
+          gap:1rem; margin:2rem 0; text-align:center; }
+  footer { margin-top:4rem; color:#6b6f74; font-size:.9rem; }
+</style>
+</head>
+<body>
+<h1>picamatl</h1>
+<span class="tag">pure-Rust PDF size optimizer &mdash; effective-DPI downsampling, fail-safe by contract</span>
+
+<p><strong>Shrink a real 58-page technical report by 73.6% with the
+accessibility tags intact &mdash; without uploading it anywhere.</strong></p>
+
+<p>Picamatl downsamples embedded images to their <em>effective on-page
+DPI</em>: the resolution an image actually displays at, not a fixed global
+target. It runs entirely offline, makes zero network requests, preserves the
+accessibility structure tree and metadata by default, and never returns
+output larger than its input. Malformed or hostile files come back
+byte-for-byte unchanged.</p>
+
+<div class="grid">
+  <div><div class="stat">73.6%</div>smaller on a NASA technical report</div>
+  <div><div class="stat">0</div>network calls, ever</div>
+  <div><div class="stat">5</div>platforms with prebuilt binaries</div>
+</div>
+
+<h2>Install</h2>
+<pre><code>cargo install picamatl
+picamatl report.pdf</code></pre>
+
+<p class="tag">No toolchain? Prebuilt binaries for Linux, macOS, and Windows are on the
+<a href="https://github.com/xcheljd/picamatl/releases">releases page</a>.</p>
+
+<h2>Why not the usual options?</h2>
+<table>
+  <tr><td><strong>Web compressors</strong></td>
+      <td>upload your documents to someone else's server. Picamatl makes
+      zero network calls.</td></tr>
+  <tr><td><strong>Ghostscript</strong></td>
+      <td>AGPL, a PostScript interpreter with a CVE history, and it strips
+      accessibility trees. Picamatl is pure Rust, MIT/Apache, and keeps
+      them.</td></tr>
+  <tr><td><strong>Blind DPI tools</strong></td>
+      <td>downsample every image to one global value. Picamatl reads each
+      image's actual placement and only shrinks what's genuinely
+      over-resolved.</td></tr>
+</table>
+
+<div class="cta">
+  <a class="btn" href="https://github.com/xcheljd/picamatl">GitHub repository</a>
+  <a class="btn" href="https://crates.io/crates/picamatl">crates.io</a>
+  <a class="btn" href="https://docs.rs/picamatl">API documentation</a>
+</div>
+
+<footer>
+picamatl = <em>pico-</em> (tiny) + <em>&amacr;matl</em> (Nahuatl fig-bark paper).
+MIT OR Apache-2.0. Benchmarks are reproducible: see the
+<a href="https://github.com/xcheljd/picamatl/blob/main/docs/CORPUS.md">corpus manifest</a>.
+</footer>
+</body>
+</html>
