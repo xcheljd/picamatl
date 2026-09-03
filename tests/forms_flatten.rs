@@ -14,9 +14,9 @@
 use std::collections::HashSet;
 use std::process::Command;
 
-use picamatl::{optimize_with_options, OptimizeOptions};
 use lopdf::content::{Content, Operation};
 use lopdf::{dictionary, Dictionary, Document, Object, ObjectId, Stream, StringFormat};
+use picamatl::{optimize_with_options, OptimizeOptions};
 
 // -- options ----------------------------------------------------------------
 

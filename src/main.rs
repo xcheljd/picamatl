@@ -10,8 +10,8 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Instant;
 
-use picamatl::{DeflateBackend, OptimizeOptions, SignatureHandling};
 use clap::Parser;
+use picamatl::{DeflateBackend, OptimizeOptions, SignatureHandling, SignatureInfo};
 
 /// How far into the file to look for `%PDF-`. The PDF spec's implementation
 /// notes allow junk before the header; 1024 bytes is the tolerance most
@@ -366,10 +366,7 @@ fn collect_inputs(input: &std::path::Path) -> Vec<PathBuf> {
 /// Resolve one input's output path under the flag combination. The
 /// single-file `-o`/`--force` forms keep their historical meaning; the batch
 /// forms (--output-dir / --suffix) compute `<dir?>/<stem><suffix>.pdf`.
-fn resolve_output(
-    input: &std::path::Path,
-    cli: &Cli,
-) -> Result<(PathBuf, bool), String> {
+fn resolve_output(input: &std::path::Path, cli: &Cli) -> Result<(PathBuf, bool), String> {
     if let Some(dir) = &cli.output_dir {
         let stem = input
             .file_stem()
@@ -397,6 +394,27 @@ fn resolve_output(
         (None, true) => Ok((input.to_path_buf(), false)),
         (None, false) => Ok((input.with_extension("optimized.pdf"), true)),
     }
+}
+
+/// The signature warning line. Built here rather than in the library, which
+/// performs no I/O and owns no user-facing copy; split out of `optimize_one`
+/// so `signature_warning_agrees_with_itself` can pin the singular/plural
+/// agreement, which a stray line continuation has broken before.
+fn signature_warning(signatures: &[SignatureInfo]) -> String {
+    let named: Vec<String> = signatures.iter().map(ToString::to_string).collect();
+    let (plural, verb) = if signatures.len() == 1 {
+        ("", "is")
+    } else {
+        ("s", "are")
+    };
+    format!(
+        "warning: {} digital signature{plural} detected — optimization \
+         re-serializes the document, so the /ByteRange digest{plural} {verb} \
+         invalidated in the output: {}. Proceeding; pass \
+         --on-signature silence to suppress this warning.",
+        signatures.len(),
+        named.join("; ")
+    )
 }
 
 fn optimize_one(input: &std::path::Path, cli: &Cli) -> Result<(), String> {
@@ -427,8 +445,16 @@ fn optimize_one(input: &std::path::Path, cli: &Cli) -> Result<(), String> {
     // returns the input bytes unchanged, so the only failures the CLI can see
     // are I/O.
     let started = Instant::now();
-    let optimized = picamatl::optimize_with_options(&bytes, options_from(cli));
+    let (optimized, report) = picamatl::optimize_with_report(&bytes, options_from(cli));
     let secs = started.elapsed().as_secs_f64();
+
+    // Signatures are reported only for a run that actually returned a
+    // rewritten document, so this line can never contradict the
+    // "wrote a byte-for-byte copy" note below it. `rewritten` is checked
+    // anyway: the honesty of this warning is the whole feature.
+    if report.rewritten && !report.signatures.is_empty() {
+        eprintln!("{}", signature_warning(&report.signatures));
+    }
 
     std::fs::write(&output_path, &optimized)
         .map_err(|e| format!("cannot write {shown_out}: {e}"))?;
@@ -448,10 +474,7 @@ fn optimize_one(input: &std::path::Path, cli: &Cli) -> Result<(), String> {
 fn run(cli: &Cli) -> Result<(), String> {
     let inputs = collect_inputs(&cli.input);
     if inputs.is_empty() {
-        return Err(format!(
-            "no *.pdf files found in {}",
-            cli.input.display()
-        ));
+        return Err(format!("no *.pdf files found in {}", cli.input.display()));
     }
     let multiple = inputs.len() > 1;
     if multiple && (cli.output.is_some() || cli.force) {
@@ -483,5 +506,67 @@ fn main() -> ExitCode {
             eprintln!("error: {message}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use picamatl::SignatureKind;
+
+    fn info(object: Option<(u32, u16)>, kind: SignatureKind) -> SignatureInfo {
+        SignatureInfo::new(object, kind)
+    }
+
+    #[test]
+    fn signature_warning_agrees_with_itself() {
+        // Singular is the common case, and the one a `\` line continuation
+        // silently broke: it eats the newline AND the next line's indent, so
+        // a separator has to be spelled out on the near side.
+        let one = signature_warning(&[info(Some((7, 0)), SignatureKind::Field)]);
+        assert!(
+            one.contains("1 digital signature detected"),
+            "singular count: {one}"
+        );
+        assert!(
+            one.contains("the /ByteRange digest is invalidated"),
+            "singular grammar (note the spaces): {one}"
+        );
+        assert!(
+            one.contains("signature field (object 7 0)"),
+            "naming: {one}"
+        );
+
+        let two = signature_warning(&[
+            info(Some((7, 0)), SignatureKind::Field),
+            info(None, SignatureKind::Permissions),
+        ]);
+        assert!(
+            two.contains("2 digital signatures detected"),
+            "plural count: {two}"
+        );
+        assert!(
+            two.contains("the /ByteRange digests are invalidated"),
+            "plural grammar: {two}"
+        );
+        assert!(
+            two.contains(
+                "signature field (object 7 0); \
+                 permissions/usage-rights entry (direct dict, no object number)"
+            ),
+            "both findings named, semicolon-separated: {two}"
+        );
+    }
+
+    #[test]
+    fn signature_warning_names_the_suppression_flag() {
+        // The warning has to tell the user how to turn it off, or `Silence`
+        // is undiscoverable outside --help.
+        let line = signature_warning(&[info(Some((3, 1)), SignatureKind::Dictionary)]);
+        assert!(line.contains("--on-signature silence"), "{line}");
+        assert!(
+            line.contains("signature dictionary (object 3 1)"),
+            "generation number must survive: {line}"
+        );
     }
 }
