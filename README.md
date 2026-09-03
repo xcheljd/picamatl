@@ -146,13 +146,19 @@ ways, picamatl leaves the number as-is rather than pick.
 
 **Digital signatures do not survive optimization — and picamatl tells you.**
 Every run re-serializes the whole document, so a `/ByteRange` digest — which
-pins file offsets — is invalid in the output. Picamatl detects signature
-fields, usage-rights entries, and certification dictionaries before
-optimizing and prints a warning naming what it found; pass
-`--on-signature silence` in pipelines that pre-filter signed files. (There
-is no mode that preserves a signature: any re-serialization moves offsets.
-This is true of every PDF optimizer; the difference is that picamatl says
-so at runtime instead of silently.)
+pins file offsets — is invalid in the output. Before optimizing, picamatl
+walks the `/AcroForm` field tree (through `/Kids`, inheriting `/FT` and
+`/V`), the merged field/widget signature dictionaries some writers emit, and
+the catalog's `/Perms` `/UR3` usage-rights and `/DocMDP` certification
+entries — then prints one warning naming each signature it found and the
+object number it lives in. Pass `--on-signature silence` in pipelines that
+pre-filter signed files.
+
+The warning is only printed when picamatl actually rewrote the document: a
+run that declines and hands back your bytes byte for byte invalidates
+nothing, and says nothing. (There is no mode that *preserves* a signature:
+any re-serialization moves offsets. This is true of every PDF optimizer; the
+difference is that picamatl says so at runtime instead of silently.)
 
 ## Library usage
 
@@ -169,6 +175,13 @@ let opts = OptimizeOptions::default()
     .with_strip_metadata(true)          // drop XMP packets; opt-in, off by default
     .with_pack_object_streams(false);   // PDF 1.5 ObjStm packing, ON by default
 let optimized = picamatl::optimize_with_options(&input_bytes, opts);
+
+// Same bytes, plus what the run found. The library never writes to stderr:
+// callers that want the signature warning format it themselves.
+let (optimized, report) = picamatl::optimize_with_report(&input_bytes, opts);
+for signature in &report.signatures {
+    println!("{signature}");  // e.g. "signature field (object 7 0)"
+}
 ```
 
 Beyond downsampling, picamatl also merges byte-identical duplicate objects and

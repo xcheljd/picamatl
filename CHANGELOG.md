@@ -9,19 +9,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Signature detection and warning.** Picamatl now detects signature
-  dictionaries reachable from `/AcroForm/Fields` (both indirect and
-  direct-dict forms), catalog `/Perms` usage-rights and MDP entries, and
-  prints one stderr warning naming what it found before optimizing — a
-  signed PDF's `/ByteRange` digest is invalidated by any re-serialization,
-  and until now nothing at runtime said so. New
-  `--on-signature warn|silence` flag (`OptimizeOptions::on_signature`,
-  `SignatureHandling::Warn` default / `Silence` for pre-filtering
-  pipelines).
+- **Signature detection and warning.** A signed PDF's `/ByteRange` digest is
+  invalidated by any re-serialization, and until now nothing at runtime said
+  so. Picamatl now detects the signatures a run would invalidate and the CLI
+  prints one stderr warning naming each of them and its object number.
+  Detection covers:
+  - the `/AcroForm` field tree, walked recursively through `/Kids` with
+    `/FT` and `/V` inherited (ISO 32000-1 12.7.3.1: only leaf nodes must
+    carry `/FT`), depth-guarded against cyclic `/Kids`;
+  - merged field/widget nodes that carry `/ByteRange` themselves;
+  - the catalog's `/Perms` `/UR3` (Reader-extended usage rights — the
+    Reader-extended IRS form profile) and `/DocMDP` (certification) entries,
+    whose values *are* the signature dictionaries per Table 258.
+
+  Every reference along the way is resolved: `/AcroForm`, `/Fields`, `/FT`,
+  `/V`, `/Kids`, `/Perms` and the `/Perms` entries may each be indirect.
+  Findings are deduplicated by object id, so one signature reached through
+  both `/AcroForm` and `/Perms` is reported once. An unsigned placeholder
+  field — no `/V`, or a `/V` that is not a signature dictionary — is
+  deliberately *not* reported: there is no digest to invalidate.
+
+  New `--on-signature warn|silence` flag
+  (`OptimizeOptions::on_signature`, `SignatureHandling::Warn` default /
+  `Silence` for pre-filtering pipelines). `Silence` skips the walk entirely
+  and costs nothing.
+
+- **`optimize_with_report`**, returning `(Vec<u8>, OptimizeReport)` — the
+  same bytes `optimize_with_options` returns, plus the `SignatureInfo`
+  findings and whether the run rewrote the document or handed the input
+  back. The library performs no I/O of its own: the `picamatl` binary owns
+  the warning text. New public items: `OptimizeReport`, `SignatureInfo`,
+  `SignatureKind`.
 
 ### Changed
 
 - README signature paragraph updated to describe the runtime warning.
+- `SignatureHandling` is now `#[non_exhaustive]`, matching
+  `OptimizeOptions`, so a future variant is not a breaking change.
+- The signature warning is emitted only when picamatl actually returned a
+  rewritten document. A declined or non-shrinking run hands back the input
+  byte for byte, invalidates nothing, and now says nothing — it used to
+  print the warning and "wrote a byte-for-byte copy" on the same run.
 
 ## [0.4.1] - 2026-08-27
 
