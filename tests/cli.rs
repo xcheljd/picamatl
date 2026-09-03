@@ -1,10 +1,150 @@
 //! End-to-end tests for the `picamatl` CLI binary, driven as a subprocess via
 //! `CARGO_BIN_EXE_picamatl` (cargo builds it before running integration tests).
 
+use std::path::{Path, PathBuf};
 use std::process::Command;
+
+use lopdf::{dictionary, Document, Object, StringFormat};
 
 fn picamatl() -> Command {
     Command::new(env!("CARGO_BIN_EXE_picamatl"))
+}
+
+/// Write `fixtures/sample.pdf` with a conforming signature field bolted on
+/// (`/FT /Sig` -> `/V` -> a `/ByteRange`-carrying dictionary) into a fresh
+/// temp dir, and return the path. The base fixture is the one the CLI is
+/// already known to shrink, which is what makes the warning legitimate: a
+/// passthrough must not print it.
+fn signed_fixture(dir_name: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(dir_name);
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let mut doc = Document::load("fixtures/sample.pdf").expect("load fixture");
+    let sig_id = doc.add_object(dictionary! {
+        "Type" => Object::Name(b"Sig".to_vec()),
+        "Filter" => Object::Name(b"Adobe.PPKLite".to_vec()),
+        "SubFilter" => Object::Name(b"adbe.pkcs7.detached".to_vec()),
+        "ByteRange" => Object::Array(vec![
+            Object::Integer(0), Object::Integer(10),
+            Object::Integer(20), Object::Integer(10),
+        ]),
+        "Contents" => Object::String(b"fake".to_vec(), StringFormat::Hexadecimal),
+    });
+    let field_id = doc.add_object(dictionary! {
+        "FT" => Object::Name(b"Sig".to_vec()),
+        "T" => Object::String(b"Signature1".to_vec(), StringFormat::Literal),
+        "V" => Object::Reference(sig_id),
+    });
+    doc.catalog_mut().unwrap().set(
+        "AcroForm",
+        Object::Dictionary(dictionary! {
+            "SigFlags" => Object::Integer(3),
+            "Fields" => Object::Array(vec![Object::Reference(field_id)]),
+        }),
+    );
+    let path = dir.join("signed.pdf");
+    doc.save(&path).expect("write signed fixture");
+    path
+}
+
+/// Run the CLI on `input`, returning `(stderr, output bytes)`.
+fn run_on(input: &Path, out: &Path, extra: &[&str]) -> (String, Vec<u8>) {
+    let mut cmd = picamatl();
+    cmd.arg(input).arg("-o").arg(out);
+    for arg in extra {
+        cmd.arg(arg);
+    }
+    let result = cmd.output().expect("run picamatl");
+    assert!(
+        result.status.success(),
+        "picamatl failed: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    (
+        String::from_utf8_lossy(&result.stderr).into_owned(),
+        std::fs::read(out).expect("read output"),
+    )
+}
+
+#[test]
+fn signature_warning_prints_by_default_and_silence_suppresses_it() {
+    let input = signed_fixture("picamatl-cli-signed");
+    let original = std::fs::read(&input).unwrap();
+    let dir = input.parent().unwrap();
+
+    let (warned, out) = run_on(&input, &dir.join("warn.pdf"), &[]);
+    assert!(
+        out.len() < original.len(),
+        "the signed fixture must actually shrink, or the warning would be \
+         about a passthrough: {} -> {}",
+        original.len(),
+        out.len()
+    );
+    assert!(
+        warned.contains("1 digital signature detected"),
+        "default run must warn: {warned}"
+    );
+    assert!(
+        warned.contains("the /ByteRange digest is invalidated"),
+        "singular grammar, with both spaces: {warned}"
+    );
+    assert!(
+        warned.contains("signature field (object"),
+        "the warning must name what it found: {warned}"
+    );
+
+    let (silenced, silent_out) =
+        run_on(&input, &dir.join("silent.pdf"), &["--on-signature=silence"]);
+    assert!(
+        !silenced.contains("digital signature"),
+        "--on-signature silence must suppress the warning: {silenced}"
+    );
+    assert_eq!(
+        out, silent_out,
+        "the flag decides who is told, never what is produced"
+    );
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn a_passthrough_run_does_not_warn_about_signatures() {
+    // Feed picamatl its own output back in. Nothing is left to win, so the
+    // bytes come straight back — no re-serialization, no invalidated digest,
+    // and therefore no warning. This used to print the warning and the
+    // "wrote a byte-for-byte copy" note on the same run, which cannot both
+    // be true.
+    let input = signed_fixture("picamatl-cli-signed-passthrough");
+    let dir = input.parent().unwrap().to_path_buf();
+    let once = dir.join("once.pdf");
+    let (_, first) = run_on(&input, &once, &[]);
+
+    let twice = dir.join("twice.pdf");
+    let (stderr, second) = run_on(&once, &twice, &[]);
+    assert_eq!(second, first, "second pass must be a byte-for-byte copy");
+    assert!(
+        stderr.contains("byte-for-byte copy"),
+        "expected the passthrough note: {stderr}"
+    );
+    assert!(
+        !stderr.contains("digital signature"),
+        "a passthrough invalidates nothing and must not warn: {stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn an_unsigned_document_never_mentions_signatures() {
+    let dir = std::env::temp_dir().join("picamatl-cli-unsigned");
+    std::fs::create_dir_all(&dir).unwrap();
+    let (stderr, _) = run_on(Path::new("fixtures/sample.pdf"), &dir.join("out.pdf"), &[]);
+    assert!(
+        !stderr.contains("digital signature"),
+        "no signature, no warning: {stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -21,6 +161,7 @@ fn help_exits_successfully_and_documents_flags() {
         "--downsample-flate-images",
         "--subset-fonts",
         "--recompress-bitonal-images",
+        "--on-signature",
     ] {
         assert!(text.contains(flag), "--help missing {flag}");
     }
@@ -122,15 +263,24 @@ fn output_dir_batch_processes_a_directory_into_new_files() {
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&in_dir).unwrap();
     // Two inputs: one shrinks, one is unchanged — batch must handle both.
-    std::fs::copy("fixtures/forms/filled-acroform.pdf", in_dir.join("dummy.pdf")).unwrap();
+    std::fs::copy(
+        "fixtures/forms/filled-acroform.pdf",
+        in_dir.join("dummy.pdf"),
+    )
+    .unwrap();
     std::fs::copy("fixtures/sample.pdf", in_dir.join("nist-ssdf.pdf")).unwrap();
 
     let out = picamatl()
-        .arg("--output-dir").arg(&out_dir)
+        .arg("--output-dir")
+        .arg(&out_dir)
         .arg(&in_dir)
         .output()
         .expect("run batch");
-    assert!(out.status.success(), "batch run failed: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "batch run failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     // Outputs land in out_dir with the same file names; inputs untouched.
     for name in ["dummy.pdf", "nist-ssdf.pdf"] {
@@ -153,7 +303,11 @@ fn suffix_writes_beside_the_input_and_leaves_the_input_alone() {
         .arg(&input)
         .output()
         .expect("run suffix");
-    assert!(out.status.success(), "suffix run failed: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "suffix run failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     let written = tmp.join("doc-small.pdf");
     assert!(written.is_file(), "doc-small.pdf not written beside input");
@@ -163,7 +317,10 @@ fn suffix_writes_beside_the_input_and_leaves_the_input_alone() {
     // it parses and is never larger than the input (never-larger contract).
     let original_len = std::fs::metadata(&input).unwrap().len();
     let written_len = std::fs::metadata(&written).unwrap().len();
-    assert!(written_len <= original_len, "suffix output grew: {written_len} > {original_len}");
+    assert!(
+        written_len <= original_len,
+        "suffix output grew: {written_len} > {original_len}"
+    );
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
@@ -174,16 +331,24 @@ fn output_dir_and_suffix_combine() {
     let out_dir = tmp.join("out");
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&in_dir).unwrap();
-    std::fs::copy("fixtures/forms/filled-acroform.pdf", in_dir.join("report.pdf")).unwrap();
+    std::fs::copy(
+        "fixtures/forms/filled-acroform.pdf",
+        in_dir.join("report.pdf"),
+    )
+    .unwrap();
 
     let out = picamatl()
-        .arg("--output-dir").arg(&out_dir)
+        .arg("--output-dir")
+        .arg(&out_dir)
         .arg("--suffix=-min")
         .arg(&in_dir)
         .output()
         .expect("run combo");
     assert!(out.status.success());
-    assert!(out_dir.join("report-min.pdf").is_file(), "combined stem+suffix name missing");
+    assert!(
+        out_dir.join("report-min.pdf").is_file(),
+        "combined stem+suffix name missing"
+    );
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
@@ -194,20 +359,34 @@ fn batch_continues_past_a_bad_file_and_reports_failure() {
     let out_dir = tmp.join("out");
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&in_dir).unwrap();
-    std::fs::copy("fixtures/forms/filled-acroform.pdf", in_dir.join("good.pdf")).unwrap();
+    std::fs::copy(
+        "fixtures/forms/filled-acroform.pdf",
+        in_dir.join("good.pdf"),
+    )
+    .unwrap();
     std::fs::write(in_dir.join("broken.pdf"), b"not a pdf at all").unwrap();
 
     let out = picamatl()
-        .arg("--output-dir").arg(&out_dir)
+        .arg("--output-dir")
+        .arg(&out_dir)
         .arg(&in_dir)
         .output()
         .expect("run batch with bad file");
-    assert!(!out.status.success(), "batch must exit nonzero on any failure");
+    assert!(
+        !out.status.success(),
+        "batch must exit nonzero on any failure"
+    );
     let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("not a PDF"), "bad-file error should name the problem: {err}");
+    assert!(
+        err.contains("not a PDF"),
+        "bad-file error should name the problem: {err}"
+    );
     assert!(err.contains("1 of 2"), "summary must count failures: {err}");
     // The good file still processed — batch does not lose the rest.
-    assert!(out_dir.join("good.pdf").is_file(), "good file lost when a sibling failed");
+    assert!(
+        out_dir.join("good.pdf").is_file(),
+        "good file lost when a sibling failed"
+    );
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
@@ -215,13 +394,17 @@ fn batch_continues_past_a_bad_file_and_reports_failure() {
 fn output_conflicts_with_suffix_and_output_dir() {
     let out = picamatl()
         .arg("fixtures/forms/filled-acroform.pdf")
-        .arg("-o").arg("/tmp/never.pdf")
+        .arg("-o")
+        .arg("/tmp/never.pdf")
         .arg("--suffix=-x")
         .output()
         .expect("run conflicting flags");
     assert!(!out.status.success(), "-o + --suffix must be rejected");
     let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("cannot be used with"), "clap conflict message expected: {err}");
+    assert!(
+        err.contains("cannot be used with"),
+        "clap conflict message expected: {err}"
+    );
 }
 
 #[test]
@@ -235,9 +418,13 @@ fn multiple_inputs_with_single_file_output_flags_are_rejected() {
 
     let out = picamatl()
         .arg(&in_dir)
-        .arg("-o").arg("/tmp/never-multi.pdf")
+        .arg("-o")
+        .arg("/tmp/never-multi.pdf")
         .output()
         .expect("run multi + -o");
-    assert!(!out.status.success(), "multi-input with -o must be rejected");
+    assert!(
+        !out.status.success(),
+        "multi-input with -o must be rejected"
+    );
     let _ = std::fs::remove_dir_all(&tmp);
 }
