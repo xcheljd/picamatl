@@ -1,4 +1,12 @@
 /target
+
+# Benchmark corpora: fetched by scripts/fetch-corpus.sh, never committed.
 /corpus/
-corpus-expanded/
+/corpus-expanded/
 __pycache__/
+
+# Editor and OS droppings.
+.vscode/
+.idea/
+*.swp
+.DS_Store

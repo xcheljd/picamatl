@@ -1,16 +1,24 @@
-//! B-M1 Phase 1 vetting spike for the `fax` 0.3.0 crate (CCITT G3/G4).
+//! Contract tests for the `fax` crate (CCITT G3/G4), the one vendor codec
+//! `--recompress-bitonal-images` delegates to.
 //!
-//! Functional probes required by docs/PHASE3-PLAN.md §B.2 before committing to
-//! the G4 re-encode milestone:
+//! These pin the properties `src/bitonal.rs` relies on and cannot check for
+//! itself, so a `fax` upgrade that breaks one fails here rather than in a
+//! user's scan:
 //!
-//! 1. G4 encode→decode round-trip on synthetic bitonal data — pixel equality.
-//! 2. Panic safety: truncated / corrupt G4 data must produce an error (never
-//!    a panic, never silently-wrong success).
-//! 3. Byte economy: G4 vs flate2 level-9 deflate of the same packed rows.
+//! 1. G4 encode→decode round-trips to pixel equality on synthetic bitonal data.
+//! 2. Truncated or corrupt G4 data produces an error — never a panic, and
+//!    never a silently-wrong success. `bitonal.rs`'s decode-back verification
+//!    is only as good as this.
+//! 3. G4 actually beats flate2 level-9 deflate on the same packed rows, which
+//!    is the whole premise of the pass.
 //!
-//! The static audit lives in docs/PHASE3-PLAN.md §B ("Vetting spike results"):
-//! MIT LICENSE present; `#![deny(unsafe_code)]` crate-wide; rust-version 1.71;
-//! zero transitive dependencies (`cargo tree -p fax`).
+//! Written for the B-M1 milestone (docs/PHASE3-PLAN.md §B.2) and kept as a
+//! standing regression suite. The static half of that audit — MIT license,
+//! crate-wide `#![deny(unsafe_code)]`, rust-version 1.71, zero transitive
+//! dependencies — is recorded in §B and re-checked by `cargo tree -p fax`.
+//!
+//! This is the slowest test binary in the suite; the round-trip volume is
+//! deliberate, since a sampling-based version would not pin the edge rows.
 
 use fax::decoder::{decode_g3, decode_g4, pels};
 use fax::encoder::Encoder;

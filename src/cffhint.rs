@@ -1042,7 +1042,8 @@ mod tests {
     #[test]
     #[ignore = "needs PICAMATL_CFF_DIR corpus"]
     fn corpus_report() {
-        let dir = std::env::var("PICAMATL_CFF_DIR").unwrap_or_else(|_| "target/scratch/h5/cff".into());
+        let dir =
+            std::env::var("PICAMATL_CFF_DIR").unwrap_or_else(|_| "target/scratch/h5/cff".into());
         let mut entries: Vec<_> = std::fs::read_dir(&dir)
             .unwrap()
             .filter_map(Result::ok)

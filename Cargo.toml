@@ -1,17 +1,35 @@
 [package]
 name = "picamatl"
 version = "0.4.2"
-description = "Pure-Rust PDF size optimizer: CTM-aware effective-DPI downsampling of embedded JPEG and Flate images, opt-in Type0 font subsetting, with a hard fail-safe contract. No Ghostscript; everything stays on your machine."
+# Kept under 160 chars so crates.io search does not truncate it mid-word, and
+# ordered for the ~90 chars that snippet actually shows: what it is and that it
+# is a CLI first, then the differentiators.
+description = "PDF size optimizer (CLI + library): downsamples over-resolution images to on-page DPI. No Ghostscript, no AGPL, local-only, never larger than the input."
 authors = ["Xchel Dominguez <xjdom2@gmail.com>"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/xcheljd/picamatl"
 readme = "README.md"
 keywords = ["pdf", "compression", "optimizer", "jpeg", "mozjpeg"]
-categories = ["compression", "multimedia::images"]
+# command-line-utilities is claimed because [[bin]] below ships a real CLI;
+# without it, CLI browsers never see this crate.
+categories = ["compression", "multimedia::images", "command-line-utilities"]
 edition = "2021"
-# Dependency-driven floor, not from this crate's own code: lopdf 0.42.0 needs
+# Dependency-driven floor, not from this crate's own code: lopdf 0.44 needs
 # edition 2024 (Cargo/Rust >= 1.85), and current image/time releases need 1.88.
 rust-version = "1.88.0"
+# Development scaffolding stays in the repository and out of the tarball:
+# hunt probe scripts and their notes, the Phase 7 spike examples (whose own
+# headers say "not shipped"), and the corpus manifest, whose only consumers
+# are scripts/fetch-corpus.sh and scripts/verify-corpus.sh. Everything a
+# consumer or reviewer needs — src, tests, fixtures, README, CHANGELOG, the
+# architecture and design docs, licenses, NOTICE — still ships.
+exclude = [
+    "/scripts",
+    "/docs/hunts",
+    "/corpus.sha256",
+    "/examples/spike_*",
+    "/fixtures/jpeg/generate*.py",
+]
 
 [package.metadata.docs.rs]
 targets = ["x86_64-unknown-linux-gnu"]
@@ -70,11 +88,15 @@ path = "src/main.rs"
 # outline + advance equality between the original and subset font programs.
 # Never a runtime dependency.
 ttf-parser = "0.25.1"
-# PNG support for the Phase 7 spike tooling (examples/spike_*.rs) only; the
-# library itself keeps its jpeg-only image build.
+# PNG support for the Phase 7 spike tooling (examples/spike_*.rs, repo-only —
+# excluded from the package above); the library keeps its jpeg-only image build.
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 
-# The profile that 'dist' will build with
+# The profile that 'dist' will build with. `lto = "thin"` is dist's generated
+# default and is kept deliberately: the hot loops are libjpeg-turbo's, inside a
+# C static library that Rust's LTO does not cross, so the case for paying fat
+# LTO's link time on five release targets has not been made. Revisit with a
+# measurement, not a preference.
 [profile.dist]
 inherits = "release"
 lto = "thin"

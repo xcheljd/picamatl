@@ -322,7 +322,7 @@ has no such hazard and remains a legitimate B-M2 candidate.
 
 ### B.3 Vetting spike results (2026-08-22) — PASS (partial scope; see note)
 
-Checks run against `fax 0.3.0` (probes live in `tests/fax_spike.rs`, kept as a
+Checks run against `fax 0.3.0` (probes live in `tests/ccitt_vendor_contract.rs`, kept as a
 permanent regression harness):
 
 **Scope note (honesty vs §B.2's spike definition):** the original spike covered
@@ -352,8 +352,8 @@ entire target corpus for this milestone.
 
 #### B.3.1 Gap-closing probes (2026-08-22) — PASS
 
-Follow-up probes closing the scope-note gaps (`tests/fax_spike.rs` +
-`tests/fax_pdf_interop.rs`), all against `fax 0.3.0` source read from the
+Follow-up probes closing the scope-note gaps (`tests/ccitt_vendor_contract.rs` +
+`tests/ccitt_pdf_interop.rs`), all against `fax 0.3.0` source read from the
 registry tarball:
 
 | Probe | Result | Detail |

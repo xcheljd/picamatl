@@ -21,7 +21,7 @@ jobs:
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           toolchain: stable
-          components: clippy
+          components: clippy, rustfmt
 
       # mozjpeg compiles libjpeg-turbo (needs NASM for x86_64 SIMD); cmake is
       # already on the runner.
@@ -40,8 +40,11 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
 
+      - name: Formatting
+        run: cargo fmt --check
+
   # The crate records rust-version = "1.88.0" (MSRV, dictated by lopdf
-  # 0.42.0's edition-2024 manifest and current image/time releases);
+  # 0.44's edition-2024 manifest and current image/time releases);
   # verify it actually builds there so the claim can't silently rot.
   msrv:
     runs-on: ubuntu-latest

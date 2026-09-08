@@ -1,11 +1,13 @@
-//! B-M1 pre-work probe C: prove a `fax`-encoded G4 stream survives a real PDF
-//! embedding — written as a `/CCITTFaxDecode` image XObject via lopdf, read
-//! back through lopdf (raw stream bytes; lopdf does not decode CCITT) and
-//! decoded with `fax`, then rendered by Ghostscript (a foreign decoder) and
+//! End-to-end check that a `fax`-encoded G4 stream survives a real PDF
+//! embedding: written as a `/CCITTFaxDecode` image XObject via lopdf, read
+//! back through lopdf (raw stream bytes — lopdf does not decode CCITT) and
+//! decoded with `fax`, then rendered by Ghostscript (a *foreign* decoder) and
 //! compared pixel-for-pixel against the source bitmap.
 //!
-//! The Ghostscript half is skipped with a message if `gs` is not installed —
-//! the lopdf round-trip half always runs.
+//! The foreign-decoder half is the point: it is what proves
+//! `--recompress-bitonal-images` emits streams other readers agree with, not
+//! just streams picamatl can read back. It is skipped with a message if `gs`
+//! is not installed; the lopdf round-trip half always runs.
 
 use std::path::PathBuf;
 use std::process::Command;

@@ -368,7 +368,7 @@ mod tests {
         OptimizeOptions::default().with_recompress_bitonal_images(true)
     }
 
-    /// Deterministic LCG so failures reproduce (same as tests/fax_spike.rs).
+    /// Deterministic LCG so failures reproduce (same as tests/ccitt_vendor_contract.rs).
     struct Lcg(u64);
     impl Lcg {
         fn next(&mut self) -> u64 {
@@ -443,7 +443,7 @@ mod tests {
     }
 
     /// Encode ink rows as EOL-framed G3 1D using fax's public code tables
-    /// (same construction as tests/fax_spike.rs — fax ships no G3 encoder).
+    /// (same construction as tests/ccitt_vendor_contract.rs — fax ships no G3 encoder).
     fn g3_of(rows: &[Vec<bool>]) -> Vec<u8> {
         use fax::maps::{black, white, EOL};
         fn write_run(w: &mut VecWriter, color: Color, mut n: u32) {
