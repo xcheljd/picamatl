@@ -124,9 +124,11 @@ Executed in this order; each pass reports whether it did work.
   CMYK samples (libjpeg `JCS_CMYK`), resample all four channels, re-encode as
   YCCK with APP14 written by libjpeg. Never converted to RGB; `/Decode` arrays
   decline. See `docs/CMYK-JPEG.md`.
-- **Digital signatures**: re-serialization invalidates `/ByteRange` digests.
-  Always has; the entropy passes no longer pretend otherwise by declining.
-  Optimizing a signed PDF invalidates its signature — documented in README.
+- **Digital signatures**: a `/ByteRange` digest covers file offsets, and every
+  run re-serializes the whole document, so optimizing a signed PDF always
+  invalidates its signature. Picamatl therefore detects rather than declines:
+  `--on-signature warn` (default) names each affected signature on stderr.
+  The full rationale is the comment block above `SIG_MAX_DEPTH` in `src/lib.rs`.
 
 ## Consent ladder (README calls these levels)
 

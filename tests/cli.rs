@@ -250,7 +250,21 @@ fn bitonal_flag_is_accepted_and_shrinks_the_flate_bitonal_pdf() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(out_path.exists());
-    assert!(std::fs::read(&out_path).unwrap().starts_with(b"%PDF-"));
+    let optimized = std::fs::read(&out_path).unwrap();
+    assert!(optimized.starts_with(b"%PDF-"));
+
+    // The name of this test promises a size reduction, so assert one.
+    // `--no-downsample-flate-images` is what makes this specific: with the
+    // resampling route switched off, the bitonal G4 pass is the only thing
+    // that can move the 1-bit page, so a non-shrinking output means the flag
+    // did not fire.
+    let original = std::fs::read("fixtures/sample.pdf").unwrap();
+    assert!(
+        optimized.len() < original.len(),
+        "bitonal recompression should shrink the fixture: {} -> {} bytes",
+        original.len(),
+        optimized.len()
+    );
 }
 
 // ---- output options (v0.4.1): --output-dir, --suffix, batch mode ----
@@ -263,12 +277,8 @@ fn output_dir_batch_processes_a_directory_into_new_files() {
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&in_dir).unwrap();
     // Two inputs: one shrinks, one is unchanged — batch must handle both.
-    std::fs::copy(
-        "fixtures/forms/filled-acroform.pdf",
-        in_dir.join("dummy.pdf"),
-    )
-    .unwrap();
-    std::fs::copy("fixtures/sample.pdf", in_dir.join("nist-ssdf.pdf")).unwrap();
+    std::fs::copy("fixtures/forms/filled-acroform.pdf", in_dir.join("form.pdf")).unwrap();
+    std::fs::copy("fixtures/sample.pdf", in_dir.join("images.pdf")).unwrap();
 
     let out = picamatl()
         .arg("--output-dir")
@@ -283,7 +293,7 @@ fn output_dir_batch_processes_a_directory_into_new_files() {
     );
 
     // Outputs land in out_dir with the same file names; inputs untouched.
-    for name in ["dummy.pdf", "nist-ssdf.pdf"] {
+    for name in ["form.pdf", "images.pdf"] {
         assert!(out_dir.join(name).is_file(), "missing {name} in output dir");
         assert!(in_dir.join(name).is_file(), "input {name} was consumed");
     }
@@ -408,6 +418,63 @@ fn output_conflicts_with_suffix_and_output_dir() {
 }
 
 #[test]
+fn a_single_failing_input_reports_exactly_one_error() {
+    let missing = std::env::temp_dir().join("picamatl-cli-does-not-exist.pdf");
+    let _ = std::fs::remove_file(&missing);
+
+    let out = picamatl()
+        .arg(&missing)
+        .output()
+        .expect("run on a missing file");
+    assert!(!out.status.success(), "a missing input must exit nonzero");
+
+    let err = String::from_utf8_lossy(&out.stderr);
+    let errors: Vec<&str> = err.lines().filter(|l| l.starts_with("error:")).collect();
+    // The per-file line says everything; a "1 of 1 inputs failed" summary
+    // after it would be a second, vaguer report of the same fact.
+    assert_eq!(errors.len(), 1, "one error line expected, got: {err:?}");
+    assert!(
+        errors[0].starts_with("error: cannot read "),
+        "the surviving line must be the specific one: {err:?}"
+    );
+}
+
+#[test]
+fn a_batch_with_one_failing_input_still_summarizes_the_count() {
+    let tmp = std::env::temp_dir().join("picamatl-cli-batch-partial");
+    let in_dir = tmp.join("in");
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&in_dir).unwrap();
+    std::fs::copy("fixtures/sample.pdf", in_dir.join("good.pdf")).unwrap();
+    // A .pdf that is not a PDF: collected as an input, rejected on sniffing.
+    std::fs::write(in_dir.join("bad.pdf"), b"not a pdf at all").unwrap();
+
+    let out = picamatl()
+        .arg(&in_dir)
+        .arg("--output-dir")
+        .arg(tmp.join("out"))
+        .output()
+        .expect("run a partially failing batch");
+    assert!(!out.status.success(), "a failed member must exit nonzero");
+
+    let err = String::from_utf8_lossy(&out.stderr);
+    // Two inputs, so the count genuinely summarizes something the per-file
+    // lines do not, and the plural is spelled out rather than "input(s)".
+    assert!(
+        err.contains("error: 1 of 2 inputs failed"),
+        "batch summary expected: {err:?}"
+    );
+    assert!(
+        !err.contains("input(s)"),
+        "parenthetical plural should be gone: {err:?}"
+    );
+    // The good file still ran: batch semantics are unchanged.
+    assert!(tmp.join("out").join("good.pdf").exists());
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
 fn multiple_inputs_with_single_file_output_flags_are_rejected() {
     let tmp = std::env::temp_dir().join("picamatl-cli-multi-o");
     let in_dir = tmp.join("in");
@@ -426,5 +493,18 @@ fn multiple_inputs_with_single_file_output_flags_are_rejected() {
         !out.status.success(),
         "multi-input with -o must be rejected"
     );
+
+    // Pin the exact wording, not just the exit code. This string is assembled
+    // across a `\` line continuation, which eats the newline AND the next
+    // line's indent — it shipped once with 14 literal spaces inside it, and
+    // nothing in the suite noticed.
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        err.trim_end(),
+        "error: --output/--force apply to a single input; \
+         for multiple files use --output-dir and/or --suffix",
+        "exact rejection text (watch the internal spacing): {err:?}"
+    );
+
     let _ = std::fs::remove_dir_all(&tmp);
 }

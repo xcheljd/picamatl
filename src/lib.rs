@@ -4,6 +4,26 @@
 //! Mesoamerican codices. Picamatl shrinks PDFs by downsampling over-resolution
 //! embedded images to the resolution they are actually rendered at.
 //!
+//! ```
+//! use picamatl::{optimize_with_options, OptimizeOptions};
+//!
+//! // Any &[u8]; this is the crate's own four-page test fixture.
+//! let input: &[u8] = include_bytes!("../fixtures/sample.pdf");
+//!
+//! let opts = OptimizeOptions::default().with_target_dpi(130.0);
+//! let output = optimize_with_options(input, opts);
+//!
+//! // The contract, in one line: never larger than what you handed in. Any
+//! // change that cannot prove it shrinks is declined, and a file picamatl
+//! // cannot make smaller comes back byte for byte.
+//! assert!(output.len() <= input.len());
+//! ```
+//!
+//! [`optimize`] is the same call with default options; [`optimize_with_report`]
+//! additionally returns what the run found — notably any digital signatures it
+//! would invalidate. None of them return an error, and none of them panic: see
+//! *Hard safety guarantees* below.
+//!
 //! For the dominant input shape this targets — business documents (flyers,
 //! catalogs, decks, reports) exported from office suites, where embedded JPEG
 //! product photos are ~80% of file bytes — a measured sweet spot of ~130 DPI /
@@ -21,27 +41,8 @@
 //!      JPEG artifacts are ever introduced on that content class.
 //!   3. Replace the stream only when the result is actually smaller.
 //!
-//!   Soft-masked DCTDecode images (`/SMask`) follow the Phase 5 D-milestone
-//!   rules: over-resolution pairs are **downsampled as a unit** (D-M2) — the
-//!   base JPEG and its `/SMask` stream are resampled to the SAME target
-//!   geometry and replaced together or not at all — while pairs at or below
-//!   the target resolution take the dimension-preserving D-M1 requantization
-//!   (the base is re-encoded at the configured JPEG quality at its OWN
-//!   dimensions, never resized, and the `/SMask` stream is never modified).
-//!   Both apply only when the mask is a plain 8-bit DeviceGray image stream
-//!   with no `/Matte`. `/Mask` (stencil/color-key) images and any ineligible
-//!   `/SMask` stay untouched.
-//!
-//!   Soft-masked FlateDecode bases (D-M3) take the coupled downsample when
-//!   over-resolution; otherwise they are untouched by default, and with the
-//!   `allow_lossy_reencode` consent flag they take the dimension-preserving
-//!   Flate→JPEG conversion. That conversion rewrites the base stream only —
-//!   the `/SMask` object keeps its bytes and its dimensions, so alignment is
-//!   preserved by construction (and shared masks stay safe for the same
-//!   reason the D-M1 requant is safe for them). Under the same flag the
-//!   over-resolution coupled downsample also runs a JPEG competitor at its
-//!   TARGET geometry, against the losslessly resampled mask, so a masked pair
-//!   reaches its final encoding in one pass instead of two.
+//! Soft-masked images (`/SMask`) are handled too, under rules narrow enough
+//! that alignment cannot break; they are documented on [`OptimizeOptions`].
 //!
 //! By default (opt-out via [`OptimizeOptions::subset_fonts`]), embedded
 //! Type0/CIDFontType2 (Identity-H/V) fonts and nonsymbolic simple TrueType
@@ -106,6 +107,36 @@ const DPI_MARGIN: f32 = 1.15;
 /// Set this to `false` (CLI: `--no-pack-object-streams`) when the audience may
 /// include such readers. Implemented in pure Rust (no native deps) to avoid
 /// bundling an external tool such as qpdf.
+///
+/// # Soft-masked images
+///
+/// No option turns this on or off; it is how `target_dpi`, `jpeg_quality` and
+/// `allow_lossy_reencode` behave when an image carries an `/SMask`. The rules
+/// are named D-M1/D-M2/D-M3 in the source and in `docs/ARCHITECTURE.md`.
+///
+/// Soft-masked DCTDecode bases: over-resolution pairs are **downsampled as a
+/// unit** (D-M2) — the base JPEG and its `/SMask` stream are resampled to the
+/// SAME target geometry and replaced together or not at all — while pairs at
+/// or below the target resolution take the dimension-preserving D-M1
+/// requantization (the base is re-encoded at `jpeg_quality` at its OWN
+/// dimensions, never resized, and the `/SMask` stream is never modified).
+/// Both apply only when the mask is a plain 8-bit DeviceGray image stream with
+/// no `/Matte`. `/Mask` (stencil/color-key) images and any ineligible `/SMask`
+/// stay untouched.
+///
+/// Soft-masked FlateDecode bases (D-M3) take the coupled downsample when
+/// over-resolution; otherwise they are untouched by default, and with
+/// `allow_lossy_reencode` they take the dimension-preserving Flate→JPEG
+/// conversion. That conversion rewrites the base stream only — the `/SMask`
+/// object keeps its bytes and its dimensions, so alignment is preserved by
+/// construction (and shared masks stay safe for the same reason the D-M1
+/// requant is safe for them). Under the same flag the over-resolution coupled
+/// downsample also runs a JPEG competitor at its TARGET geometry, against the
+/// losslessly resampled mask, so a masked pair reaches its final encoding in
+/// one pass instead of two.
+///
+/// A mask shared by more than one base is never resized (P-M1), so no other
+/// consumer of it can be misaligned by a decision made for one base.
 ///
 /// # Example
 ///
@@ -654,6 +685,7 @@ impl OptimizeOptions {
 
     /// Set what happens when the input carries a digital signature. See
     /// [`OptimizeOptions::on_signature`].
+    #[must_use]
     pub fn with_on_signature(mut self, on_signature: SignatureHandling) -> Self {
         self.on_signature = on_signature;
         self
@@ -973,11 +1005,12 @@ fn walk_placements(
                         // A form without its own /Resources inherits the
                         // context it is drawn in (ISO 32000-1 8.10.2).
                         let own = match stream.dict.get(b"Resources").map(|r| resolve(doc, r)) {
-                            Ok(Object::Dictionary(_)) => {
-                                resolve(doc, stream.dict.get(b"Resources").unwrap())
-                                    .as_dict()
-                                    .ok()
-                            }
+                            // Bind what the arm already matched instead of
+                            // repeating the lookup and unwrapping it: this walk
+                            // runs over untrusted input, and the crate's
+                            // never-panics contract is not worth spending on a
+                            // borrow workaround.
+                            Ok(own @ Object::Dictionary(_)) => own.as_dict().ok(),
                             _ => resources,
                         };
                         let Some(bytes) = content_stream_plain(doc, stream) else {
@@ -1460,7 +1493,17 @@ fn plan_replacement(
             // re-litigate a resampling decision the lossless path already made,
             // the same no-compounding-losses rule the unmasked path applies.
             return plan_flate_smask_pair_downsample(
-                doc, id, mask_id, stream, px_w, px_h, target_w, target_h, options,
+                doc,
+                id,
+                mask_id,
+                stream,
+                PairGeometry {
+                    px_w,
+                    px_h,
+                    target_w,
+                    target_h,
+                },
+                options,
             );
         }
         if over_resolution {
@@ -1485,7 +1528,17 @@ fn plan_replacement(
             // is deliberately no D-M1 fallback here: replacing only the base
             // would violate the mask/image unit rule.
             if let Some(replacement) = plan_smask_pair_downsample(
-                doc, id, mask_id, stream, px_w, px_h, target_w, target_h, options,
+                doc,
+                id,
+                mask_id,
+                stream,
+                PairGeometry {
+                    px_w,
+                    px_h,
+                    target_w,
+                    target_h,
+                },
+                options,
             ) {
                 return Some(replacement);
             }
@@ -1980,11 +2033,14 @@ fn plan_dct_resize_verified(
 fn plan_mask_resample(
     doc: &Document,
     mask_stream: &lopdf::Stream,
-    px_w: u32,
-    px_h: u32,
-    target_w: u32,
-    target_h: u32,
+    geom: PairGeometry,
 ) -> Option<Vec<u8>> {
+    let PairGeometry {
+        px_w,
+        px_h,
+        target_w,
+        target_h,
+    } = geom;
     let dict = &mask_stream.dict;
     // A non-identity `/Decode` would remap samples after decoding; the
     // exact-byte verification below assumes identity.
@@ -2049,42 +2105,75 @@ fn plan_mask_resample(
     Some(out)
 }
 
+/// The four numbers every coupled base+`/SMask` plan carries: the pair's
+/// stored pixel dimensions and the geometry both halves are resampled to.
+/// They only ever travel together — the whole point of D-M2/D-M3 is that base
+/// and mask land on identical pixel grids — so they move as one value rather
+/// than as four positional `u32`s that a call site could transpose.
+#[derive(Debug, Clone, Copy)]
+struct PairGeometry {
+    px_w: u32,
+    px_h: u32,
+    target_w: u32,
+    target_h: u32,
+}
+
+/// The combined never-larger / 5%-minimum-savings guard shared by D-M2 and
+/// D-M3, evaluated over the pair rather than either stream alone.
+///
+/// The 5% floor is the D-M1 philosophy ported to the pair: a genuine first
+/// pass saves far more, while a second pass over an already-optimized pair
+/// lands under 5% and is declined (downsampling to a fixed DPI is naturally
+/// idempotent anyway — the `target_* >= px_*` half of `over_resolution`
+/// declines before either planner is reached). It also enforces strict-shrink
+/// atomicity: the candidate must beat the pair's original size by the full 5%
+/// before both streams are replaced.
+///
+/// `true` means "declined", so the two call sites read the same way as the
+/// no-compounding-losses predicate D-M3 builds on top of it.
+fn pair_savings_declined(
+    base_original: usize,
+    mask_original: usize,
+    base_candidate: usize,
+    mask_candidate: usize,
+) -> bool {
+    let combined_original = base_original + mask_original;
+    let combined_candidate = base_candidate + mask_candidate + MASK_DICT_OVERHEAD;
+    combined_candidate * 100 >= combined_original * 95
+}
+
 /// Phase 5 D-M2: coupled downsampling of an over-resolution JPEG base and its
 /// eligible `/SMask`. Both streams are planned together — and carried by the
 /// single returned `Replacement` so the apply pass replaces them together.
 /// Any doubt on either side, or a COMBINED size that fails the never-larger /
 /// 5% idempotence guard, returns `None` and the whole pair stays untouched.
-#[allow(clippy::too_many_arguments)] // mirrors plan_replacement's flat signature
 fn plan_smask_pair_downsample(
     doc: &Document,
     id: ObjectId,
     mask_id: ObjectId,
     base_stream: &lopdf::Stream,
-    px_w: u32,
-    px_h: u32,
-    target_w: u32,
-    target_h: u32,
+    geom: PairGeometry,
     options: OptimizeOptions,
 ) -> Option<Replacement> {
+    let PairGeometry {
+        target_w, target_h, ..
+    } = geom;
+
     // Base: JPEG at the target geometry with the existing MAD decode-back.
     let base_out = plan_dct_resize_verified(base_stream, options, target_w, target_h)?;
 
     // Mask: decode (JPEG or Flate) + resample to the SAME geometry + Flate
     // re-encode, verified by its own decode-back.
     let mask_stream = doc.get_object(mask_id).ok()?.as_stream().ok()?;
-    let mask_out = plan_mask_resample(doc, mask_stream, px_w, px_h, target_w, target_h)?;
+    let mask_out = plan_mask_resample(doc, mask_stream, geom)?;
 
-    // ATOMICITY + idempotence, evaluated over the COMBINED pair. The 5%
-    // minimum-savings guard is the D-M1 philosophy ported to the pair: both
-    // lossy re-encodes save far more on a genuine first pass, while a second
-    // pass over an already-optimized pair lands under 5% and is declined
-    // (downsampling to a fixed DPI is naturally idempotent anyway — the
-    // `target_* >= px_*` half of `over_resolution` declines before we get
-    // here). It also enforces strict-shrink atomicity: the candidate must
-    // beat the pair's original size by the full 5% to replace both streams.
-    let combined_original = base_stream.content.len() + mask_stream.content.len();
-    let combined_candidate = base_out.len() + mask_out.len() + MASK_DICT_OVERHEAD;
-    if combined_candidate * 100 >= combined_original * 95 {
+    // ATOMICITY + idempotence, evaluated over the COMBINED pair.
+    if pair_savings_declined(
+        base_stream.content.len(),
+        mask_stream.content.len(),
+        base_out.len(),
+        mask_out.len(),
+    ) {
         return None;
     }
 
@@ -2136,18 +2225,21 @@ fn plan_smask_pair_downsample(
 /// pass-2 base is DCTDecode at target geometry — not over-resolution, so it
 /// takes only the D-M1 requant, which its own 5% guard declines. Pinned by
 /// `smask_flate_lossy_pair_is_idempotent_in_one_pass`.
-#[allow(clippy::too_many_arguments)] // mirrors plan_smask_pair_downsample's flat signature
 fn plan_flate_smask_pair_downsample(
     doc: &Document,
     id: ObjectId,
     mask_id: ObjectId,
     base_stream: &lopdf::Stream,
-    px_w: u32,
-    px_h: u32,
-    target_w: u32,
-    target_h: u32,
+    geom: PairGeometry,
     options: OptimizeOptions,
 ) -> Option<Replacement> {
+    let PairGeometry {
+        px_w,
+        px_h,
+        target_w,
+        target_h,
+    } = geom;
+
     // Base: the exact eligibility gates and re-encode variants of the unmasked
     // Flate route (8bpc only, no /Decode, capped inflate + exact length check,
     // plain-vs-Up-predictor output selection). Flate is lossless, so the
@@ -2157,14 +2249,7 @@ fn plan_flate_smask_pair_downsample(
     // Mask: decode (JPEG or Flate) + resample to the SAME geometry + Flate
     // re-encode, verified by its own exact decode-back.
     let mask_stream = doc.get_object(mask_id).ok()?.as_stream().ok()?;
-    let mask_out = plan_mask_resample(doc, mask_stream, px_w, px_h, target_w, target_h)?;
-
-    // ATOMICITY + idempotence, evaluated over the COMBINED pair — the same
-    // arithmetic as the D-M2 guard (see plan_smask_pair_downsample): the
-    // candidate, including the mask's dict-token overhead, must beat the
-    // pair's original size by the full 5% to replace both streams.
-    let combined_original = base_stream.content.len() + mask_stream.content.len();
-    let combined_lossless = base_out.len() + mask_out.len() + MASK_DICT_OVERHEAD;
+    let mask_out = plan_mask_resample(doc, mask_stream, geom)?;
 
     // NO COMPOUNDING LOSSES, the pair's form of the unmasked rule: the geometry
     // change is the LOSSLESS path's decision. If the fully lossless pair
@@ -2173,7 +2258,12 @@ fn plan_flate_smask_pair_downsample(
     // — then a JPEG base must not resurrect it by hiding the resolution loss
     // behind a DCT win. The predicate is the exact guard the pair is judged by,
     // so "declined" means the same thing on both sides.
-    let lossless_declined = combined_lossless * 100 >= combined_original * 95;
+    let lossless_declined = pair_savings_declined(
+        base_stream.content.len(),
+        mask_stream.content.len(),
+        base_out.len(),
+        mask_out.len(),
+    );
     let lossy = if options.allow_lossy_reencode && !lossless_declined {
         // The line-art content guard lives inside `plan_flate_to_jpeg` and is
         // evaluated on the decoded SOURCE pixels; declining there just leaves
@@ -2191,8 +2281,14 @@ fn plan_flate_smask_pair_downsample(
         _ => (base_out, DictUpdate::Flate { decode_parms }),
     };
 
-    let combined_candidate = content.len() + mask_out.len() + MASK_DICT_OVERHEAD;
-    if combined_candidate * 100 >= combined_original * 95 {
+    // ATOMICITY + idempotence over the COMBINED pair — the same guard, re-run
+    // against whichever base candidate won.
+    if pair_savings_declined(
+        base_stream.content.len(),
+        mask_stream.content.len(),
+        content.len(),
+        mask_out.len(),
+    ) {
         return None;
     }
 
@@ -4987,6 +5083,30 @@ fn replan_deflate(content: &[u8], backend: DeflateBackend) -> Option<Vec<u8>> {
     (inflate_capped(&out, plain.len())? == plain).then_some(out)
 }
 
+// ---------------------------------------------------------------------------
+// Signature handling: why this is detection and not a guard.
+//
+// A `/ByteRange` digest covers file offsets, so it cannot survive *any*
+// picamatl output: every run re-serializes the whole document from scratch,
+// moving every offset, and font subsetting, image downsampling, object-stream
+// packing and metadata stripping were never gated on signatures in the first
+// place. Gating only the three entropy-level passes (JPEG Huffman
+// re-optimization, whole-document re-deflate, content minification) would have
+// protected nothing while costing real bytes -- measured at 477 KB on a
+// Reader-extended IRS form whose 1.5 MB XFA attachment ships with a weak
+// deflate.
+//
+// The honest contract: optimizing a signed PDF invalidates its signature,
+// exactly as with every other PDF optimizer. `OptimizeOptions::on_signature`
+// controls whether `detect_signatures` runs (the default `Warn`) or the
+// pipeline proceeds without looking (`Silence`). The findings come back in
+// `OptimizeReport::signatures`, and only for a run that actually returned a
+// rewritten document -- the library itself prints nothing; the `picamatl`
+// binary turns the report into its one stderr warning. The fail-safe contract
+// covers rendered content, not offset-pinned digests; callers who must keep a
+// signature intact should not optimize the file at all.
+// ---------------------------------------------------------------------------
+
 /// Depth bound for the `/Kids` field-tree walk, mirroring `forms::MAX_DEPTH`.
 /// A malformed document can point a `/Kids` entry back at its own ancestor;
 /// detection must terminate on one regardless.
@@ -5185,31 +5305,13 @@ fn walk_sig_field<'a>(
     }
 }
 
-/// Signature handling (there used to be a guard here; now there is detection).
-///
-/// A `/ByteRange` digest covers file offsets, so it cannot survive *any*
-/// picamatl output: every run re-serializes the whole document from scratch,
-/// moving every offset, and font subsetting, image downsampling, object-stream
-/// packing and metadata stripping were never gated on signatures in the first
-/// place. Gating only the three entropy-level passes (JPEG Huffman
-/// re-optimization, whole-document re-deflate, content minification) would
-/// have protected nothing while costing real bytes -- measured at 477 KB on a
-/// Reader-extended IRS form whose 1.5 MB XFA attachment ships with a weak
-/// deflate.
-///
-/// The honest contract: optimizing a signed PDF invalidates its signature,
-/// exactly as with every other PDF optimizer. [`OptimizeOptions::on_signature`]
-/// controls whether [`detect_signatures`] runs (the default `Warn`) or the
-/// pipeline proceeds without looking (`Silence`). The findings come back in
-/// [`OptimizeReport::signatures`], and only for a run that actually returned a
-/// rewritten document — the library itself prints nothing; the `picamatl`
-/// binary turns the report into its one stderr warning. The fail-safe contract
-/// covers rendered content, not offset-pinned digests; callers who must keep a
-/// signature intact should not optimize the file at all.
 /// Serialize the document, optionally using PDF 1.5 object-stream packing when
 /// `options.pack_object_streams` is true. The packed path produces smaller
 /// output for object-heavy documents but is more complex; the classic path is
 /// the always-available fallback and matches what lopdf ships.
+///
+/// Either path finishes by splicing the input's own real literals back in (see
+/// [`reals`]), so f32 parsing never changes a number's printed value.
 fn save_document(
     doc: &mut Document,
     options: OptimizeOptions,

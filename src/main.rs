@@ -479,17 +479,20 @@ fn optimize_one(input: &std::path::Path, cli: &Cli) -> Result<(), String> {
     Ok(())
 }
 
-fn run(cli: &Cli) -> Result<(), String> {
+fn run(cli: &Cli) -> Result<(), RunError> {
     let inputs = collect_inputs(&cli.input);
     if inputs.is_empty() {
-        return Err(format!("no *.pdf files found in {}", cli.input.display()));
+        return Err(format!("no *.pdf files found in {}", cli.input.display()).into());
     }
     let multiple = inputs.len() > 1;
     if multiple && (cli.output.is_some() || cli.force) {
-        return Err(
-            "--output/--force apply to a single input; for multiple files use              --output-dir and/or --suffix"
-                .to_string(),
-        );
+        // Spell the separator on the near side of the `\`: a line continuation
+        // eats the newline AND the next line's indent, which is exactly how
+        // this string shipped with 14 literal spaces in it.
+        return Err("--output/--force apply to a single input; for multiple \
+                    files use --output-dir and/or --suffix"
+            .to_string()
+            .into());
     }
     let mut failed = 0usize;
     for input in &inputs {
@@ -501,19 +504,46 @@ fn run(cli: &Cli) -> Result<(), String> {
         }
     }
     if failed > 0 {
-        return Err(format!("{failed} of {} input(s) failed", inputs.len()));
+        // The per-file `error:` above already said everything there is to say
+        // about a single input, so a summary would just repeat it in vaguer
+        // words. Report the count only when it summarizes more than one file,
+        // and use `Failed` so main() does not print a second `error:` line.
+        return if inputs.len() == 1 {
+            Err(RunError::Failed)
+        } else {
+            let total = inputs.len();
+            Err(RunError::Message(format!(
+                "{failed} of {total} inputs failed"
+            )))
+        };
     }
     Ok(())
+}
+
+/// A `run` failure that has already been reported ([`RunError::Failed`]) or
+/// still needs printing ([`RunError::Message`]). Keeping the distinction here
+/// rather than in `main` is what stops a single bad file from producing two
+/// `error:` lines, the second of them content-free.
+enum RunError {
+    Message(String),
+    Failed,
+}
+
+impl From<String> for RunError {
+    fn from(message: String) -> Self {
+        RunError::Message(message)
+    }
 }
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match run(&cli) {
         Ok(()) => ExitCode::SUCCESS,
-        Err(message) => {
+        Err(RunError::Message(message)) => {
             eprintln!("error: {message}");
             ExitCode::FAILURE
         }
+        Err(RunError::Failed) => ExitCode::FAILURE,
     }
 }
 
