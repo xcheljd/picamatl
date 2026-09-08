@@ -277,7 +277,11 @@ fn output_dir_batch_processes_a_directory_into_new_files() {
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&in_dir).unwrap();
     // Two inputs: one shrinks, one is unchanged — batch must handle both.
-    std::fs::copy("fixtures/forms/filled-acroform.pdf", in_dir.join("form.pdf")).unwrap();
+    std::fs::copy(
+        "fixtures/forms/filled-acroform.pdf",
+        in_dir.join("form.pdf"),
+    )
+    .unwrap();
     std::fs::copy("fixtures/sample.pdf", in_dir.join("images.pdf")).unwrap();
 
     let out = picamatl()
