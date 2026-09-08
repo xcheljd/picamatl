@@ -26,7 +26,8 @@ use fax::{Color, VecWriter};
 use lopdf::{Document, Object, ObjectId};
 use rayon::prelude::*;
 
-use crate::{classify_filter, inflate_capped, num, resolve, FilterClass};
+use crate::deflate::inflate_capped;
+use crate::{classify_filter, num, resolve, FilterClass};
 
 /// Pixel-count ceiling for the bitonal pass: 2^28 ≈ 268M pixels (32 MiB of
 /// packed samples), roughly 2× an A4 page scanned at 1200 dpi. Guards the
@@ -360,7 +361,8 @@ fn encode_g4_from_samples(samples: &[u8], width: u32, height: usize) -> Vec<u8> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{deflate_level9, optimize_with_options, OptimizeOptions};
+    use crate::deflate::deflate_level9;
+    use crate::{optimize_with_options, OptimizeOptions};
     use fax::BitWriter;
     use lopdf::{dictionary, Dictionary, Document, Stream};
 

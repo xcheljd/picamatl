@@ -87,22 +87,33 @@ Executed in this order; each pass reports whether it did work.
   literals back into the saved file — f32-parsing otherwise loses precision on
   e.g. `/MediaBox [0 0 595.91998 841.91998]`.
 
+Everything from `pack_object_streams` down is `save_document` in
+`src/serialize.rs`, the single exit every optimized document takes.
+
 ## Source layout
 
 | File | Lines | What lives there |
 |---|---|---|
-| `src/lib.rs` | ~12K | The whole pipeline: `OptimizeOptions`, placement walk, plan/apply, all image & serialization passes, fail-safe boundary, the bulk of tests |
+| `src/lib.rs` | ~9K | The orchestrator: `OptimizeOptions`, placement walk, the `plan_*` family, `try_optimize`, the fail-safe boundary, and the bulk of tests |
 | `src/fonts.rs` | ~3.4K | Font subsetting + Type1→CFF conversion |
 | `src/type1.rs` | ~2K | Type1 interpreter |
 | `src/jpeghuff.rs` | ~1.8K | Lossless Huffman-table re-encoder |
-| `src/cffhint.rs` | ~1K | Type2 hint stripping |
 | `src/forms.rs` | ~1.2K | Form flattening |
+| `src/cffhint.rs` | ~1K | Type2 hint stripping |
+| `src/cmyk.rs` | ~1K | CMYK/YCCK JPEG decode/resample/encode/verify + the shared JPEG frame-header reader |
+| `src/signatures.rs` | ~1K | Digital-signature detection (`SignatureInfo`/`SignatureKind` live here; re-exported from `lib.rs`) |
+| `src/reals.rs` | ~1K | Real-literal splice-back |
+| `src/encodings.rs` | ~0.9K | Font encoding tables, generated mechanically from ISO 32000-1 Annex D.1/D.2 plus Adobe's BSD-3-Clause Adobe Glyph List, cross-checked against Python's `cp1252`/`mac_roman` (provenance in the module header) |
 | `src/cffmerge.rs` | ~0.8K | Type1C same-family union merges |
 | `src/bitonal.rs` | ~0.8K | CCITT G4 recompression |
-| `src/encodings.rs` | ~0.9K | Font encoding tables, generated mechanically from ISO 32000-1 Annex D.1/D.2 plus Adobe's BSD-3-Clause Adobe Glyph List, cross-checked against Python's `cp1252`/`mac_roman` (provenance in the module header) |
-| `src/reals.rs` | ~1K | Real-literal splice-back |
 | `src/truetype.rs` | ~0.7K | TrueType subset cmap synthesis |
+| `src/serialize.rs` | ~0.6K | `save_document`: both save paths + the xref-stream / `ObjStm` byte-level post-passes |
+| `src/classify.rs` | ~0.5K | Line-art guard and the `--figure-dpi` figure classifier, with their tuning constants |
 | `src/main.rs` | ~0.4K | CLI (every flag maps 1:1 to an `OptimizeOptions` builder method) |
+| `src/deflate.rs` | ~0.2K | Deflate/inflate backends, the capped inflate, PNG row-filter codec |
+
+`try_optimize` and the `plan_*` family deliberately stay together in `lib.rs`:
+they are one pipeline, and the pass ordering above is the reason.
 
 ## Key mechanisms
 
@@ -128,7 +139,7 @@ Executed in this order; each pass reports whether it did work.
   run re-serializes the whole document, so optimizing a signed PDF always
   invalidates its signature. Picamatl therefore detects rather than declines:
   `--on-signature warn` (default) names each affected signature on stderr.
-  The full rationale is the comment block above `SIG_MAX_DEPTH` in `src/lib.rs`.
+  The full rationale is the module header of `src/signatures.rs`.
 
 ## Consent ladder (README calls these levels)
 

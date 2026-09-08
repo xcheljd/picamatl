@@ -54,7 +54,9 @@ use std::collections::{HashMap, HashSet};
 
 use lopdf::{Document, Object};
 
-use crate::{deflate_level9, find_sub, inflate_capped, MAX_REDEFLATE_BYTES};
+use crate::deflate::{deflate_level9, inflate_capped};
+use crate::serialize::find_sub;
+use crate::MAX_REDEFLATE_BYTES;
 
 /// The exact decimal text of every real literal in the input whose value
 /// lopdf's `f32` cannot represent, keyed by that `f32`'s bit pattern.

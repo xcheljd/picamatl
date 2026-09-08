@@ -48,10 +48,8 @@ use lopdf::content::Content;
 use lopdf::{dictionary, Dictionary, Document, Object, ObjectId, Stream};
 use subsetter::GlyphRemapper;
 
-use crate::{
-    cffhint, cffmerge, deflate_level9, encodings, inflate_capped, resolve, truetype, type1,
-    FilterClass,
-};
+use crate::deflate::{deflate_level9, inflate_capped};
+use crate::{cffhint, cffmerge, encodings, resolve, truetype, type1, FilterClass};
 
 /// Recursion bound for the form/pattern/Type3 walk (depth of nested streams).
 const MAX_WALK_DEPTH: usize = 16;
