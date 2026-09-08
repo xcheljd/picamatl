@@ -169,7 +169,7 @@ Two layers, both on by default in the product, not just in tests:
 Plus the usual strictly-smaller guard.
 
 `scripts/h5_cff_declines.py` and the `cffhint::tests::corpus_report` harness
-(`#[ignore]`, needs `AMATL_CFF_DIR`) over all 80 Type1C programs in picamatl's
+(`#[ignore]`, needs `PICAMATL_CFF_DIR`) over all 80 Type1C programs in picamatl's
 own output:
 
 ```
@@ -312,7 +312,7 @@ their round-3/4 gates unchanged.
 | `scripts/h5_matrix.py` | the five-config size matrix, for one binary |
 | `scripts/h5_gates.py` | render / pdftotext / pass-2 / `gs` gates for one file |
 | `scripts/h5_jpegcorpus.sh` | drives the `jpeghuff` corpus harness |
-| `scripts/h5_cffhint.py` | isolates the CFF-strip contribution — **needs a temporary `AMATL_NO_CFFHINT` escape hatch that is deliberately not in the shipped code**; re-add it locally to re-run |
+| `scripts/h5_cffhint.py` | isolates the CFF-strip contribution — **needs a temporary `PICAMATL_NO_CFFHINT` escape hatch that is deliberately not in the shipped code**; re-add it locally to re-run |
 | `scripts/h5_cff_declines.py` | explains a declined Type1C program (subr counts, subrs carrying hints) |
 
 ## 6. Where the remaining headroom sits

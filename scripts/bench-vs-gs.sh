@@ -9,9 +9,9 @@
 # `gs` (Ghostscript) and a working Rust toolchain.
 #
 # How it drives picamatl: the library's real-file test harness. Setting
-# AMATL_TEST_PDF makes `real_file_shrinks_when_present` optimize that file with
+# PICAMATL_TEST_PDF makes `real_file_shrinks_when_present` optimize that file with
 # a size-focused configuration (strip_accessibility=true, packing off unless
-# AMATL_TEST_PACK=1) and AMATL_TEST_OUT saves the optimized bytes.
+# PICAMATL_TEST_PACK=1) and PICAMATL_TEST_OUT saves the optimized bytes.
 #
 # What "equivalent settings" means: picamatl's defaults downsample images whose
 # effective on-page DPI exceeds 130 x 1.15 down to 130 DPI and re-encode as
@@ -45,11 +45,11 @@ in="${1:-$repo_root/fixtures/sample.pdf}"
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
-amatl_out="$tmp/picamatl.pdf"
+picamatl_out="$tmp/picamatl.pdf"
 gs_out="$tmp/gs.pdf"
 
 echo "== picamatl (via real-file test harness) =="
-AMATL_TEST_PDF="$in" AMATL_TEST_OUT="$amatl_out" \
+PICAMATL_TEST_PDF="$in" PICAMATL_TEST_OUT="$picamatl_out" \
     cargo test --manifest-path "$repo_root/Cargo.toml" \
     --lib real_file_shrinks_when_present -- --nocapture
 
@@ -66,11 +66,11 @@ gs -sDEVICE=pdfwrite -dCompatibilityLevel=1.5 -dNOPAUSE -dBATCH -dQUIET \
     -f "$in"
 
 in_size=$(stat -c %s "$in")
-amatl_size=$(stat -c %s "$amatl_out")
+picamatl_size=$(stat -c %s "$picamatl_out")
 gs_size=$(stat -c %s "$gs_out")
 
 echo
 echo "== results =="
 printf 'input:  %8d bytes  %s\n' "$in_size" "$in"
-printf 'picamatl:  %8d bytes  (%d%% of input)\n' "$amatl_size" $((amatl_size * 100 / in_size))
+printf 'picamatl:  %8d bytes  (%d%% of input)\n' "$picamatl_size" $((picamatl_size * 100 / in_size))
 printf 'gs:     %8d bytes  (%d%% of input)\n' "$gs_size" $((gs_size * 100 / in_size))

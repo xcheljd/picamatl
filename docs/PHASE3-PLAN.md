@@ -1,8 +1,13 @@
 # Phase 3 Implementation Plan — More Image Filters & Font Subsetting
 
-Status: **planning document — no code yet.** Approved scope per
-`talaria/docs/picamatl-roadmap.md` §7 ("More image filters" and "Font subsetting")
-and its "Dependency philosophy — the two-axis rule" section.
+Status: **implemented — design record, not a live plan.** Font subsetting
+shipped in 0.2.1 and is on by default since 0.4.0 (`src/fonts.rs`,
+`with_subset_fonts(bool)`); CCITT G4 bitonal recompression shipped in 0.2.1
+and covers Flate-stored 1-bit sources since 0.4.0 (`src/bitonal.rs`,
+`--recompress-bitonal-images`, default **off**). Kept for the reasoning:
+the crate vetting in §B.3, the nine resolved open questions, and the
+deviations recorded in §B.5. Scope covered "More image filters" and
+"Font subsetting" plus the dependency two-axis rule.
 
 Every API name, crate version, and behavior claim below was verified on
 2026-08-21 against the actual `lopdf 0.42.0` build in this repo's lockfile

@@ -5,6 +5,14 @@
 //! the library. Flags map 1:1 to the `with_*` builder setters; boolean
 //! options come as `--<flag>` / `--no-<flag>` pairs so either direction of a
 //! future library-default flip stays expressible.
+//!
+//! One flag name differs from its setter, deliberately and only in spelling:
+//! `--allow-lossy` / `--no-allow-lossy` drive
+//! [`OptimizeOptions::allow_lossy_reencode`] (setter
+//! `with_allow_lossy_reencode`). The library name says *what* is allowed; the
+//! flag stays short because it is the consent gate users type most. Renaming
+//! either side is a breaking change, so the mismatch is documented rather than
+//! papered over — every other flag matches its setter name exactly.
 
 use std::path::PathBuf;
 use std::process::ExitCode;

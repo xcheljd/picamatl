@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """hunt5: isolate the Type1C hint-strip contribution by running picamatl twice
-with the same flags, once with AMATL_NO_CFFHINT=1 (a temporary escape hatch
+with the same flags, once with PICAMATL_NO_CFFHINT=1 (a temporary escape hatch
 kept only while measuring).
 
 Usage: python3 scripts/h5_cffhint.py [picamatl flags...]
@@ -17,9 +17,9 @@ for f in FILES:
     sizes = []
     for name, off in (("nocff", True), ("cff", False)):
         env = dict(os.environ)
-        env.pop("AMATL_NO_CFFHINT", None)
+        env.pop("PICAMATL_NO_CFFHINT", None)
         if off:
-            env["AMATL_NO_CFFHINT"] = "1"
+            env["PICAMATL_NO_CFFHINT"] = "1"
         dst = f"target/scratch/h5/{f}.{tag}.{name}.pdf"
         subprocess.run(
             ["./target/release/picamatl", *flags, f"corpus/{f}.pdf", "-o", dst],

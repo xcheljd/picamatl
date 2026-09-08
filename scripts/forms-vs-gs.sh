@@ -11,7 +11,7 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
-bin="${AMATL_BIN:-$repo_root/target/release/picamatl}"
+bin="${PICAMATL_BIN:-$repo_root/target/release/picamatl}"
 out="$repo_root/target/scratch/forms-vs-gs"
 mkdir -p "$out"
 

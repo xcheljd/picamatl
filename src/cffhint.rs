@@ -1033,16 +1033,16 @@ mod tests {
         assert!(strip_charstring(&program).is_none());
     }
 
-    /// Real-corpus harness: point `AMATL_CFF_DIR` at a directory of raw
+    /// Real-corpus harness: point `PICAMATL_CFF_DIR` at a directory of raw
     /// `Type1C` programs (every `/FontFile3` payload extracted from picamatl's
     /// own output) and this strips each one, re-verifying every glyph's
     /// outline and advance from the *emitted* bytes and reporting the size
     /// delta. Ignored by default — it needs an external corpus, and the fonts
     /// in question are not redistributable.
     #[test]
-    #[ignore = "needs AMATL_CFF_DIR corpus"]
+    #[ignore = "needs PICAMATL_CFF_DIR corpus"]
     fn corpus_report() {
-        let dir = std::env::var("AMATL_CFF_DIR").unwrap_or_else(|_| "target/scratch/h5/cff".into());
+        let dir = std::env::var("PICAMATL_CFF_DIR").unwrap_or_else(|_| "target/scratch/h5/cff".into());
         let mut entries: Vec<_> = std::fs::read_dir(&dir)
             .unwrap()
             .filter_map(Result::ok)

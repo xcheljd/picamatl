@@ -1785,16 +1785,16 @@ mod tests {
         assert_eq!(w.out, vec![0xFF, 0x00]);
     }
 
-    /// Corpus harness: point `AMATL_JPEG_DIR` at a directory of raw JPEG
+    /// Corpus harness: point `PICAMATL_JPEG_DIR` at a directory of raw JPEG
     /// streams (e.g. every `/DCTDecode` payload extracted from picamatl's own
     /// output) and this reports the aggregate saving and, when `jpegtran` is
     /// on PATH, how the rebuilt stream compares to it. Ignored by default —
     /// it needs an external corpus.
     #[test]
-    #[ignore = "needs AMATL_JPEG_DIR corpus"]
+    #[ignore = "needs PICAMATL_JPEG_DIR corpus"]
     fn corpus_report() {
         let dir =
-            std::env::var("AMATL_JPEG_DIR").unwrap_or_else(|_| "target/scratch/h5/jpg".into());
+            std::env::var("PICAMATL_JPEG_DIR").unwrap_or_else(|_| "target/scratch/h5/jpg".into());
         let mut entries: Vec<_> = std::fs::read_dir(&dir)
             .unwrap()
             .filter_map(Result::ok)

@@ -10016,19 +10016,19 @@ mod tests {
 
     /// Real-file check. Defaults to the committed fixture
     /// (`fixtures/sample.pdf`, regenerable via `tests/generate_fixture.rs`);
-    /// set AMATL_TEST_PDF to run against another PDF instead. Uses a typical
+    /// set PICAMATL_TEST_PDF to run against another PDF instead. Uses a typical
     /// size-focused configuration (strip the accessibility tree). Asserts the
     /// output is smaller and remains a valid, loadable PDF.
     #[test]
     fn real_file_shrinks_when_present() {
-        let path = std::env::var("AMATL_TEST_PDF").unwrap_or_else(|_| {
+        let path = std::env::var("PICAMATL_TEST_PDF").unwrap_or_else(|_| {
             concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/sample.pdf").to_string()
         });
         let input = std::fs::read(&path).expect("failed to read real-file test input");
-        // Opt in to object-stream packing for this run via AMATL_TEST_PACK=1.
+        // Opt in to object-stream packing for this run via PICAMATL_TEST_PACK=1.
         let opts = OptimizeOptions::default()
             .with_strip_accessibility(true)
-            .with_pack_object_streams(std::env::var("AMATL_TEST_PACK").is_ok());
+            .with_pack_object_streams(std::env::var("PICAMATL_TEST_PACK").is_ok());
         let out = optimize_with_options(&input, opts);
         println!(
             "{path}: {} -> {} bytes ({}%)",
@@ -10041,7 +10041,7 @@ mod tests {
             Document::load_mem(&out).is_ok(),
             "output must be a valid PDF"
         );
-        if let Ok(dest) = std::env::var("AMATL_TEST_OUT") {
+        if let Ok(dest) = std::env::var("PICAMATL_TEST_OUT") {
             std::fs::write(&dest, &out).unwrap();
         }
     }

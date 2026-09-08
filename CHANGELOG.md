@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- Packaging and documentation polish only; no behavior change. The crates.io
+  `description` and `categories` are rewritten (the binary now advertises
+  itself as a CLI, and `command-line-utilities` is claimed), and an `exclude`
+  list keeps development scaffolding — hunt scripts, hunt notes, spike
+  examples, corpus manifests — out of the published tarball. Those two
+  manifest changes take effect on the next crates.io release; 0.4.2 as
+  published is unaffected.
+
 ## [0.4.2] - 2026-09-02
 
 ### Added
@@ -69,6 +81,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Renamed `amatl` → `picamatl`** — every release through 0.4.0 built as
+  `amatl`; the crates.io name was taken, and *pica-* (tiny) sharpens what the
+  tool does to āmatl (fig-bark codex paper) anyway. Crate, binary, library
+  and repository all move together. There is no `amatl` on crates.io, so no
+  upgrade path is broken.
 - README install section now shows only real channels.
 
 ## [0.4.0] - 2026-08-26
@@ -177,3 +194,160 @@ pipeline in full.
   idempotence for masked Flate pairs restored).
 
 ## [0.3.1] - 2026-08-22
+
+Three lossless serialization wins, no consent flag involved: on the 58-page
+NASA reference at otherwise-default settings, 4,958,148 → 4,655,752 B
+(−302,396 B, −6.10%), byte-identical on a second pass.
+
+### Added
+
+- **Final re-deflate pass** (on by default). Every stream whose `/Filter` is
+  exactly `FlateDecode` is inflated and re-deflated at level 9, kept only when
+  strictly smaller *and* byte-identical on inflate-back. Reaches streams a
+  producer's weaker deflate left behind, which `doc.compress()` never touched.
+  Declined wholesale for encrypted, PDF/A-declaring and signed documents.
+- **Compressed cross-reference stream.** lopdf hardcodes
+  `XRefStreamFilter::None` and synthesizes the xref object during save, so no
+  document-level pass could reach it; it is now deflated in both save paths
+  (NASA packed 17,486 → 5,804 B). Any structural mismatch — including a
+  classic cross-reference table — passes the file through untouched.
+
+### Changed
+
+- **Default flip:** `pack_object_streams` now defaults to `true` (it was
+  `false` through 0.3.0). Lossless, measured −163,394 B (3.29%) on NASA. The
+  cost is a **PDF 1.5 floor** — a reader older than Acrobat 6 cannot open an
+  `ObjStm` file at all. Opt out with `--no-pack-object-streams`.
+
+### Note
+
+The serialization-time passes are not counted as "work" by `try_optimize`'s
+early return: a document where nothing semantic was planned still comes back
+byte-for-byte identical.
+
+## [0.3.0] - 2026-08-22
+
+### Added
+
+- **Consent-gated lossy Flate→JPEG re-encode** behind the new default-off
+  `--allow-lossy` / `OptimizeOptions::allow_lossy_reencode`. Unmasked 8-bit
+  DeviceGray/DeviceRGB/ICCBased(N=1,3) Flate images may change encoding class
+  to `/DCTDecode`; Indexed, CMYK, non-8-bit and `/SMask`-carrying bases never
+  are. Two review-driven guards ship with it: `looks_like_line_art` declines
+  thin-line vector-style content (which JPEG mottles for marginal gain), and
+  a Flate candidate the never-larger guard would reject now disqualifies the
+  JPEG candidate too — consent to re-encode is not consent to re-litigate a
+  resampling decision the lossless path already rejected.
+- **Requantization reach extensions (Phase 6).** Two JPEG classes the Phase 5
+  pipeline never reached now take the dimension-preserving requantization:
+  bases whose `/SMask` is shared by several images (P-M1 — the refcount
+  fail-safe now blocks resizing only, the one transform that can misalign
+  other consumers), and payloads at or below the DPI threshold, normalized in
+  place instead of left at scanner grade forever (P-M2).
+
+### Fixed
+
+- **Requantization is now exactly idempotent.** A candidate whose JPEG
+  quantization tables are byte-identical to the source's is declined: same
+  tables mean the payload is already at the configured quality, so a
+  re-encode is pure generation loss. The 5% rule alone did not converge once
+  the pipeline started re-reading its own q78 output.
+
+## [0.2.2] - 2026-08-22
+
+### Added
+
+- **Soft-mask-coupled downsampling (Phase 5 D-M1/D-M2/D-M3)** — the masked-image
+  work that the README's headline numbers rest on. An over-resolution base and
+  its eligible `/SMask` are resampled to the *same* target geometry and
+  replaced together or not at all, for JPEG bases (D-M2) and Flate bases
+  (D-M3); a masked JPEG pair at or below the threshold instead takes the
+  dimension-preserving requantization, which never resizes and never touches
+  the mask stream (D-M1). Eligibility is narrow by design — plain 8-bit
+  DeviceGray mask, no `/Matte`, not a stencil — and a mask shared by more than
+  one base is never resized. On the NASA reference this took the tool from
+  11.51 MB to 5.55 MB, byte-stable across passes.
+- **The command-line binary.** The crate now ships a CLI over the same library
+  API: positional input, `-o/--output` (default `<input>.optimized.pdf`, never
+  overwriting without `--force`), and flags mapping to every `OptimizeOptions`
+  builder. Defaults — including the boolean states printed under `--help` —
+  are read from `OptimizeOptions::default()` at runtime, so CLI and library
+  cannot drift.
+
+## [0.2.1] - 2026-08-22
+
+### Added
+
+- **Opt-in lossless bitonal → CCITT G4 recompression (Phase 3 B-M1)**, via the
+  `fax` crate. Covers CCITT-stored sources (G4 `/K -1`, EOL-framed G3) and
+  1-bit Flate images including `/ImageMask` streams. Pixels are never
+  resampled, `/BlackIs1` polarity is normalized at the sample level, and a
+  stream is replaced only when the G4 payload is strictly smaller *and* an
+  in-process decode-back reproduces the source bits exactly.
+- **Opt-in Type0/CIDFontType2 (Identity-H/V) font subsetting (Phase 3 C-M1)**,
+  via `subsetter`. The `/CIDToGIDMap`-stream technique replaces only
+  `/FontFile2` and `/CIDToGIDMap`, so content-stream text bytes are never
+  rewritten and `/W`, `/DW` and `/ToUnicode` stay untouched — text extraction
+  is bit-identical pre/post. Glyph discovery walks pages, form XObjects
+  (recursive, cycle-guarded), appearance streams, tiling patterns and Type3
+  char procs; any parse doubt disables subsetting for that font or the whole
+  document.
+
+### Fixed
+
+- **`optimize(optimize(x))` is now byte-stable on real files.** Duplicate-object
+  merging ran exactly one generation per call, so merges that only became
+  possible after remapping were left to the next call. The non-stream and
+  stream dedup passes now alternate to a fixpoint inside a single call.
+- **Page-tree nodes are never deduplicated**, even when byte-identical. Two
+  blank pages with identical dicts were being collapsed into one object,
+  putting the same id in `/Kids` twice — which changes what GoTo destinations
+  resolve to and broke lopdf's page-reordering pass. Page identity is
+  load-bearing.
+
+## [0.2.0] - 2026-08-21
+
+### Added
+
+- **FlateDecode image downsampling, on by default.** Over-resolution
+  Flate-compressed rasters (screenshots, exported bitmaps, lossless scans) are
+  downsampled *in the same format* — decoded including PNG predictors 10–15,
+  resized with Lanczos3, re-deflated at maximum compression. `/ColorSpace` is
+  never touched, so no JPEG-class artifacts enter that content class. Scope:
+  8-bit DeviceRGB/DeviceGray/ICCBased(N=1,3) without `/SMask`, `/Mask` or
+  `/Decode`. Opt out with `downsample_flate_images = false`, which restores
+  0.1.x behavior exactly.
+- Decompression-bomb guard on the Flate path: a hard 256 MiB raw-pixel cap
+  enforced *during* inflation, plus an exact decoded-length check.
+
+### Fixed
+
+- PNG predictor inversion is performed in-crate (spec-correct, including the
+  Avg filter) rather than by lopdf's `Stream::decompressed_content`, whose Avg
+  implementation produces incorrect pixels and which returns partial data on
+  corrupt zlib streams.
+
+## [0.1.0] - 2026-08-21
+
+### Added
+
+- Initial release: CTM-aware effective-DPI downsampling of over-resolution
+  `DCTDecode` images via mozjpeg, duplicate object/stream deduplication,
+  optional accessibility-tree stripping, optional PDF 1.5 object-stream
+  packing, and the hard fail-safe contract — never larger, never corrupt,
+  original bytes on any failure.
+
+---
+
+Releases through 0.4.0 were published under the crate name `amatl`; see the
+0.4.1 entry. 0.1.0 and 0.2.0 predate this repository's release tags, so they
+have no compare links below.
+
+[Unreleased]: https://github.com/xcheljd/picamatl/compare/v0.4.2...HEAD
+[0.4.2]: https://github.com/xcheljd/picamatl/compare/v0.4.1...v0.4.2
+[0.4.1]: https://github.com/xcheljd/picamatl/compare/v0.4.0...v0.4.1
+[0.4.0]: https://github.com/xcheljd/picamatl/compare/v0.3.1...v0.4.0
+[0.3.1]: https://github.com/xcheljd/picamatl/compare/v0.3.0...v0.3.1
+[0.3.0]: https://github.com/xcheljd/picamatl/compare/v0.2.2...v0.3.0
+[0.2.2]: https://github.com/xcheljd/picamatl/compare/v0.2.1...v0.2.2
+[0.2.1]: https://github.com/xcheljd/picamatl/releases/tag/v0.2.1

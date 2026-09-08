@@ -50,8 +50,8 @@ Executed in this order; each pass reports whether it did work.
 - Form flattening (opt-in) — `forms::apply_flatten`, runs BEFORE all other
   planners so moved appearance streams get minified/re-deflated. A `None` plan
   is a decline (13 documented rules in `docs/FORMS-PLAN.md`).
-- `minify_content_streams` — minify content streams (opt-in by default? no —
-  always on; sloppy number literals, merged multi-stream pages).
+- `minify_content_streams` — always on, not gated by any flag: rewrites sloppy
+  number literals and merges a page's multiple content streams into one.
 
 **Phase B — plan against immutable doc:**
 - Image placements: walk each page content stream tracking the CTM →
@@ -91,7 +91,7 @@ Executed in this order; each pass reports whether it did work.
 
 | File | Lines | What lives there |
 |---|---|---|
-| `src/lib.rs` | ~11K | The whole pipeline: `OptimizeOptions`, placement walk, plan/apply, all image & serialization passes, fail-safe boundary, the bulk of tests |
+| `src/lib.rs` | ~12K | The whole pipeline: `OptimizeOptions`, placement walk, plan/apply, all image & serialization passes, fail-safe boundary, the bulk of tests |
 | `src/fonts.rs` | ~3.4K | Font subsetting + Type1→CFF conversion |
 | `src/type1.rs` | ~2K | Type1 interpreter |
 | `src/jpeghuff.rs` | ~1.8K | Lossless Huffman-table re-encoder |
@@ -99,7 +99,7 @@ Executed in this order; each pass reports whether it did work.
 | `src/forms.rs` | ~1.2K | Form flattening |
 | `src/cffmerge.rs` | ~0.8K | Type1C same-family union merges |
 | `src/bitonal.rs` | ~0.8K | CCITT G4 recompression |
-| `src/encodings.rs` | ~0.9K | Font encoding tables (extracted from Ghostscript resources) |
+| `src/encodings.rs` | ~0.9K | Font encoding tables, generated mechanically from ISO 32000-1 Annex D.1/D.2 plus Adobe's BSD-3-Clause Adobe Glyph List, cross-checked against Python's `cp1252`/`mac_roman` (provenance in the module header) |
 | `src/reals.rs` | ~1K | Real-literal splice-back |
 | `src/truetype.rs` | ~0.7K | TrueType subset cmap synthesis |
 | `src/main.rs` | ~0.4K | CLI (every flag maps 1:1 to an `OptimizeOptions` builder method) |
@@ -150,7 +150,7 @@ The suite is the best documentation of the invariants. Key groups:
 
 ## Reproducing benchmarks
 
-- `scripts/bench-full.sh` — four/five-lane matrix (lossless/lossy/kitchen/gs/
+- `scripts/bench-full.sh` — five-lane matrix (lossless/lossy/kitchen/gs/
   gs-custom) over the corpus; prints per-file paragraphs.
 - `scripts/bench-vs-gs.sh` — fixture vs Ghostscript.
 - NASA TM-20210010291: input re-downloadable from

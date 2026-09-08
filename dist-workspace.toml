@@ -13,6 +13,10 @@ installers = []
 targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
 # Where to host releases
 hosting = "github"
+# mozjpeg's IJG license requires the attribution notice to accompany *binary*
+# distributions, so NOTICE goes into every release archive alongside the
+# auto-included README and license texts. README's "Maintenance notes" says so.
+include = ["NOTICE"]
 
 # Build dependencies: mozjpeg compiles libjpeg-turbo, which needs NASM on
 # x86_64 targets for the SIMD paths (aarch64 uses intrinsics, no NASM).

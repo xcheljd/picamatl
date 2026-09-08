@@ -1,6 +1,6 @@
 # Picamatl roadmap
 
-Feature roadmap. Last revised: 2026-08-27.
+Feature roadmap. Last revised: 2026-09-07.
 
 ## Guiding principles
 
@@ -20,7 +20,13 @@ Feature roadmap. Last revised: 2026-08-27.
   real-literal restoration, decode-ceiling hardening. See
   [CHANGELOG](../CHANGELOG.md).
 - v0.4.1 — batch output options: directory input, `--output-dir`,
-  `--suffix` (combinable), failure-tolerant batch runs.
+  `--suffix` (combinable), failure-tolerant batch runs. Renamed
+  `amatl` → `picamatl`.
+- v0.4.2 — digital-signature detection and a one-line stderr warning naming
+  each signature a run would invalidate (`--on-signature warn|silence`);
+  new public `optimize_with_report` returning `(Vec<u8>, OptimizeReport)`
+  alongside `OptimizeReport` / `SignatureInfo` / `SignatureKind`. The library
+  still performs no I/O — the binary owns the warning text.
 - crates.io publication + cargo-dist release pipeline (5 platforms).
 
 ## In progress
@@ -46,4 +52,3 @@ Feature roadmap. Last revised: 2026-08-27.
 - JSON output mode for scripting (`--json` machine-readable summary).
 - A Tauri desktop front-end (drag-and-drop, presets, preview) — separate
   product, would wrap the same library.
-- crates.io docs build + docs.rs badge polish.

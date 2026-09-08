@@ -8,14 +8,14 @@
 # Usage:
 #   scripts/bench-full.sh          # full corpus
 #   scripts/bench-full.sh adobe-spec arxiv-gpt4   # named files (no extension)
-#   AMATL_BIN=./target/release/picamatl scripts/bench-full.sh
-#   AMATL_NO_FLATTEN=1 scripts/bench-full.sh   # kitchen sink minus --flatten-forms
+#   PICAMATL_BIN=./target/release/picamatl scripts/bench-full.sh
+#   PICAMATL_NO_FLATTEN=1 scripts/bench-full.sh   # kitchen sink minus --flatten-forms
 #
 # Requires: gs, python3 (for the matrix printer).
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
-bin="${AMATL_BIN:-$repo_root/target/release/picamatl}"
+bin="${PICAMATL_BIN:-$repo_root/target/release/picamatl}"
 out="$repo_root/target/scratch/matrix"
 mkdir -p "$out/lossless" "$out/lossy" "$out/kitchen" "$out/gs" "$out/gs-custom"
 
@@ -32,10 +32,10 @@ else
 fi
 
 # The kitchen sink is "every opt-in flag", which now includes form flattening.
-# `AMATL_NO_FLATTEN=1` reproduces the pre-0.3.2 kitchen sink for a with/without
+# `PICAMATL_NO_FLATTEN=1` reproduces the pre-0.3.2 kitchen sink for a with/without
 # comparison on form-heavy inputs.
 flatten_flag="--flatten-forms"
-[ -n "${AMATL_NO_FLATTEN:-}" ] && flatten_flag="--no-flatten-forms"
+[ -n "${PICAMATL_NO_FLATTEN:-}" ] && flatten_flag="--no-flatten-forms"
 
 echo "== picamatl lossless (defaults) =="
 for f in "${files[@]}"; do

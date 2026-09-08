@@ -17,8 +17,8 @@ build test PDFs; it is not distributed with the crate binary.
 The `real_file_shrinks_when_present` test in `src/lib.rs` runs against this
 fixture **by default** (not opt-in): measured runtime is ~0.1 s in a debug
 build, cheap enough to keep in every `cargo test` run. Override the input with
-`AMATL_TEST_PDF=/path/to/other.pdf`; `AMATL_TEST_PACK=1` opts into
-object-stream packing and `AMATL_TEST_OUT=/path` saves the optimized output.
+`PICAMATL_TEST_PDF=/path/to/other.pdf`; `PICAMATL_TEST_PACK=1` opts into
+object-stream packing and `PICAMATL_TEST_OUT=/path` saves the optimized output.
 `scripts/bench-vs-gs.sh` benchmarks picamatl against Ghostscript using the same
 harness.
 

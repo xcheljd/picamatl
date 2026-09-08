@@ -60,7 +60,7 @@ portals, no stable direct URLs) — the script prints instructions for those.
 
 ```bash
 scripts/fetch-corpus.sh      # downloads + verifies all inputs
-scripts/bench-full.sh        # the four-lane matrix (lossless/lossy/kitchen/gs/gs-custom)
+scripts/bench-full.sh        # the five-lane matrix (lossless/lossy/kitchen/gs/gs-custom)
 scripts/bench-vs-gs.sh       # fixture vs Ghostscript (works without the corpus)
 ```
 

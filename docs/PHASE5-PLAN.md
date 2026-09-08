@@ -1,7 +1,10 @@
 # Phase 5 Plan — Transparency-Aware Compression (closing the Ghostscript gap)
 
-Status: DRAFT for review
-Date: 2026-08-22
+Status: **implemented — design record, not a live plan.** D-M1, D-M2 and D-M3
+all shipped in 0.2.2 (`src/lib.rs`, on by default); D-M4 was closed without
+implementation because the measured palette-image pool was empty. Kept for the
+reasoning behind the eligibility rules and the shared-mask fail-safe.
+Date: 2026-08-22 (plan); shipped 2026-08-22 (0.2.2)
 Baseline evidence: NASA TM-20210010291 (16,804,107 B) head-to-head vs Ghostscript 10.07.1
 
 ## Measured problem
@@ -228,8 +231,8 @@ Measurements (q78 unless noted): NASA 16,804,107 → flag-off 4,958,148 →
 flag-on 4,380,087 B (gap to Ghostscript's 3,722,562 B narrows 1.33× → 1.18×);
 q85 4,772,830 B. Fixture sample 116,752 → 32,593 B. 19/122 NASA Flate streams
 converted (807 KB → 230 KB); byte-stable second passes; gs-clean rendering.
-Corpus gaps: the talaria sample and watch-repair one-pagers were unreachable
-from this session (sandbox), not skipped by choice.
+Corpus gaps: two private one-pagers were unreachable from this session
+(sandbox), not skipped by choice.
 
 Review flags from the side-by-sides (candidate no-ships): thin line art
 (p12 profiles) picks up JPEG mottling; the p7 banner class compounds loss by

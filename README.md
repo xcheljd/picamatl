@@ -1,5 +1,7 @@
 # picamatl
 
+[![crates.io](https://img.shields.io/crates/v/picamatl.svg)](https://crates.io/crates/picamatl)
+[![docs.rs](https://img.shields.io/docsrs/picamatl)](https://docs.rs/picamatl)
 [![CI](https://github.com/xcheljd/picamatl/actions/workflows/rust.yml/badge.svg)](https://github.com/xcheljd/picamatl/actions/workflows/rust.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
@@ -50,7 +52,14 @@ under MIT OR Apache-2.0, and distributed on crates.io and GitHub
 ```bash
 cargo install picamatl
 picamatl report.pdf
-# report.pdf: 16,804,107 bytes -> 4,443,883 bytes (73.6% saved) in 0.67s
+```
+
+Both lines below go to stderr; stdout stays empty so picamatl composes cleanly
+in a pipeline:
+
+```text
+no --output given: writing to report.optimized.pdf (use -o to choose a path, --output-dir/--suffix for batches, or --force to overwrite the input)
+report.pdf: 16804107 bytes -> 4443883 bytes (73.6% saved) in 0.67s -> report.optimized.pdf
 ```
 
 No toolchain? Prebuilt binaries for Linux, macOS, and Windows are on the
@@ -278,7 +287,7 @@ can be verified by exact decode-back comparison.
 picamatl ships as a library and a command-line binary:
 
 ```bash
-# Optimize with accessibility-preserving defaults; writes sample.optimized.pdf
+# Optimize with accessibility-preserving defaults; writes report.optimized.pdf
 picamatl report.pdf
 
 # Choose the output path explicitly
@@ -304,12 +313,14 @@ picamatl report.pdf --no-pack-object-streams
 picamatl paper.pdf --figure-dpi 195
 ```
 
-Every flag maps 1:1 to an `OptimizeOptions` builder method, and all defaults —
+Every flag maps 1:1 to an `OptimizeOptions` builder method — with one spelling
+exception: `--allow-lossy` drives `with_allow_lossy_reencode()`. All defaults —
 including the boolean flags' on/off state shown under `--help` — are read from
 `OptimizeOptions::default()` at runtime, so the CLI can never drift from the
 library. Non-PDF input is rejected by header sniffing; without `-o` or
 `--force` the input file is never overwritten. On success the CLI prints
-input → output size, percent saved, and elapsed time.
+input → output size, percent saved, and elapsed time — on **stderr**, like
+every other message it emits; stdout carries only `--help` and `--version`.
 
 ## Measured results
 
@@ -616,17 +627,39 @@ Picamatl exists because shelling out to `gs` was evaluated and rejected:
 
 ## Scope
 
-Picamatl currently optimizes baseline-JPEG (`DCTDecode`) images without soft
-masks, in RGB, grayscale, or CMYK/YCCK (four-component payloads are resampled
-in native CMYK space and re-encoded as YCCK, never converted to RGB; streams
-carrying a `/Decode` array are declined — see
-[`docs/CMYK-JPEG.md`](docs/CMYK-JPEG.md)), and — since 0.2.0 — 8-bit `FlateDecode` raster images in
-DeviceRGB/DeviceGray/ICCBased(N=1,3), downsampled in place with the format and
-color space preserved. Flate images that are Indexed, 1/2/4/16-bit,
-soft-masked, `/Decode`-remapped, or TIFF-predicted are deliberately left
-untouched. It does not (yet) recompress `CCITT`/`JBIG2` images. On
-text-heavy PDFs with default options it will honestly do very little, and by
-contract it returns the input unchanged rather than a worse file.
+Picamatl optimizes `DCTDecode` (JPEG) images — baseline, extended *and*
+progressive, since 0.4.0 — in RGB, grayscale, or CMYK/YCCK (four-component
+payloads are resampled in native CMYK space and re-encoded as YCCK, never
+converted to RGB; streams carrying a `/Decode` array are declined — see
+[`docs/CMYK-JPEG.md`](docs/CMYK-JPEG.md)), and — since 0.2.0 — 8-bit
+`FlateDecode` raster images in DeviceRGB/DeviceGray/ICCBased(N=1,3),
+downsampled in place with the format and color space preserved.
+
+**Soft-masked images are handled, not skipped.** An over-resolution base and
+its `/SMask` are downsampled as an atomic pair to the same target geometry —
+both replaced or neither — for JPEG bases (D-M2) and Flate bases (D-M3). A
+masked JPEG pair already at or below the target instead takes the
+dimension-preserving requantization (D-M1): the base is re-encoded at its own
+dimensions and the mask is not touched at all. All three require the mask to
+be a plain 8-bit DeviceGray image stream with no `/Matte`, and a mask shared
+by more than one base is never resized. `/Mask` (stencil/color-key) images and
+ineligible `/SMask`s stay untouched.
+
+**Bitonal recompression ships** as `--recompress-bitonal-images` (opt-in since
+0.4.0): 1-bit images are re-encoded to CCITT G4, losslessly and verified by
+exact decode-back, covering both CCITT-stored sources (G4 `/K<0` and
+EOL-framed G3) and 1-bit images stored as Flate. **`JPXDecode` (JPEG 2000)**
+streams are converted to `DCTDecode` under `--allow-lossy`, via a pure-Rust
+decoder; any header or decode failure leaves the stream byte-identical.
+
+What stays untouched, deliberately: Flate images that are Indexed, 1/2/4/16-bit,
+`/Decode`-remapped, or TIFF-predicted; and **JBIG2 in either direction** — not a
+roadmap gap but the standing commitment above, since symbol-mode JBIG2 is the
+encoding behind the Xerox character-substitution scandal and picamatl restricts
+bitonal work to encodings verifiable by exact decode-back.
+
+On text-heavy PDFs with default options picamatl will honestly do very little,
+and by contract it returns the input unchanged rather than a worse file.
 
 Embedded fonts are subset to the glyphs actually shown — on by default since
 0.4.0 (opt out with `--no-subset-fonts` / `with_subset_fonts(false)`;
@@ -669,11 +702,12 @@ untouched and the output is always a valid PDF.
   NASM and a C compiler at build time (CI uses `ilammy/setup-nasm`). There is
   no native *runtime* dependency.
 - **MSRV: 1.88.0**, enforced by a dedicated CI job. The floor is
-  dependency-driven: lopdf 0.42.0's manifest declares edition 2024 (Cargo/Rust
+  dependency-driven: lopdf 0.44's manifest declares edition 2024 (Cargo/Rust
   >= 1.85), and current `image`/`time` releases require rustc 1.88.
 - mozjpeg's IJG license requires an attribution notice in documentation
-  accompanying *binary* distributions; a `NOTICE` file will ship if and when
-  prebuilt binaries do. Source distribution does not trigger it.
+  accompanying *binary* distributions. [`NOTICE`](NOTICE) carries it; it is
+  committed at the repository root, included in the crates.io package, and
+  shipped in the release archives for all five prebuilt targets.
 
 ## License
 
