@@ -7,15 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.3] - 2026-09-07
+
 ### Changed
 
 - Packaging and documentation polish only; no behavior change. The crates.io
   `description` and `categories` are rewritten (the binary now advertises
   itself as a CLI, and `command-line-utilities` is claimed), and an `exclude`
   list keeps development scaffolding — hunt scripts, hunt notes, spike
-  examples, corpus manifests — out of the published tarball. Those two
-  manifest changes take effect on the next crates.io release; 0.4.2 as
-  published is unaffected.
+  examples, corpus manifests — out of the published tarball.
+- Documentation corrections: the architecture doc's encoding-table provenance
+  (ISO 32000-1 Annex D + Adobe AGL, never Ghostscript), the README scope
+  section brought current with shipped features, the quick-start transcript
+  matched to the real CLI output, and the changelog tail backfilled.
+- CLI fixes: the multi-input error message's corrupted whitespace, and a
+  single failed input no longer prints a meaningless second error line.
+- The dependency lockfile no longer pins a yanked crate.
 
 ## [0.4.2] - 2026-09-02
 
@@ -343,7 +350,8 @@ Releases through 0.4.0 were published under the crate name `amatl`; see the
 0.4.1 entry. 0.1.0 and 0.2.0 predate this repository's release tags, so they
 have no compare links below.
 
-[Unreleased]: https://github.com/xcheljd/picamatl/compare/v0.4.2...HEAD
+[Unreleased]: https://github.com/xcheljd/picamatl/compare/v0.4.3...HEAD
+[0.4.3]: https://github.com/xcheljd/picamatl/compare/v0.4.2...v0.4.3
 [0.4.2]: https://github.com/xcheljd/picamatl/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/xcheljd/picamatl/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/xcheljd/picamatl/compare/v0.3.1...v0.4.0

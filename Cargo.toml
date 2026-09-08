@@ -1,6 +1,6 @@
 [package]
 name = "picamatl"
-version = "0.4.2"
+version = "0.4.3"
 # Kept under 160 chars so crates.io search does not truncate it mid-word, and
 # ordered for the ~90 chars that snippet actually shows: what it is and that it
 # is a CLI first, then the differentiators.
