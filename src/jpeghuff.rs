@@ -1453,8 +1453,6 @@ mod tests {
         rebuild_with(&parsed, flat_table).expect("fixture must re-encode")
     }
 
-    /// Symbol frequencies must produce a table no code longer than 16 bits,
-    /// with every used symbol assigned and the all-ones code left free.
     /// Assemble a baseline JPEG whose Huffman tables are deliberately flat:
     /// every DC symbol gets a 4-bit code and every AC symbol a 3-bit one,
     /// regardless of how often it occurs. Legal, decodable, and exactly the
@@ -1704,6 +1702,8 @@ mod tests {
         }
     }
 
+    /// Symbol frequencies must produce a table no code longer than 16 bits,
+    /// with every used symbol assigned and the all-ones code left free.
     #[test]
     fn optimal_table_is_length_limited_and_complete() {
         let mut freq = [0u64; 256];
