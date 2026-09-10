@@ -846,7 +846,6 @@ mod tests {
     /// The placeholders are chosen so that lopdf prints them at exactly the
     /// width of the literals that replace them: the splice is byte-for-byte
     /// length-preserving, so the cross-reference table stays valid.
-    /// LibreOffice's A4 page box, `[0 0 595.91998 841.91998]`.
     fn a4_fixture() -> Vec<u8> {
         undrift(&a4_placeholders())
     }
