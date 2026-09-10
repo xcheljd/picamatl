@@ -3622,6 +3622,10 @@ fn dedup_streams(doc: &mut Document) -> bool {
     true
 }
 
+/// The outcome of one optimization attempt: the rewrite (if any) plus the
+/// signatures detected in the input.
+type OptimizeOutcome = (Option<Vec<u8>>, Vec<SignatureInfo>);
+
 /// Returns `Ok((None, _))` when there was genuinely nothing to do, so the
 /// caller can hand back the original bytes without anyone allocating a
 /// throwaway copy of them. `Ok((Some(bytes), _))` is a real, rewritten
@@ -3631,8 +3635,6 @@ fn dedup_streams(doc: &mut Document) -> bool {
 /// out rather than being reported here so that the caller — which is the only
 /// place that knows whether the rewrite was actually kept — decides whether
 /// anyone hears about it.
-type OptimizeOutcome = (Option<Vec<u8>>, Vec<SignatureInfo>);
-
 fn try_optimize(input: &[u8], options: OptimizeOptions) -> Result<OptimizeOutcome, lopdf::Error> {
     // Read the input's own real literals BEFORE lopdf parses them into f32s
     // that cannot hold their digits. Empty for the overwhelming majority of
