@@ -2626,21 +2626,6 @@ fn flate_encoding(dict: &lopdf::Dictionary, channels: usize, px_w: u32) -> Optio
     }
 }
 
-/// Encode an image as JPEG using mozjpeg (optimized Huffman + trellis), which
-/// produces substantially smaller files than the basic encoder at equal
-/// quality. Channel count is preserved to match the unchanged PDF /ColorSpace.
-/// Decode a JPEG that we are about to shrink, using libjpeg's DCT-domain
-/// scaled decoding so the full-resolution image is never materialized.
-///
-/// Decoding is done at the smallest `n/8` scale whose output still covers the
-/// target in both axes, so the caller's Lanczos3 step always downsamples and
-/// quality is preserved. A 4000x4000 source targeting 180px decodes at 1/8
-/// (500x500, ~750 KB) instead of full size (~48 MB) — most of the IDCT work and
-/// nearly all of the intermediate allocation disappear.
-///
-/// Returns `(image, is_grayscale)`, or `None` for anything that is not plain
-/// RGB or grayscale (e.g. CMYK/YCCK) so the caller can fall back to the
-/// general-purpose decoder rather than risk mis-handling color.
 /// The smallest `n/8` DCT scale whose output still covers the target in BOTH
 /// axes (never upscale), so the caller's resampling step always downsamples.
 /// Falls back to 8/8 — an unscaled decode — when no smaller scale covers the
@@ -2666,6 +2651,18 @@ fn scaled_decode_within_budget(full_w: usize, full_h: usize, numerator: u8, chan
     raster_within_budget(scaled_w, scaled_h, channels)
 }
 
+/// Decode a JPEG that we are about to shrink, using libjpeg's DCT-domain
+/// scaled decoding so the full-resolution image is never materialized.
+///
+/// Decoding is done at the smallest `n/8` scale whose output still covers the
+/// target in both axes, so the caller's Lanczos3 step always downsamples and
+/// quality is preserved. A 4000x4000 source targeting 180px decodes at 1/8
+/// (500x500, ~750 KB) instead of full size (~48 MB) — most of the IDCT work and
+/// nearly all of the intermediate allocation disappear.
+///
+/// Returns `(image, is_grayscale)`, or `None` for anything that is not plain
+/// RGB or grayscale (e.g. CMYK/YCCK) so the caller can fall back to the
+/// general-purpose decoder rather than risk mis-handling color.
 fn decode_jpeg_scaled(data: &[u8], target_w: u32, target_h: u32) -> Option<(DynamicImage, bool)> {
     let mut dec = mozjpeg::Decompress::new_mem(data).ok()?;
     let (full_w, full_h) = (dec.width(), dec.height());
@@ -2713,6 +2710,10 @@ fn decode_jpeg_scaled(data: &[u8], target_w: u32, target_h: u32) -> Option<(Dyna
     Some((img, is_gray))
 }
 
+/// Encode an image as JPEG using mozjpeg (optimized Huffman + trellis), which
+/// produces substantially smaller files than the basic encoder at equal
+/// quality. Channel count is preserved to match the unchanged PDF /ColorSpace.
+///
 /// Takes `img` **by value** so the pixel buffer can be moved out with `into_*`
 /// instead of copied: `to_rgb8(&self)` always allocates a fresh buffer, while
 /// `into_rgb8(self)` returns the existing one when the variant already matches
