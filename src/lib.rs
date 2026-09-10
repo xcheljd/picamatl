@@ -4163,8 +4163,8 @@ fn reoptimize_jpeg_streams(doc: &mut Document) -> bool {
 ///
 /// Declined wholesale for encrypted documents (stream bytes are ciphertext)
 /// and PDF/A-declared documents. Signed documents are NOT declined: see the
-/// note above `save_document` for why a signature guard here protects
-/// nothing.
+/// module header of `src/signatures.rs` for why a signature guard here
+/// protects nothing.
 fn redeflate_flate_streams(doc: &mut Document, backend: DeflateBackend) {
     if doc.is_encrypted() || fonts::pdfa_blocked(doc) {
         return;
