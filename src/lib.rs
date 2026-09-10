@@ -1039,12 +1039,6 @@ enum FilterClass {
     Other,
 }
 
-/// Classify a stream's `/Filter`: exactly DCTDecode (raw JPEG payload),
-/// exactly FlateDecode (deflated raster data), exactly CCITTFaxDecode (raw
-/// CCITT bitstream), `/JPXDecode` (JPEG2000) and `/JBIG2Decode` (JBIG2) or
-/// anything else. The exotic classes are recognized-and-declined: they are
-/// never handed to a re-encode path (which has no decoder for them). Both the
-/// scalar-name and one-element-array forms are recognized.
 /// The number of colour components an image dict DECLARES, or `None` when the
 /// colour space is one we cannot count with certainty (an unresolvable
 /// reference, a pattern, a name we do not know).
@@ -1087,6 +1081,12 @@ fn colorspace_component_count(doc: &Document, dict: &lopdf::Dictionary) -> Optio
     }
 }
 
+/// Classify a stream's `/Filter`: exactly DCTDecode (raw JPEG payload),
+/// exactly FlateDecode (deflated raster data), exactly CCITTFaxDecode (raw
+/// CCITT bitstream), `/JPXDecode` (JPEG2000) and `/JBIG2Decode` (JBIG2) or
+/// anything else. The exotic classes are recognized-and-declined: they are
+/// never handed to a re-encode path (which has no decoder for them). Both the
+/// scalar-name and one-element-array forms are recognized.
 fn classify_filter(doc: &Document, filter: &Object) -> FilterClass {
     let name = match resolve(doc, filter) {
         Object::Name(n) => n.as_slice(),
