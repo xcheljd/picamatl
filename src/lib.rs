@@ -3307,6 +3307,10 @@ fn operations_equivalent(a: &[lopdf::content::Operation], b: &[lopdf::content::O
         })
 }
 
+/// Dict-text cost charged to a candidate that adds `/Filter/FlateDecode` to a
+/// previously unfiltered stream.
+const FILTER_DICT_COST: usize = b"/Filter/FlateDecode".len();
+
 /// Re-emit one decoded content payload compactly; `None` unless every guard
 /// passes. Returns the winning stored bytes and whether they are deflated.
 ///
@@ -3331,8 +3335,6 @@ fn operations_equivalent(a: &[lopdf::content::Operation], b: &[lopdf::content::O
 ///   19 bytes of `/Filter/FlateDecode` dict text the rewrite adds are charged
 ///   to the candidate (measured: without this, ~350 tiny uncompressed Form
 ///   XObjects each "won" by 2 stream bytes while growing 17 on disk).
-const FILTER_DICT_COST: usize = b"/Filter/FlateDecode".len();
-
 fn replan_content(
     decoded: &[u8],
     plain_stored: usize,
