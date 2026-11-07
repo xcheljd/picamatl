@@ -29,9 +29,15 @@
 //!   decompression or strict content parsing — or text is shown in a state we
 //!   cannot attribute to a font — **no font in the document is touched**.
 //! - **Per-font rule:** any doubt about one font (non-Identity encoding, no
-//!   `/FontFile2`, unresolvable `/CIDToGIDMap`, shared descendant/descriptor/
-//!   font file, out-of-range glyph IDs, `subsetter` error, not net-smaller)
-//!   leaves *that* font untouched.
+//!   `/FontFile2`, unresolvable `/CIDToGIDMap`, a shared descendant,
+//!   out-of-range glyph IDs, `subsetter` error, not net-smaller) leaves
+//!   *that* font untouched.
+//! - **Per-program rule:** fonts are planned per embedded font program, so
+//!   several fonts sharing one program (common after the stream dedup merges
+//!   byte-identical copies) subset or convert together, on the first pass.
+//!   The group is sealed: every reference to the program and to each
+//!   descriptor must come from a font whose usage was attributed, else the
+//!   whole group is left untouched.
 //! - PDF/A-declared documents (`pdfaid` in the XMP metadata) and encrypted
 //!   documents are skipped entirely (C-M2 revisits PDF/A with `/CIDSet`
 //!   regeneration).
@@ -68,7 +74,7 @@ impl FontPlan {
     /// The font dictionary object the plan anchors to (sort key).
     fn font_id(&self) -> ObjectId {
         match self {
-            FontPlan::Cid(p) => p.type0_id,
+            FontPlan::Cid(p) => p.members[0].type0_id,
             FontPlan::Simple(p) => p.fonts[0].0,
             FontPlan::Type1(p) => p.font_ids[0],
         }
@@ -79,14 +85,22 @@ impl FontPlan {
 /// `/FontFile2` stream in place, points `/CIDToGIDMap` at a new map stream,
 /// and re-tags the font names — nothing else changes.
 pub(crate) struct CidFontPlan {
-    type0_id: ObjectId,
-    descendant_id: ObjectId,
-    descriptor_id: ObjectId,
+    /// Every Type0 font sharing the program, sorted by Type0 id. Each keeps
+    /// its own descendant, descriptor and CID -> GID map; only the program is
+    /// shared.
+    members: Vec<CidMemberPlan>,
     font_file_id: ObjectId,
     /// Flate-compressed subset font program.
     deflated_font: Vec<u8>,
     /// Uncompressed length of the subset font (`/Length1`).
     font_len: i64,
+}
+
+/// One Type0 font's part of a [`CidFontPlan`].
+struct CidMemberPlan {
+    type0_id: ObjectId,
+    descendant_id: ObjectId,
+    descriptor_id: ObjectId,
     /// Flate-compressed old-CID -> new-GID map stream payload.
     deflated_map: Vec<u8>,
     /// `TAG+BaseFont` name applied to `/BaseFont` (both dicts) and `/FontName`.
@@ -115,10 +129,12 @@ pub(crate) struct SimpleFontPlan {
 /// and re-tags the font names — `/Encoding`, `/Widths`, and `/ToUnicode`
 /// never change, so text extraction is bit-identical.
 pub(crate) struct Type1FontPlan {
-    /// Every font dictionary served by this descriptor. Usually one; more
-    /// when a producer points several `/Encoding` variants at one program.
+    /// Every font dictionary served by this program. Usually one; more when
+    /// a producer points several `/Encoding` variants at one descriptor, or
+    /// when the stream dedup merged byte-identical copies of the program.
     font_ids: Vec<ObjectId>,
-    descriptor_id: ObjectId,
+    /// Every descriptor carrying the program.
+    descriptor_ids: Vec<ObjectId>,
     font_file_id: ObjectId,
     /// Flate-compressed CFF font program.
     deflated_cff: Vec<u8>,
@@ -165,13 +181,13 @@ pub(crate) fn plan_font_subsets(
         count_refs(val, &mut refcounts);
     }
 
-    let mut plans: Vec<FontPlan> = walker
-        .used
-        .iter()
-        .filter(|(id, cids)| !walker.ineligible.contains(id) && !cids.is_empty())
-        .filter_map(|(&id, cids)| plan_one(doc, id, cids, &refcounts, subset_fonts, strip_hinting))
-        .collect();
+    let mut plans: Vec<FontPlan> = Vec::new();
     if subset_fonts {
+        plans.extend(
+            plan_cid_groups(doc, &walker, &refcounts, strip_hinting)
+                .into_iter()
+                .map(FontPlan::Cid),
+        );
         plans.extend(
             plan_simple_truetype_groups(doc, &walker, &refcounts, strip_hinting)
                 .into_iter()
@@ -188,25 +204,6 @@ pub(crate) fn plan_font_subsets(
     // HashMap iteration order is arbitrary; sort so output is reproducible.
     plans.sort_by_key(FontPlan::font_id);
     plans
-}
-
-/// Dispatch a used font to the planner matching its subtype (each planner
-/// gated by its own option).
-fn plan_one(
-    doc: &Document,
-    id: ObjectId,
-    codes: &BTreeSet<u16>,
-    refcounts: &HashMap<ObjectId, usize>,
-    subset_fonts: bool,
-    strip_hinting: bool,
-) -> Option<FontPlan> {
-    let dict = doc.get_object(id).ok()?.as_dict().ok()?;
-    match dict.get(b"Subtype").map(|s| resolve(doc, s)) {
-        Ok(Object::Name(n)) if n == b"Type0" && subset_fonts => {
-            plan_one_font(doc, id, codes, refcounts, strip_hinting).map(FontPlan::Cid)
-        }
-        _ => None,
-    }
 }
 
 /// Apply planned subsets. Each plan is independent; the set may be empty.
@@ -527,10 +524,6 @@ pub(crate) fn apply_type1c_merges(doc: &mut Document, plans: Vec<T1cMergePlan>) 
 }
 
 fn apply_cid_plan(doc: &mut Document, plan: CidFontPlan) {
-    let map_stream = Stream::new(dictionary! { "Filter" => "FlateDecode" }, plan.deflated_map)
-        .with_compression(false);
-    let map_id = doc.add_object(map_stream);
-
     let font_stream = Stream::new(
         dictionary! {
             "Filter" => "FlateDecode",
@@ -542,19 +535,27 @@ fn apply_cid_plan(doc: &mut Document, plan: CidFontPlan) {
     doc.objects
         .insert(plan.font_file_id, Object::Stream(font_stream));
 
-    if let Ok(Object::Dictionary(d)) = doc.get_object_mut(plan.descendant_id) {
-        d.set("CIDToGIDMap", Object::Reference(map_id));
-        d.set("BaseFont", Object::Name(plan.tagged_name.clone()));
-    }
-    if let Ok(Object::Dictionary(d)) = doc.get_object_mut(plan.type0_id) {
-        d.set("BaseFont", Object::Name(plan.tagged_name.clone()));
-    }
-    if let Ok(Object::Dictionary(d)) = doc.get_object_mut(plan.descriptor_id) {
-        d.set("FontName", Object::Name(plan.tagged_name));
-        // A stale /CIDSet would over-claim glyph coverage after the
-        // subset; it is optional metadata outside PDF/A (and PDF/A
-        // documents were skipped above), so drop it. C-M2 regenerates it.
-        d.remove(b"CIDSet");
+    for member in plan.members {
+        let map_stream = Stream::new(
+            dictionary! { "Filter" => "FlateDecode" },
+            member.deflated_map,
+        )
+        .with_compression(false);
+        let map_id = doc.add_object(map_stream);
+        if let Ok(Object::Dictionary(d)) = doc.get_object_mut(member.descendant_id) {
+            d.set("CIDToGIDMap", Object::Reference(map_id));
+            d.set("BaseFont", Object::Name(member.tagged_name.clone()));
+        }
+        if let Ok(Object::Dictionary(d)) = doc.get_object_mut(member.type0_id) {
+            d.set("BaseFont", Object::Name(member.tagged_name.clone()));
+        }
+        if let Ok(Object::Dictionary(d)) = doc.get_object_mut(member.descriptor_id) {
+            d.set("FontName", Object::Name(member.tagged_name));
+            // A stale /CIDSet would over-claim glyph coverage after the
+            // subset; it is optional metadata outside PDF/A (and PDF/A
+            // documents were skipped above), so drop it. C-M2 regenerates it.
+            d.remove(b"CIDSet");
+        }
     }
 }
 
@@ -596,10 +597,12 @@ fn apply_type1_plan(doc: &mut Document, plan: Type1FontPlan) {
     doc.objects
         .insert(plan.font_file_id, Object::Stream(font_stream));
 
-    if let Ok(Object::Dictionary(d)) = doc.get_object_mut(plan.descriptor_id) {
-        d.remove(b"FontFile");
-        d.set("FontFile3", Object::Reference(plan.font_file_id));
-        d.set("FontName", Object::Name(plan.tagged_name.clone()));
+    for descriptor_id in plan.descriptor_ids {
+        if let Ok(Object::Dictionary(d)) = doc.get_object_mut(descriptor_id) {
+            d.remove(b"FontFile");
+            d.set("FontFile3", Object::Reference(plan.font_file_id));
+            d.set("FontName", Object::Name(plan.tagged_name.clone()));
+        }
     }
     for font_id in plan.font_ids {
         if let Ok(Object::Dictionary(d)) = doc.get_object_mut(font_id) {
@@ -1425,17 +1428,65 @@ fn strip_subset_tag(name: &[u8]) -> &[u8] {
     }
 }
 
-/// Validate one candidate Type0 font end to end and build its plan. Any
-/// failure — wrong shapes, shared structure, subsetter error, not
-/// net-smaller — returns `None` and the font ships untouched.
-fn plan_one_font(
+/// Group every used Type0/CIDFontType2 font by the `/FontFile2` program its
+/// descendant's descriptor carries, and plan one subset per program.
+///
+/// Same reason as [`plan_simple_truetype_groups`]: the stream dedups run
+/// before font planning, so Type0 fonts that each embedded a byte-identical
+/// copy of one program reach the planner sharing a single `/FontFile2`.
+/// Planning per font then declined the shared program, and a later
+/// `dedup_objects` pass could fold the (by then identical) font chains into
+/// one — so only the *next* run subset it, breaking idempotence. Planning per
+/// program keeps every member's descendant, descriptor and CID -> GID map its
+/// own, and unions the members' glyph sets into one subset.
+fn plan_cid_groups(
+    doc: &Document,
+    walker: &Walker,
+    refcounts: &HashMap<ObjectId, usize>,
+    strip_hinting: bool,
+) -> Vec<CidFontPlan> {
+    let mut groups: BTreeMap<ObjectId, Vec<CidMember>> = BTreeMap::new();
+    for (&type0_id, cids) in &walker.used {
+        if walker.ineligible.contains(&type0_id) || cids.is_empty() {
+            continue;
+        }
+        if let Some(member) = cid_member(doc, type0_id, cids, refcounts) {
+            groups.entry(member.font_file_id).or_default().push(member);
+        }
+    }
+    groups
+        .into_iter()
+        .filter_map(|(font_file_id, mut members)| {
+            members.sort_by_key(|m| m.type0_id);
+            plan_cid_group(doc, font_file_id, &members, refcounts, strip_hinting)
+        })
+        .collect()
+}
+
+/// One used Type0 font of a program group, its structure already validated.
+struct CidMember {
+    type0_id: ObjectId,
+    descendant_id: ObjectId,
+    descriptor_id: ObjectId,
+    font_file_id: ObjectId,
+    cids: BTreeSet<u16>,
+}
+
+/// Validate one Type0 font's own structure. Its descendant and descriptor
+/// must each belong to it alone; the program may be shared, which the group
+/// check in [`plan_cid_group`] then accounts for. Any doubt returns `None`.
+fn cid_member(
     doc: &Document,
     type0_id: ObjectId,
     cids: &BTreeSet<u16>,
     refcounts: &HashMap<ObjectId, usize>,
-    strip_hinting: bool,
-) -> Option<CidFontPlan> {
+) -> Option<CidMember> {
     let type0 = doc.get_object(type0_id).ok()?.as_dict().ok()?;
+    if !matches!(type0.get(b"Subtype").map(|s| resolve(doc, s)),
+        Ok(Object::Name(n)) if n == b"Type0")
+    {
+        return None;
+    }
 
     let descendants = type0.get(b"DescendantFonts").ok()?;
     // If the array itself is indirect, it must not be shared between fonts.
@@ -1470,30 +1521,59 @@ fn plan_one_font(
     }
     let (font_file_id, font_file) = resolve_ref(doc, descriptor.get(b"FontFile2").ok()?);
     let font_file_id = font_file_id?;
-    let font_file = font_file.as_stream().ok()?;
+    font_file.as_stream().ok()?;
 
-    // Shared descendant/descriptor/font-program structure could serve fonts
-    // whose usage was not attributed here; mutating it would be unsound.
-    if refcounts.get(&descendant_id) != Some(&1)
-        || refcounts.get(&descriptor_id) != Some(&1)
-        || refcounts.get(&font_file_id) != Some(&1)
-    {
+    // A shared descendant or descriptor could serve a font whose usage was
+    // not attributed here; mutating it would be unsound.
+    if refcounts.get(&descendant_id) != Some(&1) || refcounts.get(&descriptor_id) != Some(&1) {
         return None;
     }
+    Some(CidMember {
+        type0_id,
+        descendant_id,
+        descriptor_id,
+        font_file_id,
+        cids: cids.clone(),
+    })
+}
 
+/// Validate one program's worth of used Type0 fonts end to end and build
+/// their shared subset plan. Any failure in any member — out-of-range glyph
+/// ids, an unresolvable map, a program referenced from outside the group,
+/// subsetter error, not net-smaller — returns `None` and every member ships
+/// untouched.
+fn plan_cid_group(
+    doc: &Document,
+    font_file_id: ObjectId,
+    members: &[CidMember],
+    refcounts: &HashMap<ObjectId, usize>,
+    strip_hinting: bool,
+) -> Option<CidFontPlan> {
+    // Each member's descriptor is its own (checked in `cid_member`), so the
+    // program is referenced exactly once per member when nothing outside the
+    // group holds it.
+    if refcounts.get(&font_file_id) != Some(&members.len()) {
+        return None;
+    }
+    let font_file = doc.get_object(font_file_id).ok()?.as_stream().ok()?;
     let font_bytes = strict_stream_bytes(doc, font_file)?;
     let glyph_count = num_glyphs(&font_bytes)?;
-    let cid_map = load_cid_map(doc, descendant)?;
 
+    let mut maps: Vec<CidMap> = Vec::with_capacity(members.len());
     let mut gids: BTreeSet<u16> = BTreeSet::new();
-    for &cid in cids {
-        let gid = cid_map.lookup(cid);
-        if gid != 0 && gid >= glyph_count {
-            // The document references a glyph the font does not have; the
-            // font is not in a state we can confidently transform.
-            return None;
+    for m in members {
+        let descendant = doc.get_object(m.descendant_id).ok()?.as_dict().ok()?;
+        let cid_map = load_cid_map(doc, descendant)?;
+        for &cid in &m.cids {
+            let gid = cid_map.lookup(cid);
+            if gid != 0 && gid >= glyph_count {
+                // The document references a glyph the font does not have; the
+                // font is not in a state we can confidently transform.
+                return None;
+            }
+            gids.insert(gid);
         }
-        gids.insert(gid);
+        maps.push(cid_map);
     }
     let gid_list: Vec<u16> = gids.iter().copied().collect();
     let remapper = GlyphRemapper::new_from_glyphs_sorted(&gid_list);
@@ -1512,41 +1592,69 @@ fn plan_one_font(
         return None;
     }
 
-    // Old CID -> new GID, 2 bytes big-endian per CID up to the max used CID;
-    // unused CIDs map to 0 (.notdef). Mostly zeros, so it deflates to nearly
-    // nothing.
-    let max_cid = *cids.iter().next_back()?;
-    let mut map = vec![0u8; (usize::from(max_cid) + 1) * 2];
-    for &cid in cids {
-        let new_gid = remapper.get(cid_map.lookup(cid)).unwrap_or(0);
-        let idx = usize::from(cid) * 2;
-        map[idx..idx + 2].copy_from_slice(&new_gid.to_be_bytes());
-    }
-
     let deflated_font = deflate_level9(&subset)?;
-    let deflated_map = deflate_level9(&map)?;
-    // Net-smaller guard on stored bytes: the new font program plus the new
-    // map stream must undercut the old font program plus the old map stream.
-    if deflated_font.len() + deflated_map.len() >= font_file.content.len() + cid_map.stored_len {
+    let tag = subset_tag(&subset);
+    let mut new_bytes = deflated_font.len();
+    let mut old_bytes = font_file.content.len();
+    // Old map streams this rewrite frees: each counted once, and only when
+    // every reference to it comes from a group member (a map still held by a
+    // font outside the group survives the rewrite, so its bytes are not
+    // saved). Counting either way would let the guard approve growth.
+    let mut old_maps: BTreeMap<ObjectId, (usize, usize)> = BTreeMap::new(); // id -> (uses, stored)
+    let mut member_plans: Vec<CidMemberPlan> = Vec::with_capacity(members.len());
+    for (m, cid_map) in members.iter().zip(&maps) {
+        // Old CID -> new GID, 2 bytes big-endian per CID up to the max used
+        // CID; unused CIDs map to 0 (.notdef). Mostly zeros, so it deflates
+        // to nearly nothing.
+        let max_cid = *m.cids.iter().next_back()?;
+        let mut map = vec![0u8; (usize::from(max_cid) + 1) * 2];
+        for &cid in &m.cids {
+            let new_gid = remapper.get(cid_map.lookup(cid)).unwrap_or(0);
+            let idx = usize::from(cid) * 2;
+            map[idx..idx + 2].copy_from_slice(&new_gid.to_be_bytes());
+        }
+        let deflated_map = deflate_level9(&map)?;
+        new_bytes += deflated_map.len();
+
+        let type0 = doc.get_object(m.type0_id).ok()?.as_dict().ok()?;
+        let descendant = doc.get_object(m.descendant_id).ok()?.as_dict().ok()?;
+        let old_map_id = descendant
+            .get(b"CIDToGIDMap")
+            .ok()
+            .and_then(|o| o.as_reference().ok());
+        if let Some(id) = old_map_id {
+            old_maps.entry(id).or_insert((0, cid_map.stored_len)).0 += 1;
+        }
+        let descriptor = doc.get_object(m.descriptor_id).ok()?.as_dict().ok()?;
+        let base_name = base_font_name(doc, type0, descendant, descriptor)?;
+        let mut tagged_name = Vec::with_capacity(base_name.len() + 7);
+        tagged_name.extend_from_slice(&tag);
+        tagged_name.push(b'+');
+        tagged_name.extend_from_slice(strip_subset_tag(&base_name));
+        member_plans.push(CidMemberPlan {
+            type0_id: m.type0_id,
+            descendant_id: m.descendant_id,
+            descriptor_id: m.descriptor_id,
+            deflated_map,
+            tagged_name,
+        });
+    }
+    for (id, (uses, stored)) in &old_maps {
+        if refcounts.get(id) == Some(uses) {
+            old_bytes += stored;
+        }
+    }
+    // Net-smaller guard on stored bytes: the new program plus every new map
+    // stream must undercut the old program plus every old map it frees.
+    if new_bytes >= old_bytes {
         return None;
     }
 
-    let base_name = base_font_name(doc, type0, descendant, descriptor)?;
-    let tag = subset_tag(&subset);
-    let mut tagged_name = Vec::with_capacity(base_name.len() + 7);
-    tagged_name.extend_from_slice(&tag);
-    tagged_name.push(b'+');
-    tagged_name.extend_from_slice(strip_subset_tag(&base_name));
-
     Some(CidFontPlan {
-        type0_id,
-        descendant_id,
-        descriptor_id,
+        members: member_plans,
         font_file_id,
         deflated_font,
         font_len: subset.len() as i64,
-        deflated_map,
-        tagged_name,
     })
 }
 
@@ -1954,23 +2062,26 @@ fn parse_type1_encoding(
     }
 }
 
-/// Group every used Type1 font by the descriptor that carries its program,
-/// and plan one conversion per group.
+/// Group every used Type1 font by the `/FontFile` program its descriptor
+/// carries, and plan one conversion per program.
 ///
 /// Producers routinely point several font dictionaries — same program,
 /// different `/Encoding` — at a single `/FontDescriptor`. Planning per font
 /// dictionary meant a shared descriptor failed the "referenced exactly once"
 /// soundness test and the whole program shipped as Type1 (measured: all
-/// 331,824 B of `corpus-expanded/arxiv-diffusion.pdf`'s font bytes). Planning
-/// per descriptor keeps the same guarantee — every reference to the
-/// descriptor must be one of the font dictionaries whose usage we attributed
-/// — while letting the group's glyph sets union into one conversion.
+/// 331,824 B of `corpus-expanded/arxiv-diffusion.pdf`'s font bytes). And the
+/// stream dedups run before planning, so descriptors that each embedded a
+/// byte-identical copy of one program reach the planner sharing it — the
+/// same pass-2 idempotence trap the simple TrueType path had. Grouping by
+/// program covers both: every reference to the program must come from a
+/// group descriptor, and every reference to a descriptor from a group font.
 fn plan_type1_conversions(
     doc: &Document,
     walker: &Walker,
     refcounts: &HashMap<ObjectId, usize>,
 ) -> Vec<Type1FontPlan> {
-    let mut groups: BTreeMap<ObjectId, Vec<(ObjectId, BTreeSet<u16>)>> = BTreeMap::new();
+    // program id -> (font id, descriptor id, codes) for every member.
+    let mut groups: BTreeMap<ObjectId, Vec<(ObjectId, ObjectId, BTreeSet<u16>)>> = BTreeMap::new();
     for (&font_id, codes) in &walker.used {
         if walker.ineligible.contains(&font_id) || codes.is_empty() {
             continue;
@@ -1986,50 +2097,62 @@ fn plan_type1_conversions(
         let Ok(descriptor) = dict.get(b"FontDescriptor") else {
             continue;
         };
-        if let (Some(descriptor_id), _) = resolve_ref(doc, descriptor) {
+        let (Some(descriptor_id), descriptor) = resolve_ref(doc, descriptor) else {
+            continue;
+        };
+        let Ok(font_file) = descriptor.as_dict().and_then(|d| d.get(b"FontFile")) else {
+            continue;
+        };
+        if let (Some(font_file_id), _) = resolve_ref(doc, font_file) {
             groups
-                .entry(descriptor_id)
+                .entry(font_file_id)
                 .or_default()
-                .push((font_id, codes.clone()));
+                .push((font_id, descriptor_id, codes.clone()));
         }
     }
     groups
         .into_iter()
-        .filter_map(|(descriptor_id, mut members)| {
-            members.sort_by_key(|(id, _)| *id);
-            plan_type1_group(doc, descriptor_id, &members, refcounts)
+        .filter_map(|(font_file_id, mut members)| {
+            members.sort_by_key(|(id, _, _)| *id);
+            plan_type1_group(doc, font_file_id, &members, refcounts)
         })
         .collect()
 }
 
-/// Validate one descriptor's worth of used Type1 fonts end to end and build
+/// Validate one program's worth of used Type1 fonts end to end and build
 /// their shared Type1C conversion plan. Any failure — unparseable font
-/// program, unknown encoding shape, charstring anomalies, shared structure,
-/// not strictly smaller — returns `None` and the fonts ship untouched.
+/// program, unknown encoding shape, charstring anomalies, structure shared
+/// beyond the group, not strictly smaller — returns `None` and the fonts
+/// ship untouched.
 fn plan_type1_group(
     doc: &Document,
-    descriptor_id: ObjectId,
-    members: &[(ObjectId, BTreeSet<u16>)],
+    font_file_id: ObjectId,
+    members: &[(ObjectId, ObjectId, BTreeSet<u16>)],
     refcounts: &HashMap<ObjectId, usize>,
 ) -> Option<Type1FontPlan> {
-    let descriptor = doc.get_object(descriptor_id).ok()?.as_dict().ok()?;
-    // Exactly one font program, of the Type1 kind: a descriptor already
-    // carrying a `/FontFile3` (or a TrueType program) is not ours to touch.
-    if descriptor.get(b"FontFile2").is_ok() || descriptor.get(b"FontFile3").is_ok() {
+    // Every reference to each descriptor must be one of the group's font
+    // dictionaries, and every reference to the program one of the group's
+    // descriptors — otherwise some font whose usage was never attributed
+    // here shares the structure, and rewriting it would be unsound.
+    let mut descriptor_uses: BTreeMap<ObjectId, usize> = BTreeMap::new();
+    for (_, descriptor_id, _) in members {
+        *descriptor_uses.entry(*descriptor_id).or_default() += 1;
+    }
+    if refcounts.get(&font_file_id) != Some(&descriptor_uses.len()) {
         return None;
     }
-    let (font_file_id, font_file) = resolve_ref(doc, descriptor.get(b"FontFile").ok()?);
-    let font_file_id = font_file_id?;
-    let font_file = font_file.as_stream().ok()?;
-    // Every reference to the descriptor must be one of the font dictionaries
-    // in this group, and the program must belong to this descriptor alone —
-    // otherwise some font whose usage was never attributed here shares the
-    // structure, and rewriting it would be unsound.
-    if refcounts.get(&descriptor_id) != Some(&members.len())
-        || refcounts.get(&font_file_id) != Some(&1)
-    {
-        return None;
+    for (id, uses) in &descriptor_uses {
+        if refcounts.get(id) != Some(uses) {
+            return None;
+        }
+        let descriptor = doc.get_object(*id).ok()?.as_dict().ok()?;
+        // Exactly one font program, of the Type1 kind: a descriptor already
+        // carrying a `/FontFile3` (or a TrueType program) is not ours to touch.
+        if descriptor.get(b"FontFile2").is_ok() || descriptor.get(b"FontFile3").is_ok() {
+            return None;
+        }
     }
+    let font_file = doc.get_object(font_file_id).ok()?.as_stream().ok()?;
 
     let font_bytes = strict_stream_bytes(doc, font_file)?;
     let t1 = type1::parse(&font_bytes)?;
@@ -2042,8 +2165,9 @@ fn plan_type1_group(
     // change), so it constrains nothing.
     let mut keep: BTreeSet<Vec<u8>> = BTreeSet::new();
     let mut base_name: Option<Vec<u8>> = None;
-    for (font_id, codes) in members {
+    for (font_id, descriptor_id, codes) in members {
         let font = doc.get_object(*font_id).ok()?.as_dict().ok()?;
+        let descriptor = doc.get_object(*descriptor_id).ok()?.as_dict().ok()?;
         let (base, diffs) = parse_type1_encoding(doc, font)?;
         for &code in codes {
             let code = u8::try_from(code).ok()?;
@@ -2063,7 +2187,7 @@ fn plan_type1_group(
                 }
             }
         }
-        // One name is written back to every member and to the descriptor, so
+        // One name is written back to every member and every descriptor, so
         // the members must agree on it modulo their subset tags.
         let this_name = match font.get(b"BaseFont").map(|o| resolve(doc, o)) {
             Ok(Object::Name(n)) => strip_subset_tag(n).to_vec(),
@@ -2094,8 +2218,8 @@ fn plan_type1_group(
     tagged_name.extend_from_slice(&base_name);
 
     Some(Type1FontPlan {
-        font_ids: members.iter().map(|(id, _)| *id).collect(),
-        descriptor_id,
+        font_ids: members.iter().map(|(id, _, _)| *id).collect(),
+        descriptor_ids: descriptor_uses.into_keys().collect(),
         font_file_id,
         deflated_cff,
         tagged_name,
@@ -2956,6 +3080,73 @@ mod tests {
         assert!(out.len() < pdf.len(), "conversion must shrink the file");
     }
 
+    /// Two descriptors, each embedding its own byte-identical copy of one
+    /// Type1 program (one font per page). The stream dedup merges the copies
+    /// before planning, so two descriptors share one `/FontFile`; the
+    /// conversion must still happen on the FIRST pass.
+    #[test]
+    fn type1_conversion_of_a_duplicated_program_happens_on_the_first_pass() {
+        let program = build_type1_program("TestFont", &[("A", 600), ("B", 500)]);
+        let mut doc = Document::with_version("1.7");
+        let pages_id = doc.new_object_id();
+        let mut page_ids = Vec::new();
+        for glyph in ["A", "B"] {
+            let file_id = doc.add_object(Stream::new(
+                dictionary! {
+                    "Length1" => program.len() as i64,
+                    "Length2" => 0,
+                    "Length3" => 0,
+                },
+                program.clone(),
+            ));
+            let descriptor_id = doc.add_object(dictionary! {
+                "Type" => "FontDescriptor",
+                "FontName" => "TestFont",
+                "Flags" => 4,
+                "FontBBox" => vec![0.into(), 0.into(), 700.into(), 700.into()],
+                "ItalicAngle" => 0,
+                "Ascent" => 700,
+                "Descent" => 0,
+                "CapHeight" => 700,
+                "StemV" => 80,
+                "FontFile" => file_id,
+            });
+            let font_id = doc.add_object(dictionary! {
+                "Type" => "Font",
+                "Subtype" => "Type1",
+                "BaseFont" => "TestFont",
+                "FirstChar" => 65,
+                "LastChar" => 66,
+                "Widths" => vec![600.into(), 500.into()],
+                "FontDescriptor" => descriptor_id,
+                "Encoding" => "WinAnsiEncoding",
+            });
+            let content_id = doc.add_object(Stream::new(
+                dictionary! {},
+                format!("BT /F1 24 Tf 72 720 Td ({glyph}) Tj ET").into_bytes(),
+            ));
+            page_ids.push(doc.add_object(dictionary! {
+                "Type" => "Page",
+                "Parent" => pages_id,
+                "Contents" => content_id,
+                "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+                "Resources" => dictionary! { "Font" => dictionary! { "F1" => font_id } },
+            }));
+        }
+        let pdf = finish_pdf(&mut doc, pages_id, page_ids);
+
+        let opts = OptimizeOptions::default().with_convert_type1(true);
+        let once = optimize_with_options(&pdf, opts);
+        let (type1c, type1, _) = type1c_view(&once);
+        assert_eq!(
+            (type1c, type1),
+            (1, 0),
+            "the shared program converts on pass 1"
+        );
+        let twice = optimize_with_options(&once, opts);
+        assert_eq!(twice, once, "second pass must be byte-stable");
+    }
+
     /// The single-dictionary case still works, and is what the group path
     /// degenerates to.
     #[test]
@@ -3266,6 +3457,48 @@ mod tests {
             "old tag must be stripped"
         );
         assert_eq!(tagged.iter().filter(|&&b| b == b'+').count(), 1);
+    }
+
+    /// Two Type0 fonts, one per page, each embedding its own byte-identical
+    /// copy of one CIDFontType2 program. The stream dedup merges the copies
+    /// before planning, so both descriptors share one `/FontFile2`; the
+    /// subset must happen on the FIRST pass and cover both pages' glyphs.
+    #[test]
+    fn duplicated_cid_program_is_subsetted_on_the_first_pass() {
+        let mut doc = Document::with_version("1.7");
+        let pages_id = doc.new_object_id();
+        let mut page_ids = Vec::new();
+        for text in ["Hello", "World"] {
+            let cids = gids_for(text);
+            let pairs: Vec<(u16, char)> = cids.iter().copied().zip(text.chars()).collect();
+            let font_id = add_type0_font(&mut doc, &FontSpec::identity(pairs));
+            page_ids.push(add_text_page(
+                &mut doc,
+                pages_id,
+                font_id,
+                show_text_ops("F1", &cids),
+            ));
+        }
+        let pdf = finish_pdf(&mut doc, pages_id, page_ids);
+
+        let once = optimize_with_options(&pdf, subset_opts());
+        assert!(
+            once.len() < pdf.len() / 4,
+            "the shared program must be subset on pass 1"
+        );
+        let twice = optimize_with_options(&once, subset_opts());
+        assert_eq!(twice, once, "second pass must be byte-stable");
+        assert_eq!(
+            Document::load_mem(&once)
+                .unwrap()
+                .extract_text(&[1, 2])
+                .unwrap(),
+            Document::load_mem(&pdf)
+                .unwrap()
+                .extract_text(&[1, 2])
+                .unwrap(),
+            "text must survive"
+        );
     }
 
     #[test]

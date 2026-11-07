@@ -27,6 +27,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dictionary stored directly (not by reference) in `/Fields` or `/Kids`.
 - `--help` no longer claims the CLI expands quoted glob patterns; it never
   did (shell globs still work as usual).
+- **The same first-pass font fix now covers CID (Type0) subsetting and
+  Type1 → Type1C conversion.** Both planned per font or per descriptor, so a
+  program the stream dedup had merged from byte-identical copies was
+  declined and only handled on a second run. They now plan per program,
+  like simple TrueType. The CID size guard also counts an old
+  `/CIDToGIDMap` stream as freed only when nothing outside the rewrite
+  still references it, and counts a shared one once.
 - **A second pass could shrink a file further** when a document embedded
   the same simple TrueType font program more than once (one copy per page
   or section, as some producers write). The stream dedup merged the copies
