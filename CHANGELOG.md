@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A second pass could shrink a file further** when a document embedded
+  the same simple TrueType font program more than once (one copy per page
+  or section, as some producers write). The stream dedup merged the copies
+  before font subsetting, the subsetter then declined a program shared by
+  several font dictionaries, and a later dedup merged those dictionaries —
+  so only the *next* run subset the font. Simple TrueType fonts are now
+  planned per font program: when every font dictionary and descriptor that
+  references the program is one whose usage was attributed, their glyph
+  sets union into one subset on the first pass. Measured on
+  `corpus-expanded/arxiv-gpt4.pdf`: the first pass now lands where the
+  second used to (defaults 2,001,418 → 2,001,370 B; with every lossy and
+  strip flag on, 874,428 → 870,171 B) and a second pass is byte-stable.
+  Every other corpus file's output is byte-identical to before the fix.
+
 ### Changed
 
 - **lopdf 0.44 → 0.47.** Upstream's three releases are mostly parser

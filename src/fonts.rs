@@ -69,7 +69,7 @@ impl FontPlan {
     fn font_id(&self) -> ObjectId {
         match self {
             FontPlan::Cid(p) => p.type0_id,
-            FontPlan::Simple(p) => p.font_id,
+            FontPlan::Simple(p) => p.fonts[0].0,
             FontPlan::Type1(p) => p.font_ids[0],
         }
     }
@@ -97,15 +97,16 @@ pub(crate) struct CidFontPlan {
 /// stream in place and re-tags the font names — codes, `/Encoding`,
 /// `/Widths`, and `/ToUnicode` never change.
 pub(crate) struct SimpleFontPlan {
-    font_id: ObjectId,
-    descriptor_id: ObjectId,
+    /// Every font dictionary sharing the program, sorted by id, each with
+    /// the `TAG+BaseFont` name its `/BaseFont` takes.
+    fonts: Vec<(ObjectId, Vec<u8>)>,
+    /// Every descriptor carrying the program, with its new `/FontName`.
+    descriptors: Vec<(ObjectId, Vec<u8>)>,
     font_file_id: ObjectId,
     /// Flate-compressed subset font program (with rebuilt `cmap`).
     deflated_font: Vec<u8>,
     /// Uncompressed length of the subset font (`/Length1`).
     font_len: i64,
-    /// `TAG+BaseFont` name applied to `/BaseFont` and `/FontName`.
-    tagged_name: Vec<u8>,
 }
 
 /// A planned Type1 → Type1C (CFF) conversion (opt-in, `convert_type1`).
@@ -170,6 +171,13 @@ pub(crate) fn plan_font_subsets(
         .filter(|(id, cids)| !walker.ineligible.contains(id) && !cids.is_empty())
         .filter_map(|(&id, cids)| plan_one(doc, id, cids, &refcounts, subset_fonts, strip_hinting))
         .collect();
+    if subset_fonts {
+        plans.extend(
+            plan_simple_truetype_groups(doc, &walker, &refcounts, strip_hinting)
+                .into_iter()
+                .map(FontPlan::Simple),
+        );
+    }
     if convert_type1 {
         plans.extend(
             plan_type1_conversions(doc, &walker, &refcounts)
@@ -196,9 +204,6 @@ fn plan_one(
     match dict.get(b"Subtype").map(|s| resolve(doc, s)) {
         Ok(Object::Name(n)) if n == b"Type0" && subset_fonts => {
             plan_one_font(doc, id, codes, refcounts, strip_hinting).map(FontPlan::Cid)
-        }
-        Ok(Object::Name(n)) if n == b"TrueType" && subset_fonts => {
-            plan_one_simple_font(doc, id, codes, refcounts, strip_hinting).map(FontPlan::Simple)
         }
         _ => None,
     }
@@ -565,11 +570,15 @@ fn apply_simple_plan(doc: &mut Document, plan: SimpleFontPlan) {
     doc.objects
         .insert(plan.font_file_id, Object::Stream(font_stream));
 
-    if let Ok(Object::Dictionary(d)) = doc.get_object_mut(plan.font_id) {
-        d.set("BaseFont", Object::Name(plan.tagged_name.clone()));
+    for (font_id, name) in plan.fonts {
+        if let Ok(Object::Dictionary(d)) = doc.get_object_mut(font_id) {
+            d.set("BaseFont", Object::Name(name));
+        }
     }
-    if let Ok(Object::Dictionary(d)) = doc.get_object_mut(plan.descriptor_id) {
-        d.set("FontName", Object::Name(plan.tagged_name));
+    for (descriptor_id, name) in plan.descriptors {
+        if let Ok(Object::Dictionary(d)) = doc.get_object_mut(descriptor_id) {
+            d.set("FontName", Object::Name(name));
+        }
     }
 }
 
@@ -1623,46 +1632,106 @@ fn parse_differences(doc: &Document, d: &Dictionary) -> Option<HashMap<u8, Vec<u
     Some(diffs)
 }
 
-/// Validate one used simple TrueType font end to end and build its plan.
-/// Any failure — symbolic flags, unknown encoding or glyph name, a used code
-/// the cmap paths cannot resolve, shared structure, subsetter error, cmap
-/// round-trip mismatch, not net-smaller — returns `None` and the font ships
-/// untouched.
-fn plan_one_simple_font(
+/// Group every used simple TrueType font by the `/FontFile2` program its
+/// descriptor carries, and plan one subset per program.
+///
+/// The document-wide stream dedups run before font planning, so two font
+/// dictionaries that each embedded a byte-identical copy of one program
+/// reach the planner sharing a single `/FontFile2` object. Planning per font
+/// dictionary made that shared program fail the "referenced exactly once"
+/// soundness test — and the later `dedup_objects` pass then collapsed the two
+/// (by then identical) font dictionaries into one, so the *next* run found an
+/// unshared program and subset it: a second pass that changed the file
+/// (measured: `corpus-expanded/arxiv-gpt4.pdf`, one Helvetica program,
+/// 48 B). Planning per program keeps the same guarantee — every reference to
+/// the program and to each descriptor must come from the fonts whose usage
+/// we attributed — while their glyph sets union into one subset.
+fn plan_simple_truetype_groups(
     doc: &Document,
+    walker: &Walker,
+    refcounts: &HashMap<ObjectId, usize>,
+    strip_hinting: bool,
+) -> Vec<SimpleFontPlan> {
+    let mut groups: BTreeMap<ObjectId, Vec<SimpleMember>> = BTreeMap::new();
+    for (&font_id, codes) in &walker.used {
+        if walker.ineligible.contains(&font_id) || codes.is_empty() {
+            continue;
+        }
+        let Ok(Object::Dictionary(dict)) = doc.get_object(font_id) else {
+            continue;
+        };
+        if !matches!(dict.get(b"Subtype").map(|s| resolve(doc, s)),
+            Ok(Object::Name(n)) if n == b"TrueType")
+        {
+            continue;
+        }
+        let Ok(descriptor) = dict.get(b"FontDescriptor") else {
+            continue;
+        };
+        let (Some(descriptor_id), descriptor) = resolve_ref(doc, descriptor) else {
+            continue;
+        };
+        let Ok(descriptor) = descriptor.as_dict() else {
+            continue;
+        };
+        let Ok(font_file) = descriptor.get(b"FontFile2") else {
+            continue;
+        };
+        if let (Some(font_file_id), _) = resolve_ref(doc, font_file) {
+            groups.entry(font_file_id).or_default().push(SimpleMember {
+                font_id,
+                descriptor_id,
+                codes: codes.clone(),
+            });
+        }
+    }
+    groups
+        .into_iter()
+        .filter_map(|(font_file_id, mut members)| {
+            members.sort_by_key(|m| m.font_id);
+            plan_simple_group(doc, font_file_id, &members, refcounts, strip_hinting)
+        })
+        .collect()
+}
+
+/// One used simple TrueType font dictionary of a program group.
+struct SimpleMember {
     font_id: ObjectId,
-    codes: &BTreeSet<u16>,
+    descriptor_id: ObjectId,
+    codes: BTreeSet<u16>,
+}
+
+/// Validate one program's worth of used simple TrueType fonts end to end
+/// and build their shared subset plan. Any failure in any member — symbolic
+/// flags, unknown encoding or glyph name, a used code the cmap paths cannot
+/// resolve, structure shared beyond the group, subsetter error, cmap
+/// round-trip mismatch, not net-smaller — returns `None` and every member
+/// ships untouched.
+fn plan_simple_group(
+    doc: &Document,
+    font_file_id: ObjectId,
+    members: &[SimpleMember],
     refcounts: &HashMap<ObjectId, usize>,
     strip_hinting: bool,
 ) -> Option<SimpleFontPlan> {
-    let font = doc.get_object(font_id).ok()?.as_dict().ok()?;
-    // With /Widths present every shown glyph's advance comes from the PDF,
-    // not the font program; without it we would have to prove the subset's
-    // metrics tables serve unused codes identically. Decline instead.
-    font.get(b"Widths").ok()?;
-    let (base_names, diffs) = parse_simple_encoding(doc, font)?;
-
-    let (descriptor_id, descriptor) = resolve_ref(doc, font.get(b"FontDescriptor").ok()?);
-    let descriptor_id = descriptor_id?;
-    let descriptor = descriptor.as_dict().ok()?;
-    let flags = resolve(doc, descriptor.get(b"Flags").ok()?).as_i64().ok()?;
-    // Nonsymbolic set and Symbolic clear: exactly the fonts whose lookup the
-    // nonsymbolic paths of 9.6.6.4 (replicated below) fully describe.
-    if flags & 0x04 != 0 || flags & 0x20 == 0 {
-        return None;
-    }
-    if descriptor.get(b"FontFile").is_ok() || descriptor.get(b"FontFile3").is_ok() {
-        return None;
-    }
-    let (font_file_id, font_file) = resolve_ref(doc, descriptor.get(b"FontFile2").ok()?);
-    let font_file_id = font_file_id?;
-    let font_file = font_file.as_stream().ok()?;
     // Shared descriptor/font-program structure could serve fonts whose usage
-    // was not attributed here; mutating it would be unsound.
-    if refcounts.get(&descriptor_id) != Some(&1) || refcounts.get(&font_file_id) != Some(&1) {
+    // was not attributed here; mutating it would be unsound. So every
+    // reference to the program must come from a group descriptor, and every
+    // reference to a descriptor from a group font.
+    let mut descriptor_uses: BTreeMap<ObjectId, usize> = BTreeMap::new();
+    for m in members {
+        *descriptor_uses.entry(m.descriptor_id).or_default() += 1;
+    }
+    if refcounts.get(&font_file_id) != Some(&descriptor_uses.len()) {
         return None;
     }
+    for (id, uses) in &descriptor_uses {
+        if refcounts.get(id) != Some(uses) {
+            return None;
+        }
+    }
 
+    let font_file = doc.get_object(font_file_id).ok()?.as_stream().ok()?;
     let font_bytes = strict_stream_bytes(doc, font_file)?;
     let glyph_count = num_glyphs(&font_bytes)?;
     let subtables = truetype::parse_cmap(&font_bytes)?;
@@ -1678,48 +1747,77 @@ fn plan_one_simple_font(
         return None;
     }
 
-    // Resolve every used code through the union of the 9.6.6.4 lookup paths;
-    // every glyph any path could select is retained. A code no path resolves
-    // disqualifies the font (the original might still render it via
-    // `post`-table names, which the subset would lose).
     let mut gids: BTreeSet<u16> = BTreeSet::new();
     gids.insert(0);
-    for &code in codes {
-        let code = u8::try_from(code).ok()?;
-        let name: &[u8] = match diffs.get(&code) {
-            Some(n) => n,
-            None => {
-                let n = base_names[usize::from(code)];
-                if n.is_empty() {
-                    return None; // shown code with no name in the encoding
-                }
-                n.as_bytes()
-            }
-        };
-        let mut candidates: Vec<u16> = Vec::new();
-        if let Some(sub) = c31 {
-            if let Some(u) = encodings::glyph_name_to_unicode(name) {
-                candidates.extend(sub.map.get(&u));
-            }
-        }
-        if let Some(sub) = c10 {
-            if let Some(mac) = encodings::mac_roman_code_of(name) {
-                candidates.extend(sub.map.get(&u32::from(mac)));
-            }
-        }
-        if let Some(sub) = c30 {
-            candidates.extend(sub.map.get(&(0xF000 | u32::from(code))));
-            candidates.extend(sub.map.get(&u32::from(code)));
-        }
-        if candidates.is_empty() {
+    let mut font_names: Vec<(ObjectId, Vec<u8>)> = Vec::with_capacity(members.len());
+    for m in members {
+        let font = doc.get_object(m.font_id).ok()?.as_dict().ok()?;
+        // With /Widths present every shown glyph's advance comes from the
+        // PDF, not the font program; without it we would have to prove the
+        // subset's metrics tables serve unused codes identically. Decline.
+        font.get(b"Widths").ok()?;
+        let (base_names, diffs) = parse_simple_encoding(doc, font)?;
+        let descriptor = doc.get_object(m.descriptor_id).ok()?.as_dict().ok()?;
+        let flags = resolve(doc, descriptor.get(b"Flags").ok()?).as_i64().ok()?;
+        // Nonsymbolic set and Symbolic clear: exactly the fonts whose lookup
+        // the nonsymbolic paths of 9.6.6.4 (replicated below) fully describe.
+        if flags & 0x04 != 0 || flags & 0x20 == 0 {
             return None;
         }
-        for gid in candidates {
-            if gid >= glyph_count {
+        if descriptor.get(b"FontFile").is_ok() || descriptor.get(b"FontFile3").is_ok() {
+            return None;
+        }
+
+        // Resolve every used code through the union of the 9.6.6.4 lookup
+        // paths; every glyph any path could select is retained. A code no
+        // path resolves disqualifies the group (the original might still
+        // render it via `post`-table names, which the subset would lose).
+        for &code in &m.codes {
+            let code = u8::try_from(code).ok()?;
+            let name: &[u8] = match diffs.get(&code) {
+                Some(n) => n,
+                None => {
+                    let n = base_names[usize::from(code)];
+                    if n.is_empty() {
+                        return None; // shown code with no name in the encoding
+                    }
+                    n.as_bytes()
+                }
+            };
+            let mut candidates: Vec<u16> = Vec::new();
+            if let Some(sub) = c31 {
+                if let Some(u) = encodings::glyph_name_to_unicode(name) {
+                    candidates.extend(sub.map.get(&u));
+                }
+            }
+            if let Some(sub) = c10 {
+                if let Some(mac) = encodings::mac_roman_code_of(name) {
+                    candidates.extend(sub.map.get(&u32::from(mac)));
+                }
+            }
+            if let Some(sub) = c30 {
+                candidates.extend(sub.map.get(&(0xF000 | u32::from(code))));
+                candidates.extend(sub.map.get(&u32::from(code)));
+            }
+            if candidates.is_empty() {
                 return None;
             }
-            gids.insert(gid);
+            for gid in candidates {
+                if gid >= glyph_count {
+                    return None;
+                }
+                gids.insert(gid);
+            }
         }
+
+        let base_name = match font.get(b"BaseFont").map(|o| resolve(doc, o)) {
+            Ok(Object::Name(n)) => n.clone(),
+            _ => match descriptor.get(b"FontName").map(|o| resolve(doc, o)) {
+                Ok(Object::Name(n)) => n.clone(),
+                _ => return None,
+            },
+        };
+        font_names.push((m.font_id, base_name));
     }
 
     let gid_list: Vec<u16> = gids.iter().copied().collect();
@@ -1782,26 +1880,33 @@ fn plan_one_simple_font(
         return None;
     }
 
-    let base_name = match font.get(b"BaseFont").map(|o| resolve(doc, o)) {
-        Ok(Object::Name(n)) => n.clone(),
-        _ => match descriptor.get(b"FontName").map(|o| resolve(doc, o)) {
-            Ok(Object::Name(n)) => n.clone(),
-            _ => return None,
-        },
-    };
     let tag = subset_tag(&final_font);
-    let mut tagged_name = Vec::with_capacity(base_name.len() + 7);
-    tagged_name.extend_from_slice(&tag);
-    tagged_name.push(b'+');
-    tagged_name.extend_from_slice(strip_subset_tag(&base_name));
+    let tagged = |base: &[u8]| {
+        let mut name = Vec::with_capacity(base.len() + 7);
+        name.extend_from_slice(&tag);
+        name.push(b'+');
+        name.extend_from_slice(strip_subset_tag(base));
+        name
+    };
+    let fonts: Vec<(ObjectId, Vec<u8>)> = font_names
+        .iter()
+        .map(|(id, base)| (*id, tagged(base)))
+        .collect();
+    // Each descriptor takes the tagged name of the first (lowest-id) font
+    // that uses it — for an unshared font, exactly its own name.
+    let mut descriptors: Vec<(ObjectId, Vec<u8>)> = Vec::with_capacity(descriptor_uses.len());
+    for (m, (_, name)) in members.iter().zip(&fonts) {
+        if !descriptors.iter().any(|(id, _)| *id == m.descriptor_id) {
+            descriptors.push((m.descriptor_id, name.clone()));
+        }
+    }
 
     Some(SimpleFontPlan {
-        font_id,
-        descriptor_id,
+        fonts,
+        descriptors,
         font_file_id,
         deflated_font,
         font_len: final_font.len() as i64,
-        tagged_name,
     })
 }
 
@@ -3301,6 +3406,96 @@ mod tests {
         let (new_outline, new_adv) = outline_and_advance(subset, new_gid.0);
         assert_eq!(old_outline, new_outline, "outline mismatch for {ch:?}");
         assert_eq!(old_adv, new_adv, "advance mismatch for {ch:?}");
+    }
+
+    /// Two pages, each embedding its own byte-identical copy of one simple
+    /// TrueType program (the shape of `corpus-expanded/arxiv-gpt4.pdf`). The
+    /// stream dedup merges the copies before font planning, so the planner
+    /// sees two fonts sharing one program. `extra_unshown_sharer` adds a
+    /// third font dictionary over the same program that page 1 binds but
+    /// never shows text with; its `/Widths` differ, so no dedup pass can
+    /// fold it into the shown fonts and its reference to the program stays
+    /// unattributed on every pass.
+    fn build_duplicated_program_pdf(extra_unshown_sharer: bool) -> Vec<u8> {
+        let mut doc = Document::with_version("1.7");
+        let pages_id = doc.new_object_id();
+        let spec = SimpleSpec::winansi();
+        let a = add_simple_tt_font(&mut doc, &spec);
+        let b = add_simple_tt_font(&mut doc, &spec);
+        let p1 = add_text_page(&mut doc, pages_id, a, show_byte_ops("F1", b"Hello"));
+        let p2 = add_text_page(&mut doc, pages_id, b, show_byte_ops("F1", b"World!"));
+        if extra_unshown_sharer {
+            let c = add_simple_tt_font(&mut doc, &spec);
+            let widths: Vec<Object> = (32..=255).map(|_| 600.into()).collect();
+            let font = doc.get_object_mut(c).unwrap().as_dict_mut().unwrap();
+            font.set("Widths", widths);
+            let page = doc.get_object_mut(p1).unwrap().as_dict_mut().unwrap();
+            let res = page.get_mut(b"Resources").unwrap().as_dict_mut().unwrap();
+            let fonts = res.get_mut(b"Font").unwrap().as_dict_mut().unwrap();
+            fonts.set("F9", c);
+        }
+        finish_pdf(&mut doc, pages_id, vec![p1, p2])
+    }
+
+    #[test]
+    fn duplicated_simple_program_is_subsetted_on_the_first_pass() {
+        let pdf = build_duplicated_program_pdf(false);
+        let once = optimize_with_options(&pdf, subset_opts());
+        let twice = optimize_with_options(&once, subset_opts());
+        assert_eq!(twice, once, "second pass must be byte-stable");
+
+        // One shared program, subset to the union of both pages' glyphs.
+        let doc = Document::load_mem(&once).unwrap();
+        let mut programs = BTreeSet::new();
+        let mut names = Vec::new();
+        for obj in doc.objects.values() {
+            let Object::Dictionary(font) = obj else {
+                continue;
+            };
+            if !matches!(font.get(b"Subtype"), Ok(Object::Name(n)) if n == b"TrueType") {
+                continue;
+            }
+            let descriptor = resolve(&doc, font.get(b"FontDescriptor").unwrap())
+                .as_dict()
+                .unwrap();
+            programs.insert(
+                descriptor
+                    .get(b"FontFile2")
+                    .unwrap()
+                    .as_reference()
+                    .unwrap(),
+            );
+            names.push(base_name_of(font, b"BaseFont"));
+        }
+        assert_eq!(programs.len(), 1, "the two copies share one program");
+        assert!(
+            !names.is_empty()
+                && names
+                    .iter()
+                    .all(|n| n[6] == b'+' && &n[7..] == b"NotoSans-Regular")
+        );
+        let (_, subset) = simple_font_view(&once);
+        let original = noto_bytes();
+        assert!(
+            subset.len() < original.len() / 4,
+            "the shared program must be subset"
+        );
+        for ch in "HelloWorld!".chars() {
+            assert_char_preserved(&subset, &original, ch);
+        }
+    }
+
+    #[test]
+    fn duplicated_simple_program_with_an_unattributed_sharer_is_left_whole() {
+        // The bound-but-unshown third font holds a reference to the shared
+        // program that no attributed usage covers, so subsetting must decline
+        // on every pass (the stream dedup still merges the three copies).
+        let pdf = build_duplicated_program_pdf(true);
+        let once = optimize_with_options(&pdf, subset_opts());
+        let (_, program) = simple_font_view(&once);
+        assert_eq!(program, noto_bytes(), "the program must ship whole");
+        let twice = optimize_with_options(&once, subset_opts());
+        assert_eq!(twice, once, "second pass must be byte-stable");
     }
 
     #[test]
