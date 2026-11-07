@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **lopdf 0.44 → 0.47.** Upstream's three releases are mostly parser
+  robustness for malformed and hostile files (crash fixes, cross-reference
+  reconstruction, more stream filters, bounded decompression), plus faster
+  parsing. Both upstream bugs picamatl works around are still present in 0.47
+  (`Object::Real` stored as `f32`; the object-stream index written as `u16`),
+  so the real-literal restoration pass and the 65,535-objects-per-stream cap
+  stay. Two tests pinned old lopdf behavior and were updated: a canary for
+  lopdf's `d0`/`d1` tokenizing (now correct upstream), and a forms fixture
+  whose appearance stream is now built from integers so it stays in compact
+  form under lopdf's new whole-number real printing.
+
 ## [0.4.4] - 2026-09-08
 
 ### Changed

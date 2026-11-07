@@ -66,15 +66,19 @@ fn appearance_with(
     h: f64,
     label: &str,
 ) -> ObjectId {
+    // Integer operands: lopdf >= 0.47 writes a whole-number `Real` as `9.0`,
+    // which the default minify pass would then shorten — and this fixture's
+    // appearance must already be in the compact form a real producer writes,
+    // so the byte-identity checks below test flattening, not minification.
     let ops = vec![
         Operation::new("q", vec![]),
-        Operation::new("g", vec![Object::Real(0.0)]),
+        Operation::new("g", vec![Object::Integer(0)]),
         Operation::new("BT", vec![]),
         Operation::new(
             "Tf",
-            vec![Object::Name(b"Helv".to_vec()), Object::Real(9.0)],
+            vec![Object::Name(b"Helv".to_vec()), Object::Integer(9)],
         ),
-        Operation::new("Td", vec![Object::Real(1.0), Object::Real(2.0)]),
+        Operation::new("Td", vec![Object::Integer(1), Object::Integer(2)]),
         Operation::new(
             "Tj",
             vec![Object::String(

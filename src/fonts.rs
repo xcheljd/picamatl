@@ -1997,15 +1997,17 @@ fn plan_type1_group(
     })
 }
 
-/// Strict content decode, with the one tolerance `lopdf`'s parser needs.
+/// Strict content decode, with one Type3 tolerance.
 ///
-/// `lopdf` does not know `d0`/`d1` — the two glyph-metric operators that, per
-/// PDF 32000-1 §9.6.5, open a Type3 `/CharProcs` stream. It tokenizes `d1` as
-/// the operator `d` plus a stray number `1`, which then binds as the *first
-/// operand of the next operator*; a char proc that ends right after `d1`
-/// fails outright. Either way the walk used to abort, and one abort discards
-/// every font plan in the document (measured on a LaTeX paper: 713 KB of font
-/// programs left untouched because of one 22-byte char proc).
+/// `lopdf` before 0.47 did not know `d0`/`d1` — the two glyph-metric
+/// operators that, per PDF 32000-1 §9.6.5, open a Type3 `/CharProcs` stream.
+/// It tokenized `d1` as the operator `d` plus a stray number `1`, which then
+/// bound as the *first operand of the next operator*; a char proc that ended
+/// right after `d1` failed outright. Either way the walk used to abort, and
+/// one abort discards every font plan in the document (measured on a LaTeX
+/// paper: 713 KB of font programs left untouched because of one 22-byte char
+/// proc). lopdf 0.47 parses both operators (J-F-Liu/lopdf#601); the prefix
+/// split is kept so the walker's result never depends on that.
 ///
 /// So the metrics prefix is split off before parsing, not after a failure:
 /// a stream that "parses" with the stray number attached is misparsed, and
@@ -2921,21 +2923,21 @@ mod tests {
 
     #[test]
     fn type3_char_procs_parse_instead_of_aborting_the_walk() {
-        // lopdf rejects `d1` outright, so the tolerance is what makes this
-        // stream readable at all; the remaining operators must survive.
+        // The remaining operators of a char proc must survive the metrics
+        // prefix, whichever way lopdf tokenizes it.
         let charproc = b"0.277832 0 0 0 0 0 d1\nBT /F1 12 Tf (Hi) Tj ET".to_vec();
-        // lopdf reads `d1` as operator `d` plus a stray `1` that binds to the
-        // next operator -- a misparse, not a parse.
+        // Upstream canary: lopdf < 0.47 read `d1` as operator `d` plus a stray
+        // `1` bound to the next operator; 0.47 (J-F-Liu/lopdf#601) parses it.
         let lopdf_ops: Vec<(String, usize)> = Content::decode_strict(&charproc)
-            .expect("lopdf accepts it, wrongly")
+            .expect("lopdf parses d1")
             .operations
             .iter()
             .map(|o| (o.operator.clone(), o.operands.len()))
             .collect();
-        assert_eq!(lopdf_ops[0], ("d".to_string(), 6));
-        assert_eq!(lopdf_ops[1], ("BT".to_string(), 1), "stray operand shifted");
-        // A char proc that ends at `d1` does not parse at all.
-        assert!(Content::decode_strict(b"0.277832 0 0 0 0 0 d1\n").is_err());
+        assert_eq!(lopdf_ops[0], ("d1".to_string(), 6));
+        assert_eq!(lopdf_ops[1], ("BT".to_string(), 0), "no stray operand");
+        // A char proc that ends at `d1` now parses too.
+        assert!(Content::decode_strict(b"0.277832 0 0 0 0 0 d1\n").is_ok());
 
         let parsed = decode_content_strict(&charproc).expect("d1 prefix split off");
         let ops: Vec<&str> = parsed
