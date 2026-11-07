@@ -852,7 +852,15 @@ fn collect_placements(doc: &Document) -> HashMap<ObjectId, (f32, f32)> {
 
     for (_, page_id) in doc.get_pages() {
         let resources = page_resources(doc, page_id);
-        let content_bytes = doc.get_page_content(page_id);
+        // Bounded inflate: a page whose /Contents is a small zlib stream that
+        // expands without limit must not be able to exhaust memory here (an
+        // OOM abort is the one failure `catch_unwind` cannot turn into a
+        // pass-through). A page over the budget contributes no placements,
+        // which is the safe direction — its images are simply left alone.
+        let Ok(content_bytes) = doc.get_page_content_with_limit(page_id, MAX_REDEFLATE_BYTES)
+        else {
+            continue;
+        };
         let mut path: Vec<ObjectId> = Vec::new();
         walk_placements(
             doc,
@@ -1515,7 +1523,7 @@ fn plan_replacement(
 
     let (out, dict_update) = match class {
         FilterClass::DctOnly => {
-            let out = plan_dct(stream, options, target_w, target_h)?;
+            let out = plan_dct_resize_verified(stream, options, target_w, target_h)?;
             (out, DictUpdate::Dct)
         }
         FilterClass::FlateOnly => {
@@ -1630,34 +1638,6 @@ fn jpeg_route(data: &[u8]) -> JpegRoute {
         Some(1) | Some(3) | None => JpegRoute::GrayOrRgb,
         Some(_) => JpegRoute::Decline,
     }
-}
-
-/// The JPEG re-encode path: decode (scaled when possible), resize, re-encode
-/// via mozjpeg. Channel count is preserved to match the unchanged /ColorSpace.
-fn plan_dct(
-    stream: &lopdf::Stream,
-    options: OptimizeOptions,
-    target_w: u32,
-    target_h: u32,
-) -> Option<Vec<u8>> {
-    let quality = options.jpeg_quality.clamp(1, 100);
-
-    match jpeg_route(&stream.content) {
-        // CMYK/YCCK downsample in native four-component space and come back
-        // out as YCCK. This MUST be routed before the code below: the general
-        // `image` fallback converts CMYK to RGB, and a 3-component payload
-        // under an unchanged 4-component /ColorSpace is a corrupt page.
-        JpegRoute::Cmyk => return plan_dct_cmyk(stream, quality, target_w, target_h, false),
-        JpegRoute::Decline => return None,
-        JpegRoute::GrayOrRgb => {}
-    }
-
-    let (decoded, is_gray) = decode_jpeg(&stream.content, target_w, target_h)?;
-    let resized = decoded.resize_exact(target_w, target_h, image::imageops::FilterType::Lanczos3);
-
-    // Preserve the original component count so the PDF /ColorSpace (which we
-    // leave unchanged) still matches: gray -> 1 channel, else RGB -> 3.
-    encode_jpeg(resized, is_gray, quality)
 }
 
 /// Mean-absolute-difference ceiling for the D-M1 decode-back verification.
@@ -3024,8 +3004,17 @@ fn dedup_objects(doc: &mut Document) -> bool {
 /// [`dedup_objects`]' conservative stance: differing key order or differing
 /// spelling of an equivalent value simply declines the merge.
 fn dedup_decoded_streams(doc: &mut Document) -> bool {
-    // (decoded payload, dict minus /Length) -> object ids carrying it.
-    let mut buckets: HashMap<(Vec<u8>, String), Vec<ObjectId>> = HashMap::new();
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    // (decoded length, decoded hash, dict minus /Length) -> object ids.
+    // The decoded bytes themselves are NOT kept: the per-stream inflate cap
+    // is 128 MiB, so holding every payload at once would let a document of
+    // many small bomb streams allocate N x 128 MiB before any bucket is
+    // examined (an OOM abort escapes `catch_unwind`). Candidates in a bucket
+    // of two or more are re-inflated and compared byte-for-byte below, the
+    // same verify-before-merge shape `dedup_streams` uses.
+    let mut buckets: HashMap<(usize, u64, String), Vec<ObjectId>> = HashMap::new();
     for (&id, obj) in doc.objects.iter() {
         if let Object::Stream(s) = obj {
             // DecodeParms imply a non-trivial decode (PNG/tiff predictors)
@@ -3044,15 +3033,19 @@ fn dedup_decoded_streams(doc: &mut Document) -> bool {
             if let Some(decoded) = inflate_capped(&s.content, MAX_REDEFLATE_BYTES) {
                 let mut dict = s.dict.clone();
                 dict.remove(b"Length");
+                let mut hasher = DefaultHasher::new();
+                decoded.hash(&mut hasher);
                 buckets
-                    .entry((decoded, format!("{dict:?}")))
+                    .entry((decoded.len(), hasher.finish(), format!("{dict:?}")))
                     .or_default()
                     .push(id);
             }
         }
     }
 
-    // Lowest object id wins as canonical; everything else redirects to it.
+    // Lowest object id wins as canonical; everything else redirects to it —
+    // after its decoded bytes are confirmed equal (a hash is a hint, not a
+    // proof). One inflate of the canonical per bucket, one per candidate.
     let mut remap: HashMap<ObjectId, ObjectId> = HashMap::new();
     for ids in buckets.values() {
         if ids.len() < 2 {
@@ -3061,8 +3054,21 @@ fn dedup_decoded_streams(doc: &mut Document) -> bool {
         let mut ids = ids.clone();
         ids.sort_unstable();
         let canonical = ids[0];
+        let Some(Object::Stream(canon)) = doc.objects.get(&canonical) else {
+            continue;
+        };
+        let Some(canon_decoded) = inflate_capped(&canon.content, MAX_REDEFLATE_BYTES) else {
+            continue;
+        };
         for dup in &ids[1..] {
-            remap.insert(*dup, canonical);
+            let Some(Object::Stream(other)) = doc.objects.get(dup) else {
+                continue;
+            };
+            let same = inflate_capped(&other.content, MAX_REDEFLATE_BYTES)
+                .is_some_and(|decoded| decoded == canon_decoded);
+            if same {
+                remap.insert(*dup, canonical);
+            }
         }
     }
     if remap.is_empty() {
@@ -5898,7 +5904,7 @@ mod tests {
 
     #[test]
     fn figure_dpi_returns_the_original_bytes_on_a_corrupt_over_resolution_jpeg() {
-        // The classifier decodes the same bytes `plan_dct` was already going to
+        // The classifier decodes the same bytes the JPEG planner was already going to
         // decode, so it adds no new exposure — but pin the end-to-end contract
         // anyway: with the flag on, a corrupt over-resolution DCT stream still
         // yields the exact input bytes.
@@ -8895,6 +8901,64 @@ mod tests {
             let out = optimize_with_options(&pdf, OptimizeOptions::default());
             assert_eq!(out, pdf, "{label} bomb must leave the file untouched");
         }
+    }
+
+    /// A page whose content is split across two streams: the real drawing
+    /// (an over-resolution image placement) and a small Flate stream that
+    /// inflates past the 128 MiB budget. The placement walk must not inflate
+    /// the page without a bound — it skips the page instead, so the image it
+    /// draws is never sized off that page and is left alone (the safe
+    /// direction), and the run still returns a valid document.
+    #[test]
+    fn a_page_content_bomb_is_bounded_and_its_images_are_left_alone() {
+        use std::io::Write;
+        let mut doc = Document::load_mem(&build_pdf(400, 100)).unwrap();
+        let page_id = *doc.get_pages().get(&1).unwrap();
+        let mut z = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::best());
+        let chunk = vec![b' '; 1 << 20];
+        for _ in 0..(MAX_REDEFLATE_BYTES / chunk.len() + 1) {
+            z.write_all(&chunk).unwrap();
+        }
+        let bomb = z.finish().unwrap();
+        assert!(bomb.len() < 1 << 20, "the bomb must be small on disk");
+        let bomb_id = doc.add_object(
+            Stream::new(dictionary! { "Filter" => "FlateDecode" }, bomb).with_compression(false),
+        );
+        let page = doc.get_object_mut(page_id).unwrap().as_dict_mut().unwrap();
+        let first = page.get(b"Contents").unwrap().clone();
+        page.set("Contents", vec![first, Object::Reference(bomb_id)]);
+        let mut pdf = Vec::new();
+        doc.save_to(&mut pdf).unwrap();
+
+        // Control: without the bomb this exact image IS downsampled, so an
+        // untouched image below is the bound at work, not an inert fixture.
+        let control = build_pdf(400, 100);
+        let control_out = optimize_with_options(&control, OptimizeOptions::default());
+        assert!(control_out.len() < control.len(), "control must downsample");
+
+        let out = optimize_with_options(&pdf, OptimizeOptions::default());
+        let image_dims = |bytes: &[u8]| -> Vec<(i64, i64)> {
+            let d = Document::load_mem(bytes).unwrap();
+            d.objects
+                .values()
+                .filter_map(|o| match o {
+                    Object::Stream(s)
+                        if matches!(s.dict.get(b"Subtype"), Ok(Object::Name(n)) if n == b"Image") =>
+                    {
+                        Some((
+                            s.dict.get(b"Width").unwrap().as_i64().unwrap(),
+                            s.dict.get(b"Height").unwrap().as_i64().unwrap(),
+                        ))
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(
+            image_dims(&out),
+            vec![(400, 400)],
+            "the bombed page's image must keep its size"
+        );
     }
 
     /// A bare JPEG2000 codestream (SOC/SIZ/COD/QCD/SOT/SOD/EOC) declaring

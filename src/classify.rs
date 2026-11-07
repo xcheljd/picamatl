@@ -506,7 +506,7 @@ pub(crate) mod tests {
         // instead: mozjpeg PANICS on a malformed stream rather than returning
         // an error, so `decode_jpeg` is only safe to exercise from inside the
         // `optimize_with_options` `catch_unwind` boundary — which is equally
-        // true of the `plan_dct` call this classifier sits next to.)
+        // true of the `plan_dct_resize_verified` call this classifier sits next to.)
         //
         // Lying geometry: the dict claims a size the payload cannot fill.
         assert!(!image_is_figure_like(

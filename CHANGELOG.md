@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Unmasked JPEG downsampling now verifies its output by decoding it back**,
+  like every other re-encode path (ARCHITECTURE.md invariant 5). The
+  unverified copy of the routine is removed; the masked path's verified one
+  now serves both.
+- **Bounded page-content inflate in the image-placement walk.** A page
+  whose content stream inflated past the 128 MiB budget was decompressed
+  without limit; it is now skipped (its images are left untouched), so a
+  small crafted file can no longer exhaust memory there.
+- **The decoded-payload dedup no longer holds every decoded stream in
+  memory at once.** It buckets by length + hash and re-inflates only
+  candidate duplicates for a byte-for-byte comparison before merging.
+- **`--force` writes atomically**: the output goes to a sibling temporary
+  file that is synced and renamed over the input, so a crash, full disk or
+  kill mid-write can no longer leave the input truncated.
+- **Signature detection** now reports a merged field/widget signature
+  dictionary stored directly (not by reference) in `/Fields` or `/Kids`.
+- `--help` no longer claims the CLI expands quoted glob patterns; it never
+  did (shell globs still work as usual).
 - **A second pass could shrink a file further** when a document embedded
   the same simple TrueType font program more than once (one copy per page
   or section, as some producers write). The stream dedup merged the copies

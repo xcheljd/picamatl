@@ -512,3 +512,50 @@ fn multiple_inputs_with_single_file_output_flags_are_rejected() {
 
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+#[test]
+fn force_replaces_the_input_in_place_and_leaves_no_temp_file() {
+    let dir = std::env::temp_dir().join("picamatl-cli-force-atomic");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let input = dir.join("doc.pdf");
+    let original = std::fs::read("fixtures/sample.pdf").unwrap();
+    std::fs::write(&input, &original).unwrap();
+
+    let result = picamatl()
+        .arg(&input)
+        .arg("--force")
+        .output()
+        .expect("run picamatl");
+    assert!(
+        result.status.success(),
+        "--force run failed: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let written = std::fs::read(&input).unwrap();
+    assert!(
+        written.len() < original.len(),
+        "--force must write the smaller output over the input"
+    );
+    Document::load_mem(&written).expect("the replaced file must be a valid PDF");
+    let leftovers: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n != "doc.pdf")
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "no temp file may be left behind: {leftovers:?}"
+    );
+}
+
+#[test]
+fn help_does_not_promise_pattern_expansion() {
+    let result = picamatl().arg("--help").output().expect("run picamatl");
+    let help = String::from_utf8_lossy(&result.stdout);
+    assert!(
+        !help.contains("glob pattern"),
+        "the CLI does not expand patterns itself, so --help must not offer them"
+    );
+}

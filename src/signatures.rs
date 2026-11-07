@@ -274,14 +274,16 @@ fn walk_sig_field<'a>(
         }
     }
 
-    // A merged field/widget node that IS the signature dictionary.
+    // A merged field/widget node that IS the signature dictionary. A node
+    // stored directly in its parent's /Fields or /Kids array has no object
+    // number to name (`object: None`), but it is a signature all the same —
+    // the module's contract is that any dict carrying /ByteRange counts, and
+    // the final dedup deliberately keeps distinct `None` entries apart.
     if dict.has(b"ByteRange") {
-        if let Some(id) = node_id {
-            found.push(SignatureInfo {
-                object: Some(id),
-                kind: SignatureKind::Dictionary,
-            });
-        }
+        found.push(SignatureInfo {
+            object: node_id,
+            kind: SignatureKind::Dictionary,
+        });
     }
 
     if let Ok(kids) = dict.get(b"Kids").map(|k| resolve(doc, k)) {
@@ -593,6 +595,20 @@ mod tests {
         );
         let sigs = detect_signatures(&roundtrip(&mut doc));
         assert_eq!(objects(&sigs), vec![Some(merged_id)], "got {sigs:?}");
+        assert_eq!(sigs[0].kind, SignatureKind::Dictionary);
+    }
+
+    #[test]
+    fn detect_signatures_finds_a_direct_merged_field_widget_signature_dict() {
+        // The merged field/widget signature dictionary stored DIRECTLY in the
+        // /Fields array (no object of its own). It carries /ByteRange, so it
+        // is a signature; it simply has no object number to report.
+        let mut merged = sig_dict();
+        merged.set("FT", Object::Name(b"Sig".to_vec()));
+        merged.set("Subtype", Object::Name(b"Widget".to_vec()));
+        let mut doc = doc_with_fields(Object::Array(vec![Object::Dictionary(merged)]));
+        let sigs = detect_signatures(&roundtrip(&mut doc));
+        assert_eq!(objects(&sigs), vec![None], "got {sigs:?}");
         assert_eq!(sigs[0].kind, SignatureKind::Dictionary);
     }
 

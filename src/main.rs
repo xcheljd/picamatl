@@ -70,8 +70,9 @@ fn defaults_blurb() -> String {
     after_help = defaults_blurb(),
 )]
 struct Cli {
-    /// Input PDF file(s): one path, a glob pattern (quoted, e.g.
-    /// "reports/*.pdf"), or a directory (all *.pdf inside, non-recursive)
+    /// Input PDF: one file, or a directory (every *.pdf directly inside it,
+    /// non-recursive). Shell globs work unquoted the usual way; this tool does
+    /// not expand patterns itself.
     #[arg(value_name = "INPUT")]
     input: PathBuf,
 
@@ -348,6 +349,32 @@ fn options_from(cli: &Cli) -> OptimizeOptions {
         )
 }
 
+/// Write `bytes` to `path` through a sibling temporary file that is renamed
+/// over the target once fully written and synced. With `--force` the target
+/// IS the input: a plain truncate-then-write would leave the user's only
+/// copy empty after a crash, a full disk or a kill mid-write, so the input
+/// stays intact until the complete output exists next to it. `rename` is
+/// atomic on the same filesystem, which a sibling path guarantees.
+fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let file_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let tmp = path.with_file_name(format!(".{file_name}.picamatl-tmp"));
+    let result = (|| {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+        drop(f);
+        std::fs::rename(&tmp, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
 /// Expand the input argument into the list of PDFs to process. A directory
 /// yields its non-recursive *.pdf entries (sorted); a literal path is used
 /// as-is even if it does not exist yet (the read error will name it).
@@ -464,7 +491,7 @@ fn optimize_one(input: &std::path::Path, cli: &Cli) -> Result<(), String> {
         eprintln!("{}", signature_warning(&report.signatures));
     }
 
-    std::fs::write(&output_path, &optimized)
+    write_atomically(&output_path, &optimized)
         .map_err(|e| format!("cannot write {shown_out}: {e}"))?;
 
     let (in_len, out_len) = (bytes.len(), optimized.len());
