@@ -1,6 +1,6 @@
 # Picamatl roadmap
 
-Feature roadmap. Last revised: 2026-09-07.
+Feature roadmap. Last revised: 2026-11-06.
 
 ## Guiding principles
 
@@ -28,10 +28,6 @@ Feature roadmap. Last revised: 2026-09-07.
   alongside `OptimizeReport` / `SignatureInfo` / `SignatureKind`. The library
   still performs no I/O — the binary owns the warning text.
 - crates.io publication + cargo-dist release pipeline (5 platforms).
-
-## In progress
-
-- Homebrew tap pointing at release artifacts.
 
 ## Next
 
