@@ -53,7 +53,9 @@ that backs that claim:
 
 ## Fuzzing
 
-Structural fuzzing targets are on the roadmap (see `docs/ROADMAP.md`); the
-current evidence is regression tests for crafted, truncated, and degenerate
-inputs. Reports from fuzzers you run yourself are welcome and will be
-credited.
+cargo-fuzz targets live in `fuzz/` (see `fuzz/README.md`): the whole
+pipeline under default and all-options settings, plus focused targets for the
+JPEG, Type1, CFF, TrueType, Flate/PNG-predictor and content-stream parsers.
+They are run locally, not in CI. The rest of the evidence is regression tests
+for crafted, truncated, and degenerate inputs. Reports from fuzzers you run
+yourself are welcome and will be credited.

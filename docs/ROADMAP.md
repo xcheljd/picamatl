@@ -28,13 +28,14 @@ Feature roadmap. Last revised: 2026-11-06.
   alongside `OptimizeReport` / `SignatureInfo` / `SignatureKind`. The library
   still performs no I/O — the binary owns the warning text.
 - crates.io publication + cargo-dist release pipeline (5 platforms).
+- cargo-fuzz harness (`fuzz/`): whole-pipeline and parser-level targets, run
+  locally.
 
 ## Next
 
 - **Presets**: `--preset web/print/archive` mapping to curated flag sets.
 - **Interactive mode**: bare `picamatl` in a PDF-heavy directory suggests a
   batch run with a summary before doing anything.
-- **Fuzzing**: cargo-fuzz targets on the parse/re-encode paths.
 - **Library guide**: "using picamatl in a Rust service" — error handling,
   memory profile, threading posture, untrusted-input semantics.
 - **Corpus growth**: broader third-party document classes in the benchmark

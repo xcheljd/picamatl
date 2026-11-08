@@ -72,6 +72,66 @@ mod signatures;
 mod truetype;
 mod type1;
 
+/// Thin wrappers over internals, for the fuzz harness only.
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub mod fuzz_api {
+    pub fn jpeghuff(d: &[u8]) -> Option<Vec<u8>> {
+        crate::jpeghuff::optimize(d)
+    }
+    pub fn type1(d: &[u8], keep_all: bool) -> Option<Vec<u8>> {
+        let f = crate::type1::parse(d)?;
+        let mut keep = std::collections::BTreeSet::new();
+        if keep_all {
+            for c in 0..=255u8 {
+                if let Some(n) = f.builtin_name(c) {
+                    keep.insert(n.to_vec());
+                }
+            }
+        }
+        crate::type1::convert_to_cff(&f, &keep)
+    }
+    pub fn inflate(d: &[u8], limit: usize) -> Option<Vec<u8>> {
+        crate::deflate::inflate_capped(d, limit)
+    }
+    pub fn png_defilter(d: &[u8], bpp: usize, bpr: usize) -> Option<Vec<u8>> {
+        crate::deflate::png_defilter(d, bpp, bpr)
+    }
+    pub fn number_tokens(d: &[u8]) -> Option<Vec<std::ops::Range<usize>>> {
+        crate::content_number_tokens(d)
+    }
+    pub fn replan(d: &[u8]) -> Option<(Vec<u8>, bool)> {
+        crate::replan_content(d, d.len(), d.len(), true, crate::DeflateBackend::Zlib)
+    }
+    pub fn cffhint(d: &[u8], drop: bool) -> Option<Vec<u8>> {
+        crate::cffhint::strip_hints(d, drop)
+    }
+    /// Every TrueType entry point that reads untrusted sfnt bytes.
+    pub fn truetype(d: &[u8]) {
+        let _ = crate::truetype::find_table(d, b"glyf");
+        let _ = crate::truetype::mask_subset_tags(d);
+        let _ = crate::truetype::strip_hinting(d);
+        if let Some(cmap) = crate::truetype::parse_cmap(d) {
+            let _ = crate::truetype::insert_cmap(d, &cmap);
+        }
+    }
+    /// A whole CFF font: hint stripping both ways, then a self-merge (the
+    /// merge parses both fragments fully and checks glyph conflicts).
+    pub fn cff_font(d: &[u8]) {
+        let _ = crate::cffhint::strip_hints(d, false);
+        let _ = crate::cffhint::strip_hints(d, true);
+        let _ = crate::cffmerge::has_empty_builtin_encoding(d);
+        let _ = crate::cffmerge::merge_type1c(&[d, d], false);
+    }
+    pub fn cffmerge(d: &[u8]) -> Option<Vec<u8>> {
+        let mid = d.len() / 2;
+        crate::cffmerge::merge_type1c(
+            &[&d[..mid], &d[mid..]],
+            d.first().is_some_and(|b| b & 1 == 1),
+        )
+    }
+}
+
 use std::collections::HashMap;
 
 use image::{DynamicImage, ImageFormat};

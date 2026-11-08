@@ -1,0 +1,94 @@
+[package]
+name = "picamatl-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Standalone: not a member of picamatl's (absent) workspace, so `cargo test`
+# and `cargo package` at the repo root never build it.
+[workspace]
+members = ["."]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.picamatl]
+path = ".."
+features = ["fuzzing"]
+
+[dependencies.lopdf]
+version = "0.47"
+default-features = false
+
+[[bin]]
+name = "optimize"
+path = "fuzz_targets/optimize.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "jpeghuff"
+path = "fuzz_targets/jpeghuff.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "type1"
+path = "fuzz_targets/type1.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "deflate"
+path = "fuzz_targets/deflate.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "content"
+path = "fuzz_targets/content.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cff"
+path = "fuzz_targets/cff.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "truetype"
+path = "fuzz_targets/truetype.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cff_font"
+path = "fuzz_targets/cff_font.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "optimize_all"
+path = "fuzz_targets/optimize_all.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "extract_seeds"
+path = "tools/extract_seeds.rs"
+test = false
+doc = false
+bench = false

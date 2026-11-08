@@ -24,6 +24,7 @@ rust-version = "1.88.0"
 # consumer or reviewer needs — src, tests, fixtures, README, CHANGELOG, the
 # architecture and design docs, licenses, NOTICE — still ships.
 exclude = [
+    "/fuzz",
     "/scripts",
     "/docs/hunts",
     "/corpus.sha256",
@@ -33,6 +34,11 @@ exclude = [
 
 [package.metadata.docs.rs]
 targets = ["x86_64-unknown-linux-gnu"]
+
+[features]
+# Exposes a few internal parsers to the cargo-fuzz harness in fuzz/. Not a
+# public API: nothing outside fuzz/ should enable it.
+fuzzing = []
 
 [dependencies]
 # default-features off keeps lopdf's chrono/jiff/time datetime backends (and its
