@@ -862,8 +862,13 @@ impl<'a> Interp<'a> {
                     if idx.fract() != 0.0 || idx < 0.0 {
                         return None;
                     }
-                    let subr = self.font.subrs.get(idx as usize)?.clone();
-                    if let Flow::End = self.exec(&subr, depth + 1)? {
+                    // Borrow the subr for the font's lifetime, not `self`'s:
+                    // cloning it per call cost O(subr length) per `callsubr`,
+                    // so a large subr that returns at once, called up to the
+                    // token budget, meant hundreds of GB of copying per glyph.
+                    let font = self.font;
+                    let subr = font.subrs.get(idx as usize)?;
+                    if let Flow::End = self.exec(subr, depth + 1)? {
                         return Some(Flow::End);
                     }
                 }
@@ -2034,6 +2039,30 @@ mod tests {
     }
 
     /// A charstring that never declares its width has no glyph to emit.
+    /// A 1 MiB subr whose first byte is `return`, called ~300k times from
+    /// one glyph (each call is three tokens: push, callsubr, return — well
+    /// inside the per-glyph budget). Each call must cost O(1), not a copy of
+    /// the subr: copying meant ~300 GB of memcpy for this one glyph.
+    #[test]
+    fn calling_a_large_subr_repeatedly_does_not_copy_it() {
+        let mut big = vec![11u8]; // return
+        big.resize(1 << 20, 0);
+        let mut cs = Cs::default().hsbw(0, 500);
+        for _ in 0..300_000 {
+            cs = cs.op(&[139, 10]); // push 0; callsubr
+        }
+        let glyph = cs.rmoveto(10, 10).rlineto(100, 0).endchar();
+        let mut f = font(&[("a", glyph)]);
+        f.subrs = vec![big];
+        let started = std::time::Instant::now();
+        let interpreted = interpret_glyph(&f, b"a", true);
+        assert!(
+            started.elapsed().as_secs() < 5,
+            "callsubr must not copy the subr"
+        );
+        assert!(interpreted.is_some(), "the glyph itself is well-formed");
+    }
+
     #[test]
     fn a_charstring_without_hsbw_declines() {
         let f = font(&[("a", Cs::default().rmoveto(10, 10).endchar())]);

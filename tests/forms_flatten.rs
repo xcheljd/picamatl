@@ -787,6 +787,41 @@ fn declines_a_value_with_no_appearance_to_burn() {
 }
 
 #[test]
+fn declines_an_orphan_widget_whose_value_lives_on_its_parent() {
+    // D9 for a malformed tree: a widget on the page that `/Fields` never
+    // reaches, with no appearance, inheriting a filled `/V` from a parent
+    // that is not in `/Fields` either. Dropping it would delete the value
+    // without a trace, so flattening must decline.
+    let mut doc = Document::load_mem(&flattenable()).unwrap();
+    let parent = doc.add_object(dictionary! {
+        "FT" => "Tx",
+        "T" => Object::String(b"hidden-parent".to_vec(), StringFormat::Literal),
+        "V" => Object::String(b"inherited value".to_vec(), StringFormat::Literal),
+    });
+    let widget = doc.add_object(dictionary! {
+        "Type" => "Annot",
+        "Subtype" => "Widget",
+        "Parent" => parent,
+        "Rect" => vec![300.into(), 500.into(), 400.into(), 514.into()],
+        "F" => 4,
+    });
+    let page_id = *doc.get_pages().get(&1).unwrap();
+    let page = doc.get_object_mut(page_id).unwrap().as_dict_mut().unwrap();
+    let mut annots = page.get(b"Annots").unwrap().as_array().unwrap().clone();
+    annots.push(Object::Reference(widget));
+    page.set("Annots", annots);
+    let mut input = Vec::new();
+    doc.save_to(&mut input).unwrap();
+
+    let flattened = optimize_with_options(&input, flatten());
+    let untouched = optimize_with_options(&input, plain());
+    assert_eq!(
+        flattened, untouched,
+        "an inherited orphan value must decline flattening"
+    );
+}
+
+#[test]
 fn declines_a_page_already_using_a_burn_name() {
     // The burns are bound with `set`; a page that already draws through
     // `/AmXf0` would have that drawing silently replaced by an appearance.

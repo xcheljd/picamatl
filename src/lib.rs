@@ -2365,6 +2365,11 @@ fn plan_gray_collapses(doc: &Document) -> Vec<GrayCollapse> {
                     .ok()?,
             )
             .ok()?;
+            // A zero-dimension image has no pixels to collapse (and an empty
+            // Flate stream would satisfy every length check below).
+            if px_w == 0 || px_h == 0 {
+                return None;
+            }
             let (img, channels) = decode_flate_image(doc, stream, px_w, px_h)?;
             if channels != 3 {
                 return None;
@@ -8925,6 +8930,76 @@ mod tests {
             let out = optimize_with_options(&pdf, OptimizeOptions::default());
             assert_eq!(out, pdf, "{label} bomb must leave the file untouched");
         }
+    }
+
+    /// `--collapse-gray-images` over a zero-width RGB image with an empty
+    /// Flate stream: every length check passes (zero bytes expected, zero
+    /// decoded), and the PNG Up filter was then asked for zero-byte rows —
+    /// `chunks_exact(0)` panics, and the fail-safe handed back the WHOLE
+    /// document unoptimized. The image must be skipped and the rest of the
+    /// document still optimized.
+    #[test]
+    fn a_zero_width_image_does_not_abort_gray_collapse() {
+        use std::io::Write;
+        let mut z = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::best());
+        z.write_all(b"").unwrap();
+        let empty = z.finish().unwrap();
+        let mut doc = Document::with_version("1.5");
+        let img = doc.add_object(
+            Stream::new(
+                dictionary! {
+                    "Type" => "XObject",
+                    "Subtype" => "Image",
+                    "Width" => 0,
+                    "Height" => 1,
+                    "ColorSpace" => "DeviceRGB",
+                    "BitsPerComponent" => 8,
+                    "Filter" => "FlateDecode",
+                },
+                empty,
+            )
+            .with_compression(false),
+        );
+        // Plenty of uncompressed, highly compressible page content: the rest
+        // of the pipeline has an easy win if it gets to run at all.
+        let mut ops = b"q 1 0 0 1 0 0 cm /Im0 Do Q\n".to_vec();
+        ops.extend(std::iter::repeat_n(b'%', 4000));
+        ops.push(b'\n');
+        let content = doc.add_object(Stream::new(dictionary! {}, ops).with_compression(false));
+        let pages_id = doc.new_object_id();
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "Contents" => content,
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Resources" => dictionary! { "XObject" => dictionary! { "Im0" => img } },
+        });
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => vec![page_id.into()],
+                "Count" => 1,
+            }),
+        );
+        let catalog = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+        doc.trailer.set("Root", catalog);
+        let mut pdf = Vec::new();
+        doc.save_to(&mut pdf).unwrap();
+
+        let control = optimize_with_options(&pdf, OptimizeOptions::default());
+        assert!(
+            control.len() < pdf.len(),
+            "fixture must be optimizable at all"
+        );
+        let out = optimize_with_options(
+            &pdf,
+            OptimizeOptions::default().with_collapse_gray_images(true),
+        );
+        assert!(
+            out.len() < pdf.len(),
+            "the zero-width image must not abort the whole run"
+        );
     }
 
     /// A chain of 11 forms (under `MAX_FORM_DEPTH`) whose resources name the

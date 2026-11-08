@@ -42,6 +42,13 @@
 //! adds an independent reference decoder that reconstructs full coefficient
 //! arrays and asserts they are unchanged across the rebuild.
 
+/// Upper bound on a frame's total 8x8 block count, summed over its
+/// components: 2^24 blocks is 128 MiB of progressive coefficient state, and
+/// still admits a ~700-megapixel 4:2:0 colour image. Larger frames are
+/// declined before any per-block state is allocated. (Streams are re-tabled
+/// in parallel, so this bounds the per-image share of a shared budget.)
+const MAX_FRAME_BLOCKS: usize = 1 << 24;
+
 /// One entropy-coded token.
 ///
 /// [`Token::Sym`] is a Huffman symbol plus the additional bits that follow it;
@@ -51,13 +58,6 @@
 /// bits directly into the entropy stream, outside any table. Raw bits are
 /// copied through untouched, so they contribute nothing to the symbol
 /// statistics and re-emit at exactly the same bit positions.
-/// Upper bound on a frame's total 8x8 block count, summed over its
-/// components: 2^24 blocks is 128 MiB of progressive coefficient state, and
-/// still admits a ~700-megapixel 4:2:0 colour image. Larger frames are
-/// declined before any per-block state is allocated. (Streams are re-tabled
-/// in parallel, so this bounds the per-image share of a shared budget.)
-const MAX_FRAME_BLOCKS: usize = 1 << 24;
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Token {
     Sym {

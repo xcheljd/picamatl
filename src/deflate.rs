@@ -104,7 +104,12 @@ pub(crate) fn png_up_filter(raw: &[u8], width: u32, channels: usize) -> Vec<u8> 
     use lopdf::filters::png;
 
     let bytes_per_row = width as usize * channels;
-    let rows = raw.len() / bytes_per_row.max(1);
+    if bytes_per_row == 0 {
+        // No pixel bytes per row: `chunks_exact(0)` would panic, and there is
+        // nothing to filter.
+        return Vec::new();
+    }
+    let rows = raw.len() / bytes_per_row;
     let mut out = Vec::with_capacity(raw.len() + rows);
     let mut previous = vec![0u8; bytes_per_row];
     for row in raw.chunks_exact(bytes_per_row) {

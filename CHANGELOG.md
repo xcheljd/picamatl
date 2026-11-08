@@ -33,6 +33,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **TrueType table parsing bounds the bytes it copies by the font's size**,
   so a table directory that names one range 65535 times no longer copies it
   65535 times.
+- **Type1 → CFF conversion no longer copies a subroutine on every call.**
+  `callsubr` cloned the whole subroutine each time, so a large subroutine
+  that returns immediately, called up to the per-glyph token budget, meant
+  hundreds of GB of copying for one glyph (`--convert-type1` only).
+- **`--collapse-gray-images` skips zero-width or zero-height images.** A
+  zero-width RGB image with an empty Flate stream passed every length check
+  and then made the PNG filter panic on zero-byte rows; the fail-safe
+  caught it, but returned the whole document unoptimized.
+- **Form flattening reads an orphan widget's inherited value.** A widget no
+  `/Fields` entry reaches was checked only for its own `/V`; a value
+  inherited from an equally unreachable `/Parent` (a malformed tree) was
+  dropped with the widget instead of declining.
 - **Hint stripping zeroes `maxSizeOfInstructions`**, not the adjacent
   `maxStackElements`, in `maxp`.
 - **Form flattening declines a page whose `/XObject` resources already use

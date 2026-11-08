@@ -156,13 +156,14 @@ pub(crate) fn plan_flatten(doc: &Document) -> Option<FlattenPlan> {
                 return None;
             }
 
-            // A widget the `/Fields` walk never reached is its own field: its
-            // value can only be read off the annotation itself.
-            if !scan.known_widgets.contains(&annot_id) {
-                let value = annot.get(b"V").ok().map(|v| resolve(doc, v));
-                if !value_is_empty(value) {
-                    orphan_valued.push(annot_id);
-                }
+            // A widget the `/Fields` walk never reached is its own field. Its
+            // value is its own `/V` or, since `/V` is inheritable (ISO
+            // 32000-1 12.7.3.1), one held by a `/Parent` the walk also never
+            // reached — a malformed tree, but the value is still data.
+            if !scan.known_widgets.contains(&annot_id)
+                && !value_is_empty(own_or_inherited_value(doc, annot))
+            {
+                orphan_valued.push(annot_id);
             }
 
             let appearance = match appearance_stream(doc, annot) {
@@ -844,6 +845,19 @@ fn resources_are_bindable(doc: &Document, page_id: ObjectId) -> bool {
         }
     }
     false
+}
+
+/// The `/V` a widget shows: its own, else the nearest one up its `/Parent`
+/// chain (bounded by [`MAX_DEPTH`]; a cycle just runs out the bound).
+fn own_or_inherited_value<'a>(doc: &'a Document, widget: &'a Dictionary) -> Option<&'a Object> {
+    let mut node = widget;
+    for _ in 0..MAX_DEPTH {
+        if let Ok(v) = node.get(b"V") {
+            return Some(resolve(doc, v));
+        }
+        node = resolve(doc, node.get(b"Parent").ok()?).as_dict().ok()?;
+    }
+    None
 }
 
 // -- content splicing -------------------------------------------------------

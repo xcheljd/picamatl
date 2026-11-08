@@ -627,9 +627,6 @@ mod tests {
         out
     }
 
-    /// Hint stripping zeroes `maxSizeOfInstructions` (maxp v1.0 offset 26)
-    /// and leaves `maxStackElements` (offset 24) alone. Built from the
-    /// fixture font plus an `fpgm` program, with both fields set non-zero.
     /// A directory whose records all point at the same range declares far
     /// more table bytes than the font holds; the parser must decline instead
     /// of copying the range once per record.
@@ -653,6 +650,9 @@ mod tests {
         assert!(parse_tables(&font).is_none());
     }
 
+    /// Hint stripping zeroes `maxSizeOfInstructions` (maxp v1.0 offset 26)
+    /// and leaves `maxStackElements` (offset 24) alone. Built from the
+    /// fixture font plus an `fpgm` program, with both fields set non-zero.
     #[test]
     fn hint_strip_zeroes_the_right_maxp_field() {
         let font = std::fs::read(concat!(
