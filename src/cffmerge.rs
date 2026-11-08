@@ -23,7 +23,7 @@
 //! re-expressed against the base's width parameters.
 
 use crate::type1::{cff_index, dict_int32, dict_number, dict_op, t2_number};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// A glyph name as the merge keys it: standard SIDs (< 391) name the same
 /// glyph in every CFF, custom SIDs go through the fragment's String INDEX.
@@ -562,15 +562,20 @@ pub(crate) fn merge_type1c(fragments: &[&[u8]], write_empty_encoding: bool) -> O
 
     // Strings: custom names in first-use order.
     let mut strings: Vec<Vec<u8>> = Vec::new();
+    // Position of each custom name in `strings`. A linear search per glyph
+    // is quadratic in the glyph count — 65535 names from an untrusted font
+    // would be ~2 billion comparisons.
+    let mut string_index: HashMap<&[u8], usize> = HashMap::new();
     let mut charset = vec![0u8]; // format 0
     for key in &order[1..] {
         let sid = match key {
             NameKey::Std(sid) => *sid,
             NameKey::Custom(name) => {
-                let pos = match strings.iter().position(|s| s == name) {
-                    Some(p) => p,
+                let pos = match string_index.get(name.as_slice()) {
+                    Some(&p) => p,
                     None => {
                         strings.push(name.clone());
+                        string_index.insert(name.as_slice(), strings.len() - 1);
                         strings.len() - 1
                     }
                 };

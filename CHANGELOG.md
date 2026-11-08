@@ -9,6 +9,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Font subsetting now tracks the text font through `q`/`Q`.** The font is
+  part of the graphics state, so text shown after a `Q` is drawn in the font
+  that was current at the matching `q`. The glyph walk credited it to the
+  last `Tf` instead, and subsetting could drop glyphs the restored font
+  really draws.
+- **Signature detection and form flattening walk each field node once.** A
+  field tree that reaches one node through many paths (`/Kids [A A]` at
+  every level) was walked once per path — 2^32 visits from 33 small objects —
+  and signature detection runs on every input. Flattening declines such a
+  tree.
+- **The glyph walk and the image-placement walk each have a total budget.**
+  Both re-walk a form per use (the glyph walk when the form inherits its
+  font, the placement walk because the drawn size depends on each draw), so
+  a short chain of forms each drawing the next one several times demanded
+  billions of walks; depth caps bound depth, not width. Past the budget the
+  glyph walk gives up and no font is touched; the placement walk discards
+  its map and every image is left alone.
+- **The JPEG Huffman pass declines frames whose header declares an absurd
+  size** before sizing any per-block state from it. A 30-byte progressive
+  header declaring 65535 × 65535 made it allocate about 2 GB; under a memory
+  limit that aborts the process, which the fail-safe cannot catch.
+- **TrueType table parsing bounds the bytes it copies by the font's size**,
+  so a table directory that names one range 65535 times no longer copies it
+  65535 times.
+- **Hint stripping zeroes `maxSizeOfInstructions`**, not the adjacent
+  `maxStackElements`, in `maxp`.
+- **Form flattening declines a page whose `/XObject` resources already use
+  the `AmXf` burn-name prefix**, instead of overwriting the entry.
+- Glyph-name interning in the Type1 → CFF converter and the Type1C merge is
+  hashed rather than a linear search per glyph (quadratic in the glyph count
+  of an untrusted font).
+- The line-art classifier's documented edge threshold (8%) matches the code;
+  its metrics function also declines a pixel buffer shorter than its stated
+  dimensions instead of indexing past it (callers already size buffers
+  exactly; defensive).
 - **Unmasked JPEG downsampling now verifies its output by decoding it back**,
   like every other re-encode path (ARCHITECTURE.md invariant 5). The
   unverified copy of the routine is removed; the masked path's verified one

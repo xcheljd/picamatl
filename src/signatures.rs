@@ -20,6 +20,8 @@
 //! covers rendered content, not offset-pinned digests; callers who must keep a
 //! signature intact should not optimize the file at all.
 
+use std::collections::HashSet;
+
 use lopdf::{Document, Object, ObjectId};
 
 use crate::resolve;
@@ -100,6 +102,11 @@ impl std::fmt::Display for SignatureInfo {
 /// detection must terminate on one regardless.
 const SIG_MAX_DEPTH: usize = 32;
 
+/// Field-tree states already walked by [`walk_sig_field`]: the node, plus the
+/// `/FT` and `/V` it inherited (the `/V` by address of the inherited object
+/// and the id of the node that owns it).
+type SeenFields = HashSet<(ObjectId, Option<Vec<u8>>, Option<(usize, Option<ObjectId>)>)>;
+
 /// Detect digital signatures that optimization would invalidate.
 ///
 /// Two reachability paths, both read-only:
@@ -146,8 +153,15 @@ pub(crate) fn detect_signatures(doc: &Document) -> Vec<SignatureInfo> {
             .map(|f| resolve(doc, f))
             .and_then(Object::as_array)
         {
+            // (node, inherited /FT, inherited /V) already walked. The field tree may
+            // reach one node through many paths (`/Kids [A A]` at every level is a
+            // 33-object DAG with 2^32 paths); each combination is walked once. The
+            // inherited state is part of the key because a node's own result depends
+            // on it — keying on the node alone could skip the path that carries the
+            // signature.
+            let mut seen: SeenFields = HashSet::new();
             for field in fields {
-                walk_sig_field(doc, field, None, None, 0, &mut found);
+                walk_sig_field(doc, field, None, None, 0, &mut seen, &mut found);
             }
         }
     }
@@ -224,6 +238,7 @@ fn walk_sig_field<'a>(
     inherited_ft: Option<&'a [u8]>,
     inherited_v: Option<(&'a Object, Option<ObjectId>)>,
     depth: usize,
+    seen: &mut SeenFields,
     found: &mut Vec<SignatureInfo>,
 ) {
     if depth > SIG_MAX_DEPTH {
@@ -233,6 +248,18 @@ fn walk_sig_field<'a>(
         Object::Reference(id) => Some(*id),
         _ => None,
     };
+    // Only indirect nodes can be shared; a direct dictionary has exactly one
+    // parent, so it needs no entry.
+    if let Some(id) = node_id {
+        let key = (
+            id,
+            inherited_ft.map(<[u8]>::to_vec),
+            inherited_v.map(|(v, owner)| (std::ptr::from_ref(v) as usize, owner)),
+        );
+        if !seen.insert(key) {
+            return;
+        }
+    }
     let Ok(dict) = resolve(doc, node).as_dict() else {
         // A field entry that is not a dictionary (junk in /Fields is common)
         // carries no signature and has no kids.
@@ -289,7 +316,7 @@ fn walk_sig_field<'a>(
     if let Ok(kids) = dict.get(b"Kids").map(|k| resolve(doc, k)) {
         if let Ok(kids) = kids.as_array() {
             for kid in kids {
-                walk_sig_field(doc, kid, ft, value, depth + 1, found);
+                walk_sig_field(doc, kid, ft, value, depth + 1, seen, found);
             }
         }
     }
@@ -610,6 +637,36 @@ mod tests {
         let sigs = detect_signatures(&roundtrip(&mut doc));
         assert_eq!(objects(&sigs), vec![None], "got {sigs:?}");
         assert_eq!(sigs[0].kind, SignatureKind::Dictionary);
+    }
+
+    /// A field tree that reaches the same node twice per level (`/Kids
+    /// [next next]`, 32 levels deep) is a DAG of 33 objects but 2^32 paths.
+    /// Detection runs on every input, so it must visit each node once, not
+    /// once per path — otherwise a few hundred bytes hang the optimizer.
+    #[test]
+    fn detect_signatures_visits_a_shared_kid_once() {
+        let pdf = build_pdf(400, 100);
+        let mut doc = Document::load_mem(&pdf).unwrap();
+        let leaf_id = doc.add_object(sig_dict());
+        let mut next = leaf_id;
+        for _ in 0..32 {
+            next = doc.add_object(dictionary! {
+                "Kids" => Object::Array(vec![Object::Reference(next), Object::Reference(next)]),
+            });
+        }
+        doc.catalog_mut().unwrap().set(
+            "AcroForm",
+            Object::Dictionary(dictionary! {
+                "Fields" => Object::Array(vec![Object::Reference(next)]),
+            }),
+        );
+        let started = std::time::Instant::now();
+        let sigs = detect_signatures(&roundtrip(&mut doc));
+        assert!(
+            started.elapsed().as_secs() < 5,
+            "shared kids must not be re-walked per path"
+        );
+        assert_eq!(objects(&sigs), vec![Some(leaf_id)], "got {sigs:?}");
     }
 
     #[test]

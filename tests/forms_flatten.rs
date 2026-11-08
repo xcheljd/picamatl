@@ -134,6 +134,9 @@ struct Fixture {
     /// Put `/Contents` behind an indirect reference to an *array* of streams,
     /// the shape the splice has to unwrap rather than nest.
     indirect_contents_array: bool,
+    /// Bind the page's own drawing under the resource name `AmXf0` — the name
+    /// the first burn would take.
+    page_uses_burn_name: bool,
 }
 
 /// A one-page filled AcroForm: a text field with a value and an appearance, a
@@ -306,12 +309,17 @@ fn build(fixture: &Fixture) -> Vec<u8> {
     } else {
         Object::Reference(content_id)
     };
+    let mut resources = dictionary! { "Font" => dictionary! { "Helv" => font_id } };
+    if fixture.page_uses_burn_name {
+        let own_art = appearance(&mut doc, font_id, 40.0, 12.0, "art");
+        resources.set("XObject", dictionary! { "AmXf0" => own_art });
+    }
     let page_id = doc.add_object(dictionary! {
         "Type" => "Page",
         "Parent" => pages_id,
         "Contents" => contents,
         "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
-        "Resources" => dictionary! { "Font" => dictionary! { "Helv" => font_id } },
+        "Resources" => resources,
         "Annots" => annots,
     });
 
@@ -775,6 +783,19 @@ fn declines_a_value_with_no_appearance_to_burn() {
             ..Fixture::default()
         },
         "filled field with no /AP",
+    );
+}
+
+#[test]
+fn declines_a_page_already_using_a_burn_name() {
+    // The burns are bound with `set`; a page that already draws through
+    // `/AmXf0` would have that drawing silently replaced by an appearance.
+    assert_declines(
+        &Fixture {
+            page_uses_burn_name: true,
+            ..Fixture::default()
+        },
+        "page /XObject already binds AmXf0",
     );
 }
 
@@ -1329,4 +1350,48 @@ fn flatten_render_moves_no_subpixel_on_irs_w2() {
     let out = optimize_with_options(&input, flatten_only());
     assert_ne!(out, input, "the fixture must actually exercise flattening");
     assert_flatten_moves_no_subpixel(&tool, "irs-w2", &input, &out);
+}
+
+/// A field tree that reaches one node twice per level (`/Kids [next next]`,
+/// 32 levels) is 33 objects but 2^32 paths. Flattening must decline it, and
+/// promptly — not walk it once per path.
+#[test]
+fn a_field_tree_that_shares_kids_declines_promptly() {
+    let mut doc = Document::load_mem(&flattenable()).unwrap();
+    let mut next = doc.add_object(dictionary! {
+        "FT" => "Tx",
+        "T" => Object::String(b"leaf".to_vec(), lopdf::StringFormat::Literal),
+    });
+    for _ in 0..32 {
+        next = doc.add_object(dictionary! {
+            "Kids" => vec![Object::Reference(next), Object::Reference(next)],
+        });
+    }
+    let acroform = doc.catalog().unwrap().get(b"AcroForm").unwrap().clone();
+    let acroform_id = acroform.as_reference().ok();
+    let fields = match acroform_id {
+        Some(id) => doc.get_object_mut(id).unwrap().as_dict_mut().unwrap(),
+        None => doc
+            .catalog_mut()
+            .unwrap()
+            .get_mut(b"AcroForm")
+            .unwrap()
+            .as_dict_mut()
+            .unwrap(),
+    };
+    fields.set("Fields", vec![Object::Reference(next)]);
+    let mut input = Vec::new();
+    doc.save_to(&mut input).unwrap();
+
+    let started = std::time::Instant::now();
+    let out = optimize_with_options(&input, flatten());
+    assert!(
+        started.elapsed().as_secs() < 10,
+        "a shared-kid field tree must not be walked per path"
+    );
+    let flattened = View::of(&out).page_xobjects();
+    assert!(
+        flattened.is_empty(),
+        "a malformed field tree must decline flattening: {flattened:?}"
+    );
 }

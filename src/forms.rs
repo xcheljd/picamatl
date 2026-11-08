@@ -27,6 +27,10 @@ use crate::{fonts, resolve};
 
 /// Depth bound for the field-tree walk and the `/Parent` climb.
 const MAX_DEPTH: usize = 32;
+/// Resource-name prefix of the burned appearances (`AmXf0`, `AmXf1`, ...).
+/// Unique across the document; a page whose `/XObject` dictionary already
+/// uses the prefix is declined rather than overwritten.
+const BURN_NAME_PREFIX: &[u8] = b"AmXf";
 
 /// Geometric degeneracy threshold for `/BBox` and `/Rect` extents, in points.
 /// Not a tolerance for "small": a box thinner than this maps through a
@@ -199,7 +203,11 @@ pub(crate) fn plan_flatten(doc: &Document) -> Option<FlattenPlan> {
                 }
                 let matrix = burn_matrix(doc, annot, ap_id)?;
                 burns.push(Burn {
-                    name: format!("AmXf{next_name}").into_bytes(),
+                    name: {
+                        let mut name = BURN_NAME_PREFIX.to_vec();
+                        name.extend_from_slice(next_name.to_string().as_bytes());
+                        name
+                    },
                     ap_id,
                     matrix,
                 });
@@ -292,6 +300,11 @@ struct FieldScan {
     values_by_name: HashMap<Vec<u8>, Vec<Option<Object>>>,
     /// Any field anywhere carries a non-empty value (feeds D5).
     any_value: bool,
+    /// Indirect field nodes already walked. A well-formed field tree is a
+    /// tree; a node reached twice (`/Kids [A A]`, or two parents sharing a
+    /// kid) is malformed, and re-walking it per path is exponential — 32
+    /// levels of `[A A]` are 2^32 visits from 33 tiny objects.
+    visited: HashSet<ObjectId>,
 }
 
 /// Recursive `/Fields` walk with `/FT` and `/V` inheritance. Returns `None`
@@ -312,6 +325,13 @@ fn walk_field(
         Object::Reference(id) => Some(*id),
         _ => None,
     };
+    // A field node reached a second time means the field tree is not a tree:
+    // decline the document rather than guess which parent's /FT and /V apply.
+    if let Some(id) = node_id {
+        if !scan.visited.insert(id) {
+            return None;
+        }
+    }
     let Ok(dict) = resolve(doc, node).as_dict() else {
         // A field entry that is not a dictionary tells us nothing about the
         // values under it.
@@ -798,11 +818,20 @@ fn resources_are_bindable(doc: &Document, page_id: ObjectId) -> bool {
                     },
                     _ => return false,
                 };
+                // Burn names are `AmXf<n>`, bound with `set`: an existing
+                // entry of that name would be overwritten, and whatever the
+                // page drew through it would silently become the appearance.
+                let free_of_burn_names = |xobjects: &Dictionary| {
+                    !xobjects
+                        .iter()
+                        .any(|(k, _)| k.starts_with(BURN_NAME_PREFIX))
+                };
                 return match resources.get(b"XObject") {
-                    Ok(Object::Dictionary(_)) => true,
-                    Ok(Object::Reference(id)) => {
-                        matches!(doc.get_object(*id), Ok(Object::Dictionary(_)))
-                    }
+                    Ok(Object::Dictionary(xobjects)) => free_of_burn_names(xobjects),
+                    Ok(Object::Reference(id)) => match doc.get_object(*id) {
+                        Ok(Object::Dictionary(xobjects)) => free_of_burn_names(xobjects),
+                        _ => false,
+                    },
                     Ok(_) => false,
                     Err(_) => true,
                 };

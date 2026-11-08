@@ -354,12 +354,21 @@ type SfntTable = ([u8; 4], Vec<u8>);
 fn parse_tables(font: &[u8]) -> Option<(u32, Vec<SfntTable>)> {
     let sfnt_version = be32(font, 0)?;
     let count = usize::from(be16(font, 4)?);
-    let mut tables: Vec<SfntTable> = Vec::with_capacity(count + 1);
+    let mut tables: Vec<SfntTable> = Vec::with_capacity(count.min(64) + 1);
+    // Every table is copied out. A directory may name one byte range many
+    // times (65535 records over the same 20 MB would copy 1.3 TB), so the
+    // copies are bounded by the font's own size: a well-formed sfnt never
+    // declares more table bytes than it has.
+    let mut copied = 0usize;
     for i in 0..count {
         let rec = 12 + i * 16;
         let tag: [u8; 4] = font.get(rec..rec + 4)?.try_into().ok()?;
         let off = be32(font, rec + 8)? as usize;
         let len = be32(font, rec + 12)? as usize;
+        copied = copied.checked_add(len)?;
+        if copied > font.len() {
+            return None;
+        }
         tables.push((tag, font.get(off..off.checked_add(len)?)?.to_vec()));
     }
     Some((sfnt_version, tables))
@@ -501,7 +510,8 @@ pub(crate) fn strip_hinting(font: &[u8]) -> Option<Vec<u8>> {
     // instructions remain (version 1.0 layout only).
     let maxp = &mut tables[maxp_idx].1;
     if be32(maxp, 0)? == 0x0001_0000 && maxp.len() >= 32 {
-        maxp[24..26].fill(0); // maxSizeOfInstructions
+        // maxp v1.0: ... maxStackElements @24, maxSizeOfInstructions @26.
+        maxp[26..28].fill(0); // maxSizeOfInstructions
     }
     tables.retain(|(tag, _)| tag != b"fpgm" && tag != b"prep" && tag != b"cvt ");
     assemble_sfnt(sfnt_version, tables)
@@ -615,6 +625,65 @@ mod tests {
             out.resize(out.len().next_multiple_of(4), 0);
         }
         out
+    }
+
+    /// Hint stripping zeroes `maxSizeOfInstructions` (maxp v1.0 offset 26)
+    /// and leaves `maxStackElements` (offset 24) alone. Built from the
+    /// fixture font plus an `fpgm` program, with both fields set non-zero.
+    /// A directory whose records all point at the same range declares far
+    /// more table bytes than the font holds; the parser must decline instead
+    /// of copying the range once per record.
+    #[test]
+    fn a_directory_declaring_more_bytes_than_the_font_is_declined() {
+        let body = vec![0xAAu8; 4096];
+        let mut font = tiny_font(&body);
+        assert!(
+            parse_tables(&font).is_some(),
+            "the fixture itself must parse"
+        );
+        // Point BOTH records at the whole file (offset 0, length = file size).
+        // Each range is in bounds on its own, so a per-record check accepts
+        // them; together they declare twice the bytes the font holds.
+        let whole = (font.len() as u32).to_be_bytes();
+        for record in 0..2 {
+            let at = 12 + record * 16;
+            font[at + 8..at + 12].copy_from_slice(&0u32.to_be_bytes());
+            font[at + 12..at + 16].copy_from_slice(&whole);
+        }
+        assert!(parse_tables(&font).is_none());
+    }
+
+    #[test]
+    fn hint_strip_zeroes_the_right_maxp_field() {
+        let font = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/fixtures/fonts/NotoSans-Regular.ttf"
+        ))
+        .unwrap();
+        let (version, mut tables) = parse_tables(&font).unwrap();
+        let maxp = &mut tables.iter_mut().find(|(t, _)| t == b"maxp").unwrap().1;
+        maxp[24..26].copy_from_slice(&7u16.to_be_bytes()); // maxStackElements
+        maxp[26..28].copy_from_slice(&9u16.to_be_bytes()); // maxSizeOfInstructions
+        tables.push((*b"fpgm", vec![0xB0, 0x00, 0x2C, 0x2D])); // a tiny program
+        let hinted = assemble_sfnt(version, tables).unwrap();
+
+        let stripped = strip_hinting(&hinted).expect("the fpgm program must be stripped");
+        let (off, len) = find_table(&stripped, b"maxp").unwrap();
+        let maxp = &stripped[off..off + len];
+        assert_eq!(
+            be16(maxp, 26),
+            Some(0),
+            "maxSizeOfInstructions must be zeroed"
+        );
+        assert_eq!(
+            be16(maxp, 24),
+            Some(7),
+            "maxStackElements must be untouched"
+        );
+        assert!(
+            find_table(&stripped, b"fpgm").is_none(),
+            "fpgm must be gone"
+        );
     }
 
     #[test]

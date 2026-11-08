@@ -808,6 +808,14 @@ fn page_resources(doc: &Document, page_id: ObjectId) -> Option<&lopdf::Dictionar
 
 /// Depth bound for nested Form XObjects during placement collection.
 const MAX_FORM_DEPTH: usize = 12;
+/// Upper bound on content streams the placement walk visits per document.
+/// Forms are re-walked per `Do` (the placement depends on the CTM at each
+/// draw), so a chain of forms each drawing the next N times costs N^depth
+/// walks — a few hundred bytes can demand billions. Past the budget the walk
+/// stops and the document gets NO placements: every image is left alone,
+/// which is the safe direction (a partial map could under-state a placement
+/// and downsample an image below what some unseen draw needs).
+const MAX_PLACEMENT_WALKS: usize = 200_000;
 
 /// The `/XObject` sub-dictionary of a resource dictionary, resolved.
 fn xobject_map(
@@ -849,6 +857,7 @@ fn xobject_map(
 /// only ever make the visible area smaller than what we record.
 fn collect_placements(doc: &Document) -> HashMap<ObjectId, (f32, f32)> {
     let mut sizes: HashMap<ObjectId, (f32, f32)> = HashMap::new();
+    let mut steps = 0usize;
 
     for (_, page_id) in doc.get_pages() {
         let resources = page_resources(doc, page_id);
@@ -862,21 +871,26 @@ fn collect_placements(doc: &Document) -> HashMap<ObjectId, (f32, f32)> {
             continue;
         };
         let mut path: Vec<ObjectId> = Vec::new();
-        walk_placements(
+        if !walk_placements(
             doc,
             &content_bytes,
             resources,
             Mat::IDENTITY,
             &mut sizes,
             &mut path,
-        );
+            &mut steps,
+        ) {
+            return HashMap::new();
+        }
     }
 
     sizes
 }
 
 /// Walk one content stream's operators in its resource context, recording
-/// image placements and recursing into the Form XObjects it draws.
+/// image placements and recursing into the Form XObjects it draws. Returns
+/// `false` once the walk budget ([`MAX_PLACEMENT_WALKS`]) is spent; the
+/// caller then discards every placement.
 fn walk_placements(
     doc: &Document,
     content_bytes: &[u8],
@@ -884,13 +898,18 @@ fn walk_placements(
     initial_ctm: Mat,
     sizes: &mut HashMap<ObjectId, (f32, f32)>,
     path: &mut Vec<ObjectId>,
-) {
+    steps: &mut usize,
+) -> bool {
+    *steps += 1;
+    if *steps > MAX_PLACEMENT_WALKS {
+        return false;
+    }
     let names = xobject_map(doc, resources);
     if names.is_empty() {
-        return;
+        return true;
     }
     let Ok(content) = Content::decode(content_bytes) else {
-        return;
+        return true;
     };
 
     let mut ctm = initial_ctm;
@@ -967,8 +986,12 @@ fn walk_placements(
                             continue;
                         };
                         path.push(id);
-                        walk_placements(doc, &bytes, own, form_ctm, sizes, path);
+                        let within_budget =
+                            walk_placements(doc, &bytes, own, form_ctm, sizes, path, steps);
                         path.pop();
+                        if !within_budget {
+                            return false;
+                        }
                     }
                     _ => {}
                 }
@@ -976,6 +999,7 @@ fn walk_placements(
             _ => {}
         }
     }
+    true
 }
 
 /// Dictionary edits that accompany a replacement's new stream bytes, beyond
@@ -8901,6 +8925,104 @@ mod tests {
             let out = optimize_with_options(&pdf, OptimizeOptions::default());
             assert_eq!(out, pdf, "{label} bomb must leave the file untouched");
         }
+    }
+
+    /// A chain of 11 forms (under `MAX_FORM_DEPTH`) whose resources name the
+    /// next form 8 times (`/X1`..`/X8`, one object); the leaf draws an
+    /// over-resolution image. Forms are re-walked per `Do`, so the naive
+    /// placement walk is 8^11 (8.6 billion) stream walks from a few hundred
+    /// bytes. It must give up promptly — and with no trustworthy placements
+    /// the image is left alone (never downsampled off a partial map).
+    #[test]
+    fn exponential_form_fan_out_in_the_placement_walk_gives_up_promptly() {
+        let mut img = image::RgbImage::new(400, 400);
+        for (x, y, pixel) in img.enumerate_pixels_mut() {
+            *pixel = image::Rgb([(x % 256) as u8, (y % 256) as u8, ((x + y) % 256) as u8]);
+        }
+        let mut jpeg: Vec<u8> = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 92)
+            .encode_image(&img)
+            .unwrap();
+        let mut doc = Document::with_version("1.5");
+        let img_id = doc.add_object(Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Image",
+                "Width" => 400,
+                "Height" => 400,
+                "ColorSpace" => "DeviceRGB",
+                "BitsPerComponent" => 8,
+                "Filter" => "DCTDecode",
+            },
+            jpeg,
+        ));
+        let bbox = || vec![0.into(), 0.into(), 100.into(), 100.into()];
+        let mut next = doc.add_object(Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Form",
+                "BBox" => bbox(),
+                "Resources" => dictionary! { "XObject" => dictionary! { "Im0" => img_id } },
+            },
+            b"q 100 0 0 100 0 0 cm /Im0 Do Q".to_vec(),
+        ));
+        for _ in 0..11 {
+            next = doc.add_object(Stream::new(
+                dictionary! {
+                    "Type" => "XObject",
+                    "Subtype" => "Form",
+                    "BBox" => bbox(),
+                    "Resources" => dictionary! {
+                        "XObject" => dictionary! {
+                            "X1" => next, "X2" => next, "X3" => next, "X4" => next,
+                            "X5" => next, "X6" => next, "X7" => next, "X8" => next,
+                        },
+                    },
+                },
+                b"/X1 Do /X2 Do /X3 Do /X4 Do /X5 Do /X6 Do /X7 Do /X8 Do".to_vec(),
+            ));
+        }
+        let content_id = doc.add_object(Stream::new(dictionary! {}, b"/X Do".to_vec()));
+        let pages_id = doc.new_object_id();
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "Contents" => content_id,
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Resources" => dictionary! { "XObject" => dictionary! { "X" => next } },
+        });
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => vec![page_id.into()],
+                "Count" => 1,
+            }),
+        );
+        let catalog = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+        doc.trailer.set("Root", catalog);
+        let mut pdf = Vec::new();
+        doc.save_to(&mut pdf).unwrap();
+
+        let started = std::time::Instant::now();
+        let out = optimize_with_options(&pdf, OptimizeOptions::default());
+        assert!(
+            started.elapsed().as_secs() < 20,
+            "the placement walk must be budgeted"
+        );
+        let post = Document::load_mem(&out).unwrap();
+        let widths: Vec<i64> = post
+            .objects
+            .values()
+            .filter_map(|o| o.as_stream().ok())
+            .filter(|s| matches!(s.dict.get(b"Subtype"), Ok(Object::Name(n)) if n == b"Image"))
+            .map(|s| s.dict.get(b"Width").unwrap().as_i64().unwrap())
+            .collect();
+        assert_eq!(
+            widths,
+            vec![400],
+            "with no trustworthy placements the image must be left alone"
+        );
     }
 
     /// A page whose content is split across two streams: the real drawing

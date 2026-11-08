@@ -51,6 +51,15 @@ pub(crate) fn line_art_metrics(pixels: &[u8], channels: usize, w: u32, h: u32) -
         };
     }
     let total = (w as usize) * (h as usize);
+    // Callers hand over buffers they have already sized exactly; a short one
+    // would index past the end, so it reports the all-zero shape instead.
+    if pixels.len() < total.saturating_mul(channels) {
+        return LineArtMetrics {
+            background: 0.0,
+            palette: 0.0,
+            edges: 0.0,
+        };
+    }
     // Direct-indexed array rather than a `HashMap`: the quantized key is dense
     // and bounded (5 bits per channel), so the counts are byte-identical at a
     // fraction of the cost. Worth doing because this runs over every decoded
@@ -119,7 +128,7 @@ pub(crate) fn line_art_metrics(pixels: &[u8], channels: usize, w: u32, h: u32) -
 /// The signature is "mostly one flat background color, a handful of ink colors
 /// on top, and only a thin scattering of sharp transitions": a dominant
 /// background covering ≥ 75% of the image, the top 8 quantized colors covering
-/// ≥ 90%, and fewer than 10% of pixels sitting on a sharp edge. Rasterized
+/// ≥ 90%, and fewer than 8% of pixels sitting on a sharp edge. Rasterized
 /// plots/photographs fail the first two by a wide margin — their color mass is
 /// spread across gradients — and dense high-contrast raster content fails the
 /// third.

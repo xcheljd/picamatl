@@ -559,3 +559,101 @@ fn help_does_not_promise_pattern_expansion() {
         "the CLI does not expand patterns itself, so --help must not offer them"
     );
 }
+
+/// A JPEG whose progressive frame header declares 65535 x 65535 x 4
+/// components, in a few-hundred-byte PDF. The lossless Huffman pass used to
+/// size its coefficient state from that header (about 2 GB) before reading
+/// any scan data; under a memory limit that allocation aborts the process,
+/// which no in-library fallback can catch. Run under a 1 GiB address-space
+/// cap, the way a container or serverless host would run it.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_huge_progressive_jpeg_header_does_not_abort_under_a_memory_limit() {
+    fn seg(marker: u8, payload: &[u8]) -> Vec<u8> {
+        let mut v = vec![0xFF, marker];
+        v.extend_from_slice(&((payload.len() + 2) as u16).to_be_bytes());
+        v.extend_from_slice(payload);
+        v
+    }
+    let mut sof = vec![8, 0xFF, 0xFF, 0xFF, 0xFF, 4];
+    for id in 1..=4u8 {
+        sof.extend_from_slice(&[id, 0x11, 0]);
+    }
+    let mut dht = vec![0x00, 1];
+    dht.extend_from_slice(&[0u8; 15]);
+    dht.push(0);
+    let mut sos = vec![4];
+    for id in 1..=4u8 {
+        sos.extend_from_slice(&[id, 0x00]);
+    }
+    sos.extend_from_slice(&[0, 0, 0]);
+    let mut jpeg = vec![0xFF, 0xD8];
+    let mut dqt = vec![0u8];
+    dqt.extend_from_slice(&[1u8; 64]);
+    jpeg.extend(seg(0xDB, &dqt));
+    jpeg.extend(seg(0xC2, &sof));
+    jpeg.extend(seg(0xC4, &dht));
+    jpeg.extend(seg(0xDA, &sos));
+    jpeg.extend_from_slice(&[0u8; 16]);
+    jpeg.extend_from_slice(&[0xFF, 0xD9]);
+
+    let mut doc = Document::with_version("1.5");
+    let img = doc.add_object(lopdf::Stream::new(
+        dictionary! {
+            "Type" => "XObject",
+            "Subtype" => "Image",
+            "Width" => 64,
+            "Height" => 64,
+            "ColorSpace" => "DeviceRGB",
+            "BitsPerComponent" => 8,
+            "Filter" => "DCTDecode",
+        },
+        jpeg,
+    ));
+    let content = doc.add_object(lopdf::Stream::new(
+        dictionary! {},
+        b"q 50 0 0 50 0 0 cm /Im0 Do Q".to_vec(),
+    ));
+    let pages = doc.new_object_id();
+    let page = doc.add_object(dictionary! {
+        "Type" => "Page",
+        "Parent" => pages,
+        "Contents" => content,
+        "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        "Resources" => dictionary! { "XObject" => dictionary! { "Im0" => img } },
+    });
+    doc.objects.insert(
+        pages,
+        Object::Dictionary(
+            dictionary! { "Type" => "Pages", "Kids" => vec![page.into()], "Count" => 1 },
+        ),
+    );
+    let catalog = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages });
+    doc.trailer.set("Root", catalog);
+
+    let dir = std::env::temp_dir().join("picamatl-cli-jpeg-sof-bomb");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let input = dir.join("bomb.pdf");
+    let output = dir.join("out.pdf");
+    doc.save(&input).unwrap();
+
+    let result = Command::new("sh")
+        .arg("-c")
+        .arg("ulimit -v 1048576 && exec \"$0\" -o \"$2\" \"$1\"")
+        .arg(env!("CARGO_BIN_EXE_picamatl"))
+        .arg(&input)
+        .arg(&output)
+        .output()
+        .expect("run picamatl under a memory limit");
+    assert!(
+        result.status.success(),
+        "picamatl must not abort under a 1 GiB limit: {:?}\n{}",
+        result.status,
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(
+        std::fs::read(&output).unwrap(),
+        std::fs::read(&input).unwrap()
+    );
+}

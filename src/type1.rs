@@ -36,7 +36,7 @@
 //! outline; stem coordinates get the same sidebearing translation the Type1
 //! rasterizer applies.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use crate::encodings;
 
@@ -1572,14 +1572,18 @@ pub(crate) fn convert_to_cff(
     // strings table: custom SIDs are valid CFF and remove a large constant
     // table as a typo surface; Flate absorbs the byte cost).
     let mut strings: Vec<Vec<u8>> = Vec::new();
-    let sid_of = |name: &[u8], strings: &mut Vec<Vec<u8>>| -> Option<u16> {
+    // Name -> position in `strings`; a linear search per glyph is quadratic
+    // in the glyph count of an untrusted font.
+    let mut string_index: HashMap<Vec<u8>, usize> = HashMap::new();
+    let mut sid_of = |name: &[u8], strings: &mut Vec<Vec<u8>>| -> Option<u16> {
         if name == b".notdef" {
             return Some(0);
         }
-        if let Some(pos) = strings.iter().position(|s| s == name) {
+        if let Some(&pos) = string_index.get(name) {
             return u16::try_from(391 + pos).ok();
         }
         strings.push(name.to_vec());
+        string_index.insert(name.to_vec(), strings.len() - 1);
         u16::try_from(391 + strings.len() - 1).ok()
     };
 

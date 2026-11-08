@@ -51,6 +51,13 @@
 /// bits directly into the entropy stream, outside any table. Raw bits are
 /// copied through untouched, so they contribute nothing to the symbol
 /// statistics and re-emit at exactly the same bit positions.
+/// Upper bound on a frame's total 8x8 block count, summed over its
+/// components: 2^24 blocks is 128 MiB of progressive coefficient state, and
+/// still admits a ~700-megapixel 4:2:0 colour image. Larger frames are
+/// declined before any per-block state is allocated. (Streams are re-tabled
+/// in parallel, so this bounds the per-image share of a shared budget.)
+const MAX_FRAME_BLOCKS: usize = 1 << 24;
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Token {
     Sym {
@@ -957,6 +964,19 @@ fn parse(data: &[u8]) -> Option<Parsed> {
                     let bw = ceil_div(ceil_div(usize::from(x) * usize::from(c.h), hmax)?, 8)?;
                     let bh = ceil_div(ceil_div(usize::from(y) * usize::from(c.v), vmax)?, 8)?;
                     blocks.push(bw.checked_mul(bh)?);
+                }
+                // The frame header's dimensions are attacker-controlled: a
+                // 30-byte header can declare 65535 x 65535, and the
+                // progressive coefficient state below is sized from it
+                // (537 MB per component). An allocation that size aborts the
+                // process under any memory limit, which `catch_unwind` cannot
+                // turn into a pass-through — so the frame is declined before
+                // anything is allocated.
+                let total_blocks = blocks
+                    .iter()
+                    .try_fold(0usize, |acc, &n| acc.checked_add(n))?;
+                if total_blocks > MAX_FRAME_BLOCKS {
+                    return None;
                 }
                 let progressive = m == 0xC2;
                 if progressive {

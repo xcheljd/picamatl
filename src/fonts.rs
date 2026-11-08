@@ -59,6 +59,14 @@ use crate::{cffhint, cffmerge, encodings, resolve, truetype, type1, FilterClass}
 
 /// Recursion bound for the form/pattern/Type3 walk (depth of nested streams).
 const MAX_WALK_DEPTH: usize = 16;
+/// Upper bound on content streams walked per document. Streams that inherit
+/// a font from their invoker are re-walked per invocation (their result
+/// depends on the caller), so a chain of forms each drawing the next one N
+/// times costs N^depth walks — a few hundred bytes can demand billions.
+/// Past this budget the walk gives up and no font is touched (the existing
+/// safe fallback). Real documents walk one stream per page plus a handful
+/// per form, far below it.
+const MAX_STREAM_WALKS: usize = 200_000;
 /// Inflation cap for content/font/map streams walked by the subsetter path.
 const MAX_STREAM_BYTES: usize = 64 * 1024 * 1024;
 
@@ -162,6 +170,7 @@ pub(crate) fn plan_font_subsets(
         used: HashMap::new(),
         ineligible: HashSet::new(),
         visited: HashSet::new(),
+        walks: 0,
         aborted: false,
     };
     walker.walk_document();
@@ -715,6 +724,7 @@ fn count_refs(obj: &Object, counts: &mut HashMap<ObjectId, usize>) {
 // ---------------------------------------------------------------------------
 
 /// The font selected by the most recent `Tf` in the current stream.
+#[derive(Clone)]
 enum CurrentFont {
     /// No `Tf` seen yet: a show operator here means text we cannot attribute,
     /// e.g. a form inheriting the invoker's text state — global abort.
@@ -740,6 +750,8 @@ struct Walker<'a> {
     ineligible: HashSet<ObjectId>,
     /// Self-contained streams already walked (safe to skip on re-encounter).
     visited: HashSet<ObjectId>,
+    /// Content streams walked so far, against [`MAX_STREAM_WALKS`].
+    walks: usize,
     aborted: bool,
 }
 
@@ -953,6 +965,11 @@ impl<'a> Walker<'a> {
         parent_chain: &[&'a Dictionary],
         path: &mut Vec<ObjectId>,
     ) -> bool {
+        self.walks += 1;
+        if self.walks > MAX_STREAM_WALKS {
+            self.abort();
+            return false;
+        }
         let mut chain: Vec<&'a Dictionary> = Vec::with_capacity(parent_chain.len() + 1);
         if let Some(res) = own_res {
             chain.push(res);
@@ -976,8 +993,19 @@ impl<'a> Walker<'a> {
         };
 
         let mut current = CurrentFont::Unset;
+        // The text font is graphics state (PDF 32000-1 §8.4, §9.3.1): `q`
+        // saves it and `Q` restores it. Tracking only the last `Tf` would
+        // credit text shown after a `Q` to the font selected inside the
+        // `q`/`Q` pair — and subsetting would then drop glyphs the restored
+        // font really draws.
+        let mut saved: Vec<CurrentFont> = Vec::new();
         for op in &parsed.operations {
             match op.operator.as_str() {
+                "q" => saved.push(current.clone()),
+                // An unbalanced `Q` has nothing to restore; falling back to
+                // the stream's starting state (no font) is the safe reading,
+                // since any show before the next `Tf` then aborts the walk.
+                "Q" => current = saved.pop().unwrap_or(CurrentFont::Unset),
                 "Tf" => {
                     let Some(Object::Name(name)) = op.operands.first() else {
                         self.abort();
@@ -3729,6 +3757,144 @@ mod tests {
         assert_eq!(program, noto_bytes(), "the program must ship whole");
         let twice = optimize_with_options(&once, subset_opts());
         assert_eq!(twice, once, "second pass must be byte-stable");
+    }
+
+    /// `q`/`Q` save and restore the text font (it is graphics state, PDF
+    /// 32000-1 §8.4 / §9.3.1). In `F1 (He) Tj q F2 (x) Tj Q (llo) Tj` the
+    /// trailing "llo" is drawn in F1, so F1's subset must keep l and o — a
+    /// walker that ignores `q`/`Q` credits them to F2 and drops them from F1.
+    #[test]
+    fn text_after_q_q_is_attributed_to_the_restored_font() {
+        let mut doc = Document::with_version("1.7");
+        let pages_id = doc.new_object_id();
+        let spec = SimpleSpec::winansi();
+        let f1 = add_simple_tt_font(&mut doc, &spec);
+        // F2 carries a different (junk) program, so the two fonts never share
+        // one and group together; F2 itself is never subset. Only F1's
+        // attribution decides what F1 keeps.
+        let f2 = add_simple_tt_font(
+            &mut doc,
+            &SimpleSpec {
+                base_font: "OtherSans",
+                corrupt_font_file: true,
+                ..SimpleSpec::winansi()
+            },
+        );
+        let hex = |s: &[u8]| Object::String(s.to_vec(), StringFormat::Hexadecimal);
+        let ops = vec![
+            Operation::new("BT", vec![]),
+            Operation::new("Tf", vec![Object::Name(b"F1".to_vec()), 10.into()]),
+            Operation::new("Td", vec![72.into(), 700.into()]),
+            Operation::new("Tj", vec![hex(b"He")]),
+            Operation::new("q", vec![]),
+            Operation::new("Tf", vec![Object::Name(b"F2".to_vec()), 10.into()]),
+            Operation::new("Tj", vec![hex(b"x")]),
+            Operation::new("Q", vec![]),
+            Operation::new("Tj", vec![hex(b"llo")]),
+            Operation::new("ET", vec![]),
+        ];
+        let content_id = doc.add_object(Stream::new(
+            dictionary! {},
+            Content { operations: ops }.encode().unwrap(),
+        ));
+        let page = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "Contents" => content_id,
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Resources" => dictionary! {
+                "Font" => dictionary! { "F1" => f1, "F2" => f2 },
+            },
+        });
+        let pdf = finish_pdf(&mut doc, pages_id, vec![page]);
+        let out = optimize_with_options(&pdf, subset_opts());
+
+        // Find F1's program in the output (BaseFont ends with NotoSans-Regular).
+        let post = Document::load_mem(&out).unwrap();
+        let original = noto_bytes();
+        let mut checked = false;
+        for obj in post.objects.values() {
+            let Object::Dictionary(font) = obj else {
+                continue;
+            };
+            if !matches!(font.get(b"Subtype"), Ok(Object::Name(n)) if n == b"TrueType") {
+                continue;
+            }
+            if !base_name_of(font, b"BaseFont").ends_with(b"NotoSans-Regular") {
+                continue;
+            }
+            let descriptor = resolve(&post, font.get(b"FontDescriptor").unwrap())
+                .as_dict()
+                .unwrap();
+            let ff = resolve(&post, descriptor.get(b"FontFile2").unwrap())
+                .as_stream()
+                .unwrap();
+            let program = strict_stream_bytes(&post, ff).unwrap();
+            assert!(
+                program.len() < original.len() / 4,
+                "F1 must actually be subset"
+            );
+            for ch in "Hello".chars() {
+                assert_char_preserved(&program, &original, ch);
+            }
+            checked = true;
+        }
+        assert!(checked, "F1 must still be present");
+    }
+
+    /// A chain of 12 forms (under `MAX_WALK_DEPTH`) whose resources name the
+    /// next form 8 times (`/X1`..`/X8`, all one object); the leaf shows text
+    /// in a font it inherits from the page. Inheriting streams are re-walked
+    /// per resource entry (their result depends on the caller), so the naive
+    /// walk is 8^12 (69 billion) stream walks. It must give up promptly
+    /// instead (leaving fonts alone).
+    #[test]
+    fn exponential_form_fan_out_gives_up_promptly() {
+        let mut doc = Document::with_version("1.7");
+        let pages_id = doc.new_object_id();
+        let font_id = add_simple_tt_font(&mut doc, &SimpleSpec::winansi());
+        let mut next = doc.add_object(Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Form",
+                "BBox" => vec![0.into(), 0.into(), 10.into(), 10.into()],
+            },
+            b"BT /F1 10 Tf <41> Tj ET".to_vec(),
+        ));
+        for _ in 0..12 {
+            next = doc.add_object(Stream::new(
+                dictionary! {
+                    "Type" => "XObject",
+                    "Subtype" => "Form",
+                    "BBox" => vec![0.into(), 0.into(), 10.into(), 10.into()],
+                    "Resources" => dictionary! {
+                        "XObject" => dictionary! {
+                            "X1" => next, "X2" => next, "X3" => next, "X4" => next,
+                            "X5" => next, "X6" => next, "X7" => next, "X8" => next,
+                        },
+                    },
+                },
+                b"/X1 Do /X2 Do /X3 Do /X4 Do /X5 Do /X6 Do /X7 Do /X8 Do".to_vec(),
+            ));
+        }
+        let content_id = doc.add_object(Stream::new(dictionary! {}, b"/X Do".to_vec()));
+        let page = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "Contents" => content_id,
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Resources" => dictionary! {
+                "Font" => dictionary! { "F1" => font_id },
+                "XObject" => dictionary! { "X" => next },
+            },
+        });
+        let pdf = finish_pdf(&mut doc, pages_id, vec![page]);
+        let started = std::time::Instant::now();
+        let _ = optimize_with_options(&pdf, subset_opts());
+        assert!(
+            started.elapsed().as_secs() < 20,
+            "the walk must be budgeted"
+        );
     }
 
     #[test]
