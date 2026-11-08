@@ -124,7 +124,11 @@ they are one pipeline, and the pass ordering above is the reason.
   non-uniformly scaled image is caught even if one axis looks fine.
 - **Masked-image handling** (Phase 5/6): D-M1 (dimension-preserving
   requant), D-M2 (coupled downsample of JPEG base + `/SMask` as an atomic
-  pair), D-M3 (same for Flate base), P-M1 (shared-mask refcount guard — a
+  pair), D-M3 (same for Flate base), D-M4 (D-M3 for an 8-bit `/Indexed`
+  Flate base: the palette is expanded into its base space — Gray/RGB/ICCBased
+  N=1,3 only — then resampled; indices are never interpolated, and the base
+  is re-indexed into its own palette only when every resampled pixel is
+  exactly an entry), P-M1 (shared-mask refcount guard — a
   shared mask is never resized). The mask always follows the base's target
   geometry.
 - **`--figure-dpi`** (2026-08-26): heuristic text/chart-aware DPI. Classifier:

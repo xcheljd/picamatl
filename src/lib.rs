@@ -208,6 +208,13 @@ const DPI_MARGIN: f32 = 1.15;
 /// losslessly resampled mask, so a masked pair reaches its final encoding in
 /// one pass instead of two.
 ///
+/// Over-resolution pairs whose FlateDecode base is 8-bit `/Indexed` (D-M4)
+/// take the same coupled downsample with the palette EXPANDED first — indices
+/// are never interpolated. The base ships either re-indexed into its own
+/// palette (only when every resampled pixel is exactly an entry) or as a
+/// raster in the palette's base space (DeviceGray, DeviceRGB or ICCBased with
+/// one or three components; any other base leaves the pair untouched).
+///
 /// A mask shared by more than one base is never resized (P-M1), so no other
 /// consumer of it can be misaligned by a decision made for one base.
 ///
@@ -1081,6 +1088,17 @@ enum DictUpdate {
     /// (gray → 1-channel, RGB → 3-channel), so the existing entries still
     /// describe the payload exactly.
     FlateToJpeg,
+    /// An `/Indexed` base expanded through its palette and resampled
+    /// (`plan_indexed_smask_pair_downsample`): `/ColorSpace` becomes the
+    /// palette's BASE space, plus the [`DictUpdate::Flate`] filter/parms
+    /// normalization. `/BitsPerComponent` stays 8.
+    IndexedToFlate {
+        decode_parms: Option<lopdf::Dictionary>,
+        colorspace: Object,
+    },
+    /// The consent-gated JPEG competitor of the same expansion:
+    /// [`DictUpdate::FlateToJpeg`] plus the `/ColorSpace` rewrite.
+    IndexedToJpeg { colorspace: Object },
 }
 
 /// A planned image replacement, computed read-only before mutating the doc.
@@ -1468,7 +1486,8 @@ fn plan_replacement(
     //     requantization: the base is decoded at its own size, re-encoded at
     //     the configured quality, and the `/SMask` stream is never modified.
     //   - FlateDecode bases (D-M3): OVER-RESOLUTION pairs take the same
-    //     atomic coupled downsample, with the base going through the
+    //     atomic coupled downsample (an 8-bit `/Indexed` base through the
+    //     palette-expanding D-M4 variant), with the base going through the
     //     format-preserving Flate→Flate path — or, under
     //     `allow_lossy_reencode`, through whichever of that path and a JPEG
     //     candidate at the same target geometry is smaller. Pairs that do not take that
@@ -1526,19 +1545,18 @@ fn plan_replacement(
             // There is still no lossy fallback AFTER a decline — that would
             // re-litigate a resampling decision the lossless path already made,
             // the same no-compounding-losses rule the unmasked path applies.
-            return plan_flate_smask_pair_downsample(
-                doc,
-                id,
-                mask_id,
-                stream,
-                PairGeometry {
-                    px_w,
-                    px_h,
-                    target_w,
-                    target_h,
-                },
-                options,
-            );
+            let geom = PairGeometry {
+                px_w,
+                px_h,
+                target_w,
+                target_h,
+            };
+            // An `/Indexed` base takes the palette-expanding variant (D-M4):
+            // its indices cannot go through `plan_flate`'s resampler.
+            if is_indexed_image(doc, dict) {
+                return plan_indexed_smask_pair_downsample(doc, id, mask_id, stream, geom, options);
+            }
+            return plan_flate_smask_pair_downsample(doc, id, mask_id, stream, geom, options);
         }
         if over_resolution {
             // A shared mask is never RESIZED (P-M1 fail-safe, unchanged from
@@ -2313,6 +2331,292 @@ fn plan_flate_smask_pair_downsample(
     })
 }
 
+/// An 8-bit FlateDecode `/Indexed` image decoded through its palette — the
+/// only shape [`plan_indexed_smask_pair_downsample`] accepts.
+pub(crate) struct IndexedImage {
+    /// The base color space exactly as the `/Indexed` array names it (a name,
+    /// a reference, or a direct `[/ICCBased ...]` array) — written verbatim
+    /// as `/ColorSpace` when the expanded raster ships.
+    base: Object,
+    /// Components per base color: 1 or 3 (the [`colorspace_channels`] set).
+    pub(crate) channels: usize,
+    /// `(hival + 1) * channels` bytes: entry `i` is `palette[i*channels..]`.
+    palette: Vec<u8>,
+    /// Palette-expanded pixels at the stored geometry.
+    pub(crate) expanded: DynamicImage,
+}
+
+/// Decode an `/Indexed` FlateDecode image and expand it through its palette
+/// into the base color space. Every gate declines on doubt (image untouched):
+///
+/// - exactly 8 bits per index (1/2/4-bit index packing is out of scope), no
+///   `/Decode` (a remapped index range would change which entry each sample
+///   selects);
+/// - `[/Indexed base hival lookup]`, `hival` in 0..=255, a base space from
+///   the [`colorspace_channels`] set (DeviceGray, DeviceRGB, ICCBased N=1/3
+///   — Separation, DeviceN, Lab, CalRGB, CMYK, nested Indexed all decline);
+/// - a lookup table that is a string or an unfiltered/plain-Flate stream
+///   holding at least `(hival + 1) * channels` bytes (only that prefix is
+///   used, as viewers do);
+/// - every index `<= hival` (out-of-range indices have no defined color).
+///
+/// Why expansion is EXACT for the accepted bases (PDF 32000-1 §8.6.6.3 and
+/// §8.9.5.2): a lookup byte `b` denotes the base component value
+/// `Rmin + b * (Rmax - Rmin) / 255`, and an 8-bit image sample `b` in the
+/// base space with no `/Decode` denotes the same value under the default
+/// decode array `[Rmin Rmax]` — `[0 1]` for DeviceGray/RGB and the profile's
+/// `/Range` for ICCBased. So the expanded raster, tagged with the base space,
+/// paints exactly the colors the indexed image paints.
+pub(crate) fn decode_indexed_flate_image(
+    doc: &Document,
+    stream: &lopdf::Stream,
+    px_w: u32,
+    px_h: u32,
+) -> Option<IndexedImage> {
+    let dict = &stream.dict;
+    let bpc = dict
+        .get(b"BitsPerComponent")
+        .ok()
+        .map(|o| resolve(doc, o))
+        .and_then(|o| o.as_i64().ok())?;
+    if bpc != 8 || dict.get(b"Decode").is_ok() {
+        return None;
+    }
+    let Object::Array(items) = resolve(doc, dict.get(b"ColorSpace").ok()?) else {
+        return None;
+    };
+    let [family, base, hival, lookup] = items.as_slice() else {
+        return None;
+    };
+    if !matches!(resolve(doc, family), Object::Name(n) if n == b"Indexed" || n == b"I") {
+        return None;
+    }
+    let channels = colorspace_channels(doc, base)?;
+    let hival = resolve(doc, hival).as_i64().ok()?;
+    if !(0..=255).contains(&hival) {
+        return None;
+    }
+    let entries = hival as usize + 1;
+    let table_len = entries * channels;
+    // Only the `table_len` prefix is ever read, so only that much is copied.
+    let palette: Vec<u8> = match resolve(doc, lookup) {
+        Object::String(bytes, _) => bytes.get(..table_len)?.to_vec(),
+        Object::Stream(s) => match s.dict.get(b"Filter") {
+            Err(_) if s.dict.get(b"DecodeParms").is_err() => s.content.get(..table_len)?.to_vec(),
+            Ok(f)
+                if classify_filter(doc, f) == FilterClass::FlateOnly
+                    && s.dict.get(b"DecodeParms").is_err() =>
+            {
+                // A palette is at most 256 x 3 bytes; anything that inflates
+                // further is not a lookup table we understand.
+                inflate_capped(&s.content, 256 * 4)?
+                    .get(..table_len)?
+                    .to_vec()
+            }
+            _ => return None,
+        },
+        _ => return None,
+    };
+
+    // The expanded raster is `channels` times the index raster; budget it.
+    if !raster_within_budget(u64::from(px_w), u64::from(px_h), channels as u64) {
+        return None;
+    }
+    let indices = inflate_image_samples(stream, 1, px_w, px_h)?;
+    if indices.iter().any(|&i| usize::from(i) >= entries) {
+        return None;
+    }
+    let expanded_raw: Vec<u8> = indices
+        .iter()
+        .flat_map(|&i| {
+            let start = usize::from(i) * channels;
+            palette[start..start + channels].iter().copied()
+        })
+        .collect();
+    let expanded = if channels == 3 {
+        DynamicImage::ImageRgb8(image::RgbImage::from_raw(px_w, px_h, expanded_raw)?)
+    } else {
+        DynamicImage::ImageLuma8(image::GrayImage::from_raw(px_w, px_h, expanded_raw)?)
+    };
+    Some(IndexedImage {
+        base: base.clone(),
+        channels,
+        palette,
+        expanded,
+    })
+}
+
+/// Map every pixel of a base-space raster back to a palette index — `None`
+/// unless EVERY pixel is exactly some palette entry. A resampled raster
+/// re-indexes losslessly only when the resampler produced no new colors (flat
+/// regions, single-color palettes); then the index raster paints exactly the
+/// same pixels as the expanded one at a third of the samples.
+fn reindex_raster(raw: &[u8], palette: &[u8], channels: usize) -> Option<Vec<u8>> {
+    let mut lookup: HashMap<&[u8], u8> = HashMap::new();
+    for (i, entry) in palette.chunks_exact(channels).enumerate() {
+        // First occurrence wins; duplicate entries are the same color.
+        lookup.entry(entry).or_insert(u8::try_from(i).ok()?);
+    }
+    raw.chunks_exact(channels)
+        .map(|px| lookup.get(px).copied())
+        .collect()
+}
+
+/// D-M4: the D-M3 coupled downsample for an `/Indexed` FlateDecode base.
+/// Palette indices are never interpolated (that invents wrong colors): the
+/// base is expanded through its palette into the base color space
+/// ([`decode_indexed_flate_image`] — exact for every accepted base), resampled
+/// with the same Lanczos3 kernel as [`plan_flate`], and shipped as whichever
+/// verified candidate is smallest:
+///
+/// - the resampled raster re-indexed into the ORIGINAL palette, `/ColorSpace`
+///   unchanged — only possible when every resampled pixel is exactly a
+///   palette entry ([`reindex_raster`]);
+/// - the resampled raster itself, `/ColorSpace` rewritten to the base space;
+/// - under `allow_lossy_reencode`, a JPEG of the same raster (the D-M3
+///   Option B competitor, same no-compounding-losses gate).
+///
+/// The mask half is the unchanged [`plan_mask_resample`] raster at the same
+/// target geometry, and the pair is judged by the same combined
+/// [`pair_savings_declined`] guard as every other coupled downsample.
+fn plan_indexed_smask_pair_downsample(
+    doc: &Document,
+    id: ObjectId,
+    mask_id: ObjectId,
+    base_stream: &lopdf::Stream,
+    geom: PairGeometry,
+    options: OptimizeOptions,
+) -> Option<Replacement> {
+    let PairGeometry {
+        px_w,
+        px_h,
+        target_w,
+        target_h,
+    } = geom;
+    let indexed = decode_indexed_flate_image(doc, base_stream, px_w, px_h)?;
+    let channels = indexed.channels;
+    let resized =
+        indexed
+            .expanded
+            .resize_exact(target_w, target_h, image::imageops::FilterType::Lanczos3);
+    let raw = if channels == 3 {
+        resized.into_rgb8().into_raw()
+    } else {
+        resized.into_luma8().into_raw()
+    };
+
+    // Candidate 1: the base-space raster, decode-back verified.
+    let (expanded_out, expanded_parms) = encode_flate_raster(&raw, target_w, channels)?;
+    if !flate_raster_round_trips(
+        &expanded_out,
+        expanded_parms.is_some(),
+        &raw,
+        target_w,
+        channels,
+    ) {
+        return None;
+    }
+    let mut best = (
+        expanded_out,
+        DictUpdate::IndexedToFlate {
+            decode_parms: expanded_parms,
+            colorspace: indexed.base.clone(),
+        },
+    );
+
+    // Candidate 2: exact re-indexing into the original palette. Verified by
+    // decoding the index payload AND expanding it back to the base raster.
+    if let Some(indices) = reindex_raster(&raw, &indexed.palette, channels) {
+        if let Some((idx_out, idx_parms)) = encode_flate_raster(&indices, target_w, 1) {
+            let expands_back = indices
+                .iter()
+                .flat_map(|&i| {
+                    let start = usize::from(i) * channels;
+                    indexed.palette[start..start + channels].iter().copied()
+                })
+                .eq(raw.iter().copied());
+            if expands_back
+                && idx_out.len() < best.0.len()
+                && flate_raster_round_trips(&idx_out, idx_parms.is_some(), &indices, target_w, 1)
+            {
+                best = (
+                    idx_out,
+                    DictUpdate::Flate {
+                        decode_parms: idx_parms,
+                    },
+                );
+            }
+        }
+    }
+
+    let mask_stream = doc.get_object(mask_id).ok()?.as_stream().ok()?;
+    let mask_out = plan_mask_resample(doc, mask_stream, geom)?;
+
+    // NO COMPOUNDING LOSSES (see `plan_flate_smask_pair_downsample`): the JPEG
+    // competitor only runs when the lossless pair already pays for itself.
+    let lossless_declined = pair_savings_declined(
+        base_stream.content.len(),
+        mask_stream.content.len(),
+        best.0.len(),
+        mask_out.len(),
+    );
+    if options.allow_lossy_reencode && !lossless_declined {
+        if let Some(jpeg_out) = pixels_to_jpeg(
+            indexed.expanded,
+            channels,
+            options,
+            (px_w, px_h),
+            (target_w, target_h),
+        ) {
+            if jpeg_out.len() < best.0.len() {
+                best = (
+                    jpeg_out,
+                    DictUpdate::IndexedToJpeg {
+                        colorspace: indexed.base,
+                    },
+                );
+            }
+        }
+    }
+
+    let (content, dict_update) = best;
+    if pair_savings_declined(
+        base_stream.content.len(),
+        mask_stream.content.len(),
+        content.len(),
+        mask_out.len(),
+    ) {
+        return None;
+    }
+    Some(Replacement {
+        id,
+        content,
+        width: target_w as i64,
+        height: target_h as i64,
+        dict_update,
+        smask: Some(MaskReplacement {
+            mask_id,
+            content: mask_out,
+            width: target_w as i64,
+            height: target_h as i64,
+        }),
+    })
+}
+
+/// True when the image dict's `/ColorSpace` is an `/Indexed` array — the
+/// dispatch test for [`plan_indexed_smask_pair_downsample`].
+fn is_indexed_image(doc: &Document, dict: &lopdf::Dictionary) -> bool {
+    let Ok(cs) = dict.get(b"ColorSpace") else {
+        return false;
+    };
+    let Object::Array(items) = resolve(doc, cs) else {
+        return false;
+    };
+    items
+        .first()
+        .is_some_and(|f| matches!(resolve(doc, f), Object::Name(n) if n == b"Indexed" || n == b"I"))
+}
+
 /// Raw pixel budget above which a Flate image is never decoded: 256 MiB
 /// (~9.5k x 9.5k RGB), far above anything legitimately placed on a page.
 /// Guards against decompression bombs before any allocation happens.
@@ -2347,24 +2651,60 @@ fn plan_flate(
     } else {
         resized.into_luma8().into_raw()
     };
+    encode_flate_raster(&raw, target_w, channels)
+}
 
-    // Re-encode both variants and keep the smaller. The Up-predictor variant
-    // must also pay for the /DecodeParms dict it forces into the image
-    // dictionary (~70 serialized bytes), so the comparison includes that.
-    let plain = deflate_level9(&raw)?;
-    let up = deflate_level9(&png_up_filter(&raw, target_w, channels))?;
+/// Deflate an 8-bit raster of `width`-pixel rows two ways — plain rows and
+/// PNG Up-filtered rows — and keep the smaller. The Up-predictor variant must
+/// also pay for the `/DecodeParms` dict it forces into the image dictionary
+/// (~70 serialized bytes), so the comparison includes that. Returns the
+/// payload and the parms it needs (`None` = plain rows).
+fn encode_flate_raster(
+    raw: &[u8],
+    width: u32,
+    channels: usize,
+) -> Option<(Vec<u8>, Option<lopdf::Dictionary>)> {
+    let plain = deflate_level9(raw)?;
+    let up = deflate_level9(&png_up_filter(raw, width, channels))?;
     const PARMS_OVERHEAD: usize = 70;
     if up.len() + PARMS_OVERHEAD < plain.len() {
         let parms = dictionary! {
             "Predictor" => 15_i64,
             "Colors" => channels as i64,
             "BitsPerComponent" => 8_i64,
-            "Columns" => target_w as i64,
+            "Columns" => width as i64,
         };
         Some((up, Some(parms)))
     } else {
         Some((plain, None))
     }
+}
+
+/// Decode-back for a payload [`encode_flate_raster`] produced: inflate it
+/// (capped), undo the Up predictor when `predicted`, and require the result
+/// to equal `raw` byte for byte. Flate is lossless, so anything short of
+/// exact equality is a bug and declines the candidate.
+fn flate_raster_round_trips(
+    out: &[u8],
+    predicted: bool,
+    raw: &[u8],
+    width: u32,
+    channels: usize,
+) -> bool {
+    let bytes_per_row = width as usize * channels;
+    if bytes_per_row == 0 || !raw.len().is_multiple_of(bytes_per_row) {
+        return false;
+    }
+    let rows = raw.len() / bytes_per_row;
+    let decoded = if predicted {
+        let Some(filtered) = inflate_capped(out, (bytes_per_row + 1) * rows) else {
+            return false;
+        };
+        png_defilter(&filtered, channels, bytes_per_row)
+    } else {
+        inflate_capped(out, raw.len())
+    };
+    decoded.is_some_and(|d| d == raw)
 }
 
 /// One planned RGB→Gray collapse: the gray payload plus the predictor parms
@@ -2501,16 +2841,34 @@ fn decode_flate_image(
     }
 
     let channels = flate_channels(doc, dict)?;
-    let encoding = flate_encoding(dict, channels, px_w)?;
+    let decoded = inflate_image_samples(stream, channels, px_w, px_h)?;
 
-    // Decompression-bomb guard before decoding, then an EXACT length check
-    // after: any mismatch (truncated stream, lying dimensions) means we cannot
-    // trust the pixel data — skip.
-    let expected = u64::from(px_w) * u64::from(px_h) * channels as u64;
+    let img = if channels == 3 {
+        DynamicImage::ImageRgb8(image::RgbImage::from_raw(px_w, px_h, decoded)?)
+    } else {
+        DynamicImage::ImageLuma8(image::GrayImage::from_raw(px_w, px_h, decoded)?)
+    };
+    Some((img, channels))
+}
+
+/// Inflate an 8-bit FlateDecode image's samples: the `/DecodeParms` layout
+/// gate, the decompression-bomb guard BEFORE decoding, capped inflate,
+/// spec-correct PNG defiltering, and an EXACT length check after — any
+/// mismatch (truncated stream, lying dimensions) means the pixel data cannot
+/// be trusted. `samples` is the per-pixel sample count (1 for an `/Indexed`
+/// index raster).
+fn inflate_image_samples(
+    stream: &lopdf::Stream,
+    samples: usize,
+    px_w: u32,
+    px_h: u32,
+) -> Option<Vec<u8>> {
+    let encoding = flate_encoding(&stream.dict, samples, px_w)?;
+    let expected = u64::from(px_w) * u64::from(px_h) * samples as u64;
     if expected > MAX_FLATE_PIXEL_BYTES {
         return None;
     }
-    let bytes_per_row = px_w as usize * channels;
+    let bytes_per_row = px_w as usize * samples;
     let decoded = match encoding {
         FlateEncoding::Plain => inflate_capped(&stream.content, expected as usize)?,
         FlateEncoding::PngPredictor => {
@@ -2520,19 +2878,10 @@ fn decode_flate_image(
             if inflated.len() != filtered_len {
                 return None;
             }
-            png_defilter(&inflated, channels, bytes_per_row)?
+            png_defilter(&inflated, samples, bytes_per_row)?
         }
     };
-    if decoded.len() as u64 != expected {
-        return None;
-    }
-
-    let img = if channels == 3 {
-        DynamicImage::ImageRgb8(image::RgbImage::from_raw(px_w, px_h, decoded)?)
-    } else {
-        DynamicImage::ImageLuma8(image::GrayImage::from_raw(px_w, px_h, decoded)?)
-    };
-    Some((img, channels))
+    (decoded.len() as u64 == expected).then_some(decoded)
 }
 
 /// Phase 7 spike: the consent-gated lossy Flate→JPEG candidate. Decodes the
@@ -2561,8 +2910,22 @@ fn plan_flate_to_jpeg(
     target_w: u32,
     target_h: u32,
 ) -> Option<Vec<u8>> {
-    let quality = options.jpeg_quality.clamp(1, 100);
     let (img, channels) = decode_flate_image(doc, stream, px_w, px_h)?;
+    pixels_to_jpeg(img, channels, options, (px_w, px_h), (target_w, target_h))
+}
+
+/// The pixel half of [`plan_flate_to_jpeg`], shared with the `/Indexed`
+/// masked-pair path (which decodes through its palette instead): line-art
+/// guard on the SOURCE pixels, optional Lanczos3 resize, JPEG encode, and
+/// decode-back verification against the exact encoder input.
+fn pixels_to_jpeg(
+    img: DynamicImage,
+    channels: usize,
+    options: OptimizeOptions,
+    (px_w, px_h): (u32, u32),
+    (target_w, target_h): (u32, u32),
+) -> Option<Vec<u8>> {
+    let quality = options.jpeg_quality.clamp(1, 100);
     let is_gray = channels == 1;
     let source = if is_gray {
         img.to_luma8().into_raw()
@@ -2634,7 +2997,15 @@ fn plan_flate_lossy_requant_replacement(
 /// DeviceRGB / ICCBased N=3 -> 3, DeviceGray / ICCBased N=1 -> 1. Anything
 /// else (Indexed, Separation, Lab, CalRGB, ...) -> `None` (image untouched).
 fn flate_channels(doc: &Document, dict: &lopdf::Dictionary) -> Option<usize> {
-    match resolve(doc, dict.get(b"ColorSpace").ok()?) {
+    colorspace_channels(doc, dict.get(b"ColorSpace").ok()?)
+}
+
+/// [`flate_channels`] for a bare color-space object rather than an image
+/// dict — also the gate on an `/Indexed` palette's BASE space
+/// ([`decode_indexed_flate_image`]), so both paths accept exactly the same
+/// set of spaces.
+fn colorspace_channels(doc: &Document, cs: &Object) -> Option<usize> {
+    match resolve(doc, cs) {
         Object::Name(n) if n == b"DeviceRGB" => Some(3),
         Object::Name(n) if n == b"DeviceGray" => Some(1),
         Object::Array(items) if items.len() == 2 => {
@@ -3945,6 +4316,28 @@ fn try_optimize(input: &[u8], options: OptimizeOptions) -> Result<OptimizeOutcom
                     // /DecodeParms belonged to the old Flate encoding and
                     // must go; /ColorSpace and /BitsPerComponent still match
                     // (see the variant's doc — channel count is preserved).
+                    stream
+                        .dict
+                        .set("Filter", Object::Name(b"DCTDecode".to_vec()));
+                    stream.dict.remove(b"DecodeParms");
+                }
+                DictUpdate::IndexedToFlate {
+                    decode_parms,
+                    colorspace,
+                } => {
+                    stream.dict.set("ColorSpace", colorspace);
+                    stream
+                        .dict
+                        .set("Filter", Object::Name(b"FlateDecode".to_vec()));
+                    match decode_parms {
+                        Some(parms) => stream.dict.set("DecodeParms", Object::Dictionary(parms)),
+                        None => {
+                            stream.dict.remove(b"DecodeParms");
+                        }
+                    }
+                }
+                DictUpdate::IndexedToJpeg { colorspace } => {
+                    stream.dict.set("ColorSpace", colorspace);
                     stream
                         .dict
                         .set("Filter", Object::Name(b"DCTDecode".to_vec()));
@@ -9467,5 +9860,520 @@ mod tests {
             };
             assert!(plan_replacement(&doc, id, (72.0, 72.0), options).is_none());
         }
+    }
+
+    // ---- D-M4: /Indexed bases in the D-M3 coupled downsample -------------
+
+    /// Palette of `n` distinct, deliberately non-collinear RGB colors, so a
+    /// resampled edge between two entries is (almost) never another entry.
+    fn indexed_test_palette(n: usize) -> Vec<u8> {
+        (0..n)
+            .flat_map(|i| {
+                let i = i as u32;
+                [
+                    (i * 67 + 13) as u8,
+                    (i * 151 + 101) as u8,
+                    (i * 29 + 211) as u8,
+                ]
+            })
+            .collect()
+    }
+
+    /// A `px`-square index raster of `cell`-pixel blocks, each block one
+    /// pseudo-random entry in `0..entries`.
+    fn indexed_block_indices(px: u32, cell: u32, entries: u32) -> Vec<u8> {
+        let noise = flate_pixels(px.div_ceil(cell), px.div_ceil(cell), 1);
+        let cells = px.div_ceil(cell);
+        (0..px)
+            .flat_map(|y| {
+                let noise = &noise;
+                (0..px).map(move |x| {
+                    (u32::from(noise[((y / cell) * cells + x / cell) as usize]) % entries) as u8
+                })
+            })
+            .collect()
+    }
+
+    /// A one-page PDF with a `px`-square 8-bit `/Indexed` FlateDecode base
+    /// (`[/Indexed base hival <lookup>]`, lookup as a direct string) and a
+    /// noise DeviceGray `/SMask` (the D-M3 mask shape), drawn into
+    /// `draw_pts`. `base_mutate`/`mask_mutate` run on the final dicts.
+    fn build_pdf_smask_indexed(
+        px: u32,
+        draw_pts: i64,
+        base_cs: Object,
+        palette: &[u8],
+        indices: &[u8],
+        base_mutate: impl FnOnce(&mut lopdf::Dictionary),
+        mask_mutate: impl FnOnce(&mut lopdf::Dictionary),
+    ) -> Vec<u8> {
+        let channels = match &base_cs {
+            Object::Name(n) if n == b"DeviceGray" => 1,
+            Object::Name(n) if n == b"DeviceCMYK" => 4,
+            Object::Array(a) if matches!(&a[0], Object::Name(n) if n == b"Separation") => 1,
+            _ => 3,
+        };
+        let hival = (palette.len() / channels) as i64 - 1;
+        let cs = Object::Array(vec![
+            Object::Name(b"Indexed".to_vec()),
+            base_cs,
+            Object::Integer(hival),
+            Object::String(palette.to_vec(), lopdf::StringFormat::Hexadecimal),
+        ]);
+        let mask = flate_pixels(px, px, 1);
+        build_pdf_smask_flate_ext(
+            px,
+            draw_pts,
+            indices,
+            &mask,
+            |d| {
+                d.set("ColorSpace", cs);
+                base_mutate(d);
+            },
+            mask_mutate,
+        )
+    }
+
+    /// The masked base's dict and decoded (inflated + defiltered) samples,
+    /// plus the mask's dict and decoded samples, from an output PDF.
+    fn indexed_pair_after(pdf: &[u8]) -> (lopdf::Dictionary, Vec<u8>, lopdf::Dictionary, Vec<u8>) {
+        fn samples(s: &lopdf::Stream) -> Vec<u8> {
+            let inflated = inflate_capped(&s.content, 1 << 26).expect("flate payload");
+            match s.dict.get(b"DecodeParms") {
+                Ok(Object::Dictionary(p)) => {
+                    let colors = p.get(b"Colors").unwrap().as_i64().unwrap() as usize;
+                    let cols = p.get(b"Columns").unwrap().as_i64().unwrap() as usize;
+                    png_defilter(&inflated, colors, cols * colors).expect("defilter")
+                }
+                _ => inflated,
+            }
+        }
+        let doc = Document::load_mem(pdf).unwrap();
+        for obj in doc.objects.values() {
+            if let Object::Stream(s) = obj {
+                if matches!(s.dict.get(b"Subtype"), Ok(Object::Name(n)) if n == b"Image") {
+                    if let Ok(Object::Reference(mask_id)) = s.dict.get(b"SMask") {
+                        let mask = doc.get_object(*mask_id).unwrap().as_stream().unwrap();
+                        return (s.dict.clone(), samples(s), mask.dict.clone(), samples(mask));
+                    }
+                }
+            }
+        }
+        panic!("no smask-carrying image found");
+    }
+
+    fn dict_wh(d: &lopdf::Dictionary) -> (i64, i64) {
+        (
+            d.get(b"Width").unwrap().as_i64().unwrap(),
+            d.get(b"Height").unwrap().as_i64().unwrap(),
+        )
+    }
+
+    /// The expected base-space pixels: expand through the palette, Lanczos3
+    /// to `target` — exactly what the viewer would see, resampled.
+    fn expand_and_resample(indices: &[u8], palette: &[u8], px: u32, target: u32) -> Vec<u8> {
+        let raw: Vec<u8> = indices
+            .iter()
+            .flat_map(|&i| palette[usize::from(i) * 3..usize::from(i) * 3 + 3].to_vec())
+            .collect();
+        DynamicImage::ImageRgb8(image::RgbImage::from_raw(px, px, raw).unwrap())
+            .resize_exact(target, target, image::imageops::FilterType::Lanczos3)
+            .into_rgb8()
+            .into_raw()
+    }
+
+    #[test]
+    fn indexed_smask_pair_downsamples_with_palette_expanded_colors() {
+        // 400 px into 100 pt ≈ 288 DPI: over-resolution, target 181 px. A
+        // 16-color block image: resampled edges blend entries into colors the
+        // palette does not hold, so the base ships EXPANDED (DeviceRGB).
+        let palette = indexed_test_palette(16);
+        let indices = indexed_block_indices(400, 8, 16);
+        let pdf = build_pdf_smask_indexed(
+            400,
+            100,
+            Object::Name(b"DeviceRGB".to_vec()),
+            &palette,
+            &indices,
+            |_| {},
+            |_| {},
+        );
+        let out = optimize(&pdf);
+        assert!(out.len() < pdf.len(), "the pair must shrink");
+        let (base, base_px, mask, mask_px) = indexed_pair_after(&out);
+        assert_eq!(
+            dict_wh(&base),
+            (181, 181),
+            "base lands at the 130-DPI target"
+        );
+        assert_eq!(
+            dict_wh(&mask),
+            (181, 181),
+            "mask is resampled with the base"
+        );
+        assert_eq!(
+            mask_px.len(),
+            181 * 181,
+            "mask payload matches its geometry"
+        );
+        assert!(
+            matches!(base.get(b"ColorSpace"), Ok(Object::Name(n)) if n == b"DeviceRGB"),
+            "an expanded base is tagged with the palette's base space"
+        );
+        assert_eq!(base.get(b"BitsPerComponent").unwrap().as_i64().unwrap(), 8);
+        // Colors preserved: the decoded pixels are EXACTLY the palette-expanded,
+        // resampled original (Flate is lossless — the tolerance is zero).
+        assert_eq!(
+            base_px,
+            expand_and_resample(&indices, &palette, 400, 181),
+            "decoded base must equal the expanded + resampled original"
+        );
+    }
+
+    #[test]
+    fn indexed_smask_single_color_base_reindexes_into_its_palette() {
+        // The nist-ssdf shape: a one-entry palette (hival 0). Every resampled
+        // pixel is that entry, so the base stays /Indexed with the SAME color
+        // space and an all-zero index raster at the target geometry.
+        let palette = vec![0x20, 0x40, 0x80];
+        let indices = vec![0u8; 400 * 400];
+        let pdf = build_pdf_smask_indexed(
+            400,
+            100,
+            Object::Name(b"DeviceRGB".to_vec()),
+            &palette,
+            &indices,
+            |_| {},
+            |_| {},
+        );
+        let before = Document::load_mem(&pdf).unwrap();
+        let cs_before = before
+            .objects
+            .values()
+            .find_map(|o| match o {
+                Object::Stream(s) if s.dict.get(b"SMask").is_ok() => {
+                    Some(s.dict.get(b"ColorSpace").unwrap().clone())
+                }
+                _ => None,
+            })
+            .unwrap();
+        let out = optimize(&pdf);
+        assert!(out.len() < pdf.len());
+        let (base, base_px, mask, _) = indexed_pair_after(&out);
+        assert_eq!(dict_wh(&base), (181, 181));
+        assert_eq!(
+            dict_wh(&mask),
+            (181, 181),
+            "mask is resampled with the base"
+        );
+        assert_eq!(
+            base.get(b"ColorSpace").unwrap(),
+            &cs_before,
+            "an exactly re-indexed base keeps its /Indexed color space"
+        );
+        assert_eq!(base_px, vec![0u8; 181 * 181], "every index is entry 0");
+    }
+
+    #[test]
+    fn indexed_smask_icc_base_expands_to_the_icc_space() {
+        // ICCBased N=3 base (every corpus pair has one), lookup supplied as a
+        // FlateDecode STREAM rather than a string. The expanded base must be
+        // tagged with the very same ICC color space object.
+        let palette = indexed_test_palette(16);
+        let indices = indexed_block_indices(400, 8, 16);
+        let mut doc = Document::with_version("1.5");
+        let icc_id = doc.add_object(Stream::new(dictionary! { "N" => 3_i64 }, vec![0u8; 128]));
+        let lookup_id = doc.add_object(Stream::new(
+            dictionary! { "Filter" => "FlateDecode" },
+            deflate_level9(&palette).unwrap(),
+        ));
+        let icc_cs = Object::Array(vec![
+            Object::Name(b"ICCBased".to_vec()),
+            Object::Reference(icc_id),
+        ]);
+        let mask_id = doc.add_object(Stream::new(
+            dictionary! {
+                "Type" => "XObject", "Subtype" => "Image",
+                "Width" => 400_i64, "Height" => 400_i64,
+                "ColorSpace" => "DeviceGray", "BitsPerComponent" => 8_i64,
+                "Filter" => "FlateDecode",
+            },
+            deflate_level9(&flate_pixels(400, 400, 1)).unwrap(),
+        ));
+        let img_id = doc.add_object(Stream::new(
+            dictionary! {
+                "Type" => "XObject", "Subtype" => "Image",
+                "Width" => 400_i64, "Height" => 400_i64,
+                "ColorSpace" => vec![
+                    Object::Name(b"Indexed".to_vec()),
+                    icc_cs.clone(),
+                    Object::Integer(15),
+                    Object::Reference(lookup_id),
+                ],
+                "BitsPerComponent" => 8_i64,
+                "Filter" => "FlateDecode",
+                "SMask" => mask_id,
+            },
+            deflate_level9(&indices).unwrap(),
+        ));
+        let pdf = wrap_image_pdf(&mut doc, img_id, 100);
+        let out = optimize(&pdf);
+        let (base, base_px, mask, _) = indexed_pair_after(&out);
+        assert_eq!(dict_wh(&base), (181, 181));
+        assert_eq!(dict_wh(&mask), (181, 181));
+        let out_doc = Document::load_mem(&out).unwrap();
+        let Ok(Object::Array(items)) = base.get(b"ColorSpace") else {
+            panic!(
+                "expected the ICCBased array, got {:?}",
+                base.get(b"ColorSpace")
+            );
+        };
+        assert!(matches!(&items[0], Object::Name(n) if n == b"ICCBased"));
+        let profile = out_doc
+            .get_object(items[1].as_reference().unwrap())
+            .unwrap();
+        assert_eq!(
+            profile
+                .as_stream()
+                .unwrap()
+                .dict
+                .get(b"N")
+                .unwrap()
+                .as_i64()
+                .unwrap(),
+            3
+        );
+        assert_eq!(base_px, expand_and_resample(&indices, &palette, 400, 181));
+    }
+
+    #[test]
+    fn indexed_smask_pair_declines_unsupported_shapes() {
+        // Each case is ONE mutation of a fixture that does downsample (the
+        // control, asserted first so this test also fails on code that
+        // declines every /Indexed pair). Under each mutation the base AND
+        // mask must come back with their original geometry and bytes.
+        let palette = indexed_test_palette(16);
+        let indices = indexed_block_indices(400, 8, 16);
+        let rgb = || Object::Name(b"DeviceRGB".to_vec());
+        let control = build_pdf_smask_indexed(400, 100, rgb(), &palette, &indices, |_| {}, |_| {});
+        assert_eq!(
+            dict_wh(&indexed_pair_after(&optimize(&control)).0),
+            (181, 181),
+            "control must downsample"
+        );
+
+        let sep = Object::Array(vec![
+            Object::Name(b"Separation".to_vec()),
+            Object::Name(b"Spot".to_vec()),
+            Object::Name(b"DeviceCMYK".to_vec()),
+            Object::Dictionary(dictionary! {
+                "FunctionType" => 2_i64, "Domain" => vec![0.into(), 1.into()],
+                "C0" => vec![0.into(), 0.into(), 0.into(), 0.into()],
+                "C1" => vec![0.into(), 1.into(), 0.into(), 0.into()], "N" => 1_i64,
+            }),
+        ]);
+        let lab = Object::Array(vec![
+            Object::Name(b"Lab".to_vec()),
+            Object::Dictionary(dictionary! {
+                "WhitePoint" => vec![Object::Real(0.95), 1.into(), Object::Real(1.09)],
+            }),
+        ]);
+        let gray_palette: Vec<u8> = (0..16u8).map(|i| i * 16).collect();
+        let cmyk_palette: Vec<u8> = (0..64u8).map(|i| i * 4).collect();
+        type Mut = Box<dyn FnOnce(&mut lopdf::Dictionary)>;
+        let nop = || -> Mut { Box::new(|_| {}) };
+        // (label, base space, palette, indices, base dict hook, mask dict hook)
+        type DeclineCase = (&'static str, Object, Vec<u8>, Vec<u8>, Mut, Mut);
+        let cases: Vec<DeclineCase> = vec![
+            (
+                "Separation base",
+                sep,
+                gray_palette.clone(),
+                indices.clone(),
+                nop(),
+                nop(),
+            ),
+            (
+                "Lab base",
+                lab,
+                palette.clone(),
+                indices.clone(),
+                nop(),
+                nop(),
+            ),
+            (
+                "DeviceCMYK base",
+                Object::Name(b"DeviceCMYK".to_vec()),
+                cmyk_palette,
+                indices.clone(),
+                nop(),
+                nop(),
+            ),
+            (
+                "/Decode on the Indexed base",
+                rgb(),
+                palette.clone(),
+                indices.clone(),
+                Box::new(|d| d.set("Decode", vec![15.into(), 0.into()])),
+                nop(),
+            ),
+            (
+                "/Matte on the mask",
+                rgb(),
+                palette.clone(),
+                indices.clone(),
+                nop(),
+                Box::new(|d| d.set("Matte", vec![0.into(), 0.into(), 0.into()])),
+            ),
+            (
+                "index above hival",
+                rgb(),
+                palette.clone(),
+                indices
+                    .iter()
+                    .map(|&i| if i == 3 { 200 } else { i })
+                    .collect(),
+                nop(),
+                nop(),
+            ),
+            (
+                "lookup shorter than (hival+1)*channels",
+                rgb(),
+                palette.clone(),
+                indices.clone(),
+                Box::new(|d| {
+                    if let Ok(Object::Array(cs)) = d.get_mut(b"ColorSpace") {
+                        cs[2] = Object::Integer(16);
+                    }
+                }),
+                nop(),
+            ),
+        ];
+        for (label, base_cs, pal, idx, base_mut, mask_mut) in cases {
+            let pdf = build_pdf_smask_indexed(400, 100, base_cs, &pal, &idx, base_mut, mask_mut);
+            let (b0, bpx0, m0, mpx0) = indexed_pair_after(&pdf);
+            let (b1, bpx1, m1, mpx1) = indexed_pair_after(&optimize(&pdf));
+            assert_eq!(
+                dict_wh(&b1),
+                dict_wh(&b0),
+                "{label}: base geometry unchanged"
+            );
+            assert_eq!(
+                dict_wh(&m1),
+                dict_wh(&m0),
+                "{label}: mask geometry unchanged"
+            );
+            assert_eq!(bpx1, bpx0, "{label}: base samples unchanged");
+            assert_eq!(mpx1, mpx0, "{label}: mask samples unchanged");
+            assert_eq!(
+                b1.get(b"ColorSpace").ok(),
+                b0.get(b"ColorSpace").ok(),
+                "{label}: color space unchanged"
+            );
+        }
+    }
+
+    #[test]
+    fn indexed_smask_pair_is_idempotent() {
+        // Pass 2 sees an at-target pair (expanded or re-indexed) and must
+        // leave it byte-identical, with defaults and with lossy consent.
+        let palette = indexed_test_palette(16);
+        let indices = indexed_block_indices(400, 8, 16);
+        let single = build_pdf_smask_indexed(
+            400,
+            100,
+            Object::Name(b"DeviceRGB".to_vec()),
+            &[1, 2, 3],
+            &vec![0u8; 400 * 400],
+            |_| {},
+            |_| {},
+        );
+        let expanded = build_pdf_smask_indexed(
+            400,
+            100,
+            Object::Name(b"DeviceRGB".to_vec()),
+            &palette,
+            &indices,
+            |_| {},
+            |_| {},
+        );
+        // Photographic once expanded: the lossy lane ships the JPEG competitor
+        // (see `indexed_smask_lossy_jpeg_competitor_retags_the_color_space`).
+        let photo = build_pdf_smask_indexed(
+            400,
+            100,
+            Object::Name(b"DeviceRGB".to_vec()),
+            &flate_pixels(256, 1, 3),
+            &flate_pixels(400, 400, 1),
+            |_| {},
+            |_| {},
+        );
+        let lossy = OptimizeOptions::default().with_allow_lossy_reencode(true);
+        for (label, pdf) in [
+            ("single-color", &single),
+            ("expanded", &expanded),
+            ("photographic", &photo),
+        ] {
+            for options in [OptimizeOptions::default(), lossy] {
+                let once = optimize_with_options(pdf, options);
+                let twice = optimize_with_options(&once, options);
+                assert!(once.len() < pdf.len(), "{label}: pass 1 must shrink");
+                assert_eq!(once, twice, "{label}: pass 2 must be byte-identical");
+            }
+        }
+    }
+
+    #[test]
+    fn indexed_smask_lossy_jpeg_competitor_retags_the_color_space() {
+        // A 256-entry random palette under smooth-noise indices: photographic
+        // once expanded, so with --allow-lossy the JPEG competitor wins. A
+        // DCT payload under an /Indexed color space would be a corrupt
+        // image; the base must be retagged with the palette's base space.
+        let palette = flate_pixels(256, 1, 3);
+        let indices = flate_pixels(400, 400, 1);
+        let pdf = build_pdf_smask_indexed(
+            400,
+            100,
+            Object::Name(b"DeviceRGB".to_vec()),
+            &palette,
+            &indices,
+            |_| {},
+            |_| {},
+        );
+        let options = OptimizeOptions::default().with_allow_lossy_reencode(true);
+        let out = optimize_with_options(&pdf, options);
+        let doc = Document::load_mem(&out).unwrap();
+        let base = doc
+            .objects
+            .values()
+            .find_map(|o| match o {
+                Object::Stream(s) if s.dict.get(b"SMask").is_ok() => Some(s),
+                _ => None,
+            })
+            .unwrap();
+        assert!(
+            matches!(base.dict.get(b"Filter"), Ok(Object::Name(n)) if n == b"DCTDecode"),
+            "the JPEG competitor should win on photographic content"
+        );
+        assert!(
+            matches!(base.dict.get(b"ColorSpace"), Ok(Object::Name(n)) if n == b"DeviceRGB"),
+            "a JPEG base must carry the base space, never /Indexed"
+        );
+        assert_eq!(dict_wh(&base.dict), (181, 181));
+        let (decoded, is_gray) = decode_jpeg(&base.content, 181, 181).unwrap();
+        assert!(!is_gray);
+        assert_eq!((decoded.width(), decoded.height()), (181, 181));
+    }
+
+    #[test]
+    fn reindex_raster_requires_every_pixel_in_the_palette() {
+        let palette = [10, 20, 30, 40, 50, 60, 10, 20, 30];
+        assert_eq!(
+            reindex_raster(&[40, 50, 60, 10, 20, 30], &palette, 3),
+            Some(vec![1, 0]),
+            "duplicate entries map to the first occurrence"
+        );
+        assert_eq!(reindex_raster(&[40, 50, 61], &palette, 3), None);
+        assert_eq!(reindex_raster(&[7, 9], &[9, 7], 1), Some(vec![1, 0]));
     }
 }

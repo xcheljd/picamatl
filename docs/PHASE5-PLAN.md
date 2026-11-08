@@ -149,6 +149,25 @@ resampling for a class that does not occur in any observed document would be
 unmeasured complexity; if a palette-heavy corpus ever shows up, reopen with
 that corpus as the benchmark.
 
+**D-M4 REOPENED AND SHIPPED for soft-masked pairs** (2026-11-08): the
+17-file reference corpus does carry `/Indexed` inputs — 25 in the Talaria
+copy of the NASA report (23 with an `/SMask`), 58 masked pairs in
+nist-sp800-63b, 6 in nist-ssdf, 1 in census-brief (with a `/Decode`, so
+declined) — nearly all over an ICCBased N=3 base. Measured before building,
+default options: -150,624 B over the corpus (nist-ssdf -56,377,
+nasa -77,538, nist-sp800-63b -16,709). Design: expand the palette into the
+base space (exact for Gray/RGB/ICCBased N=1,3 — a lookup byte and an
+undecoded 8-bit base sample denote the same value), Lanczos3-resample, then
+ship the smallest verified candidate: re-indexed into the original palette
+(only when every resampled pixel is exactly an entry), the base-space raster,
+or under `allow_lossy_reencode` a JPEG of it. The mask follows the D-M3
+rules unchanged. Nearest-palette or box-majority index resampling was
+rejected: the large NASA palette images that still decline (the expanded
+raster at target is larger than the palette original) are line plots and
+color-contour plots with axis text, isolines and 1-px traces that such a
+resampler breaks or drops. Unmasked `/Indexed` images remain
+untouched.
+
 Where the remaining gap to Ghostscript actually lives (picamatl 5.55 MB output
 census): FlateDecode images 2.54 MB (122 streams, already at 130 DPI,
 lossless-by-contract) + JPEG 2.12 MB + fonts/structure 0.64 MB. GS's edge is

@@ -637,10 +637,12 @@ downsampled in place with the format and color space preserved.
 
 **Soft-masked images are handled, not skipped.** An over-resolution base and
 its `/SMask` are downsampled as an atomic pair to the same target geometry —
-both replaced or neither — for JPEG bases (D-M2) and Flate bases (D-M3). A
+both replaced or neither — for JPEG bases (D-M2) and Flate bases (D-M3),
+including 8-bit palette (`/Indexed`) Flate bases (D-M4), whose palette is
+expanded before resampling so no in-between index is ever invented. A
 masked JPEG pair already at or below the target instead takes the
 dimension-preserving requantization (D-M1): the base is re-encoded at its own
-dimensions and the mask is not touched at all. All three require the mask to
+dimensions and the mask is not touched at all. All of them require the mask to
 be a plain 8-bit DeviceGray image stream with no `/Matte`, and a mask shared
 by more than one base is never resized. `/Mask` (stencil/color-key) images and
 ineligible `/SMask`s stay untouched.
@@ -652,8 +654,9 @@ EOL-framed G3) and 1-bit images stored as Flate. **`JPXDecode` (JPEG 2000)**
 streams are converted to `DCTDecode` under `--allow-lossy`, via a pure-Rust
 decoder; any header or decode failure leaves the stream byte-identical.
 
-What stays untouched, deliberately: Flate images that are Indexed, 1/2/4/16-bit,
-`/Decode`-remapped, or TIFF-predicted; and **JBIG2 in either direction** — not a
+What stays untouched, deliberately: Flate images that are Indexed (other
+than the soft-masked pairs above), 1/2/4/16-bit, `/Decode`-remapped, or
+TIFF-predicted; and **JBIG2 in either direction** — not a
 roadmap gap but the standing commitment above, since symbol-mode JBIG2 is the
 encoding behind the Xerox character-substitution scandal and picamatl restricts
 bitonal work to encodings verifiable by exact decode-back.

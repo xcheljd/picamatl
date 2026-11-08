@@ -9,7 +9,9 @@
 use lopdf::Document;
 
 use crate::cmyk::decode_cmyk_jpeg_scaled;
-use crate::{decode_flate_image, decode_jpeg, jpeg_route, FilterClass, JpegRoute};
+use crate::{
+    decode_flate_image, decode_indexed_flate_image, decode_jpeg, jpeg_route, FilterClass, JpegRoute,
+};
 
 /// Metrics behind the line-art guard, computed in a single pass over decoded
 /// 8-bit samples. See [`looks_like_line_art`] for the thresholds and the
@@ -220,8 +222,14 @@ fn figure_metrics_source(
         },
         // `decode_flate_image` already guarantees the buffer is exactly
         // `px_w * px_h * channels` bytes, so the dict geometry is the truth here.
+        // An `/Indexed` base (D-M4) is classified on its palette-expanded
+        // pixels — the colors a viewer paints, exactly the raster the coupled
+        // downsample resamples.
         FilterClass::FlateOnly => {
-            let (img, channels) = decode_flate_image(doc, stream, px_w, px_h)?;
+            let (img, channels) = decode_flate_image(doc, stream, px_w, px_h).or_else(|| {
+                decode_indexed_flate_image(doc, stream, px_w, px_h)
+                    .map(|i| (i.expanded, i.channels))
+            })?;
             let pixels = if channels == 1 {
                 img.to_luma8().into_raw()
             } else {
@@ -453,6 +461,60 @@ pub(crate) mod tests {
             .map(|(id, _)| *id)
             .expect("an image stream");
         (doc, id)
+    }
+
+    #[test]
+    fn figure_dpi_classifies_indexed_flate_images_on_their_expanded_pixels() {
+        // A chart stored as an 8-bit `/Indexed` FlateDecode image must classify
+        // exactly as the same pixels stored as DeviceRGB: the classifier sees
+        // the palette-expanded raster, not the raw indices. Quantizing to the
+        // top of each 5-bit bucket keeps every metric bucket unchanged while
+        // bringing the color count under 256.
+        use lopdf::dictionary;
+        let (w, h) = (200u32, 200u32);
+        let rgb: Vec<u8> = chart_pixels(w, h).iter().map(|v| v | 7).collect();
+        let mut palette: Vec<[u8; 3]> = Vec::new();
+        let mut indices = Vec::with_capacity((w * h) as usize);
+        for px in rgb.chunks_exact(3) {
+            let c = [px[0], px[1], px[2]];
+            let i = palette.iter().position(|p| *p == c).unwrap_or_else(|| {
+                palette.push(c);
+                palette.len() - 1
+            });
+            indices.push(u8::try_from(i).expect("chart fixture must fit a palette"));
+        }
+        let lookup: Vec<u8> = palette.iter().flatten().copied().collect();
+        let mut doc = Document::with_version("1.5");
+        let image = |cs: Object, data: &[u8]| {
+            Stream::new(
+                dictionary! {
+                    "Type" => "XObject", "Subtype" => "Image",
+                    "Width" => i64::from(w), "Height" => i64::from(h),
+                    "ColorSpace" => cs, "BitsPerComponent" => 8_i64,
+                    "Filter" => "FlateDecode",
+                },
+                crate::deflate::deflate_level9(data).unwrap(),
+            )
+        };
+        let indexed = image(
+            Object::Array(vec![
+                Object::Name(b"Indexed".to_vec()),
+                Object::Name(b"DeviceRGB".to_vec()),
+                Object::Integer(palette.len() as i64 - 1),
+                Object::String(lookup, lopdf::StringFormat::Hexadecimal),
+            ]),
+            &indices,
+        );
+        let direct = image(Object::Name(b"DeviceRGB".to_vec()), &rgb);
+        let rgb_verdict = image_is_figure_like(&doc, &direct, &FilterClass::FlateOnly, w, h);
+        assert!(rgb_verdict, "control: the RGB chart is figure-like");
+        let id = doc.add_object(indexed);
+        let stream = doc.get_object(id).unwrap().as_stream().unwrap();
+        assert_eq!(
+            image_is_figure_like(&doc, stream, &FilterClass::FlateOnly, w, h),
+            rgb_verdict,
+            "an /Indexed chart classifies like its expanded pixels"
+        );
     }
 
     #[test]
