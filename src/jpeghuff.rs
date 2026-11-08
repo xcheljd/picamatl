@@ -1080,6 +1080,59 @@ fn rebuild_with(p: &Parsed, gen: fn(&[u64; 256]) -> Option<EncodeTable>) -> Opti
     Some(out)
 }
 
+/// Peak heap bytes per input byte of one [`optimize`] call, upper bound.
+/// Each entropy-coded byte decodes to at most 8 tokens (codes are >= 1 bit)
+/// of 8 bytes, held twice (the parse and the verification re-parse) plus
+/// vector growth slack. Measured: 27-55x on real JPEGs, 66x on a synthetic
+/// worst case (one 1-bit code per symbol).
+const PEAK_BYTES_PER_INPUT_BYTE: usize = 72;
+
+/// Upper bound on the heap one [`optimize`] call needs for `data`, read from
+/// the headers only (nothing is decoded): the token state scales with the
+/// entropy-coded bytes, and a progressive frame adds 8 bytes of coefficient
+/// state per block, sized from the frame header and held twice. Used to
+/// schedule concurrent calls against a memory budget.
+pub(crate) fn memory_estimate(data: &[u8]) -> usize {
+    let tokens = data.len().saturating_mul(PEAK_BYTES_PER_INPUT_BYTE);
+    tokens.saturating_add(progressive_state_bytes(data).unwrap_or(0))
+}
+
+/// `16 * blocks` for a progressive frame (see [`memory_estimate`]), capped by
+/// [`MAX_FRAME_BLOCKS`] like [`parse`]; `None` when there is no readable
+/// progressive frame header.
+fn progressive_state_bytes(data: &[u8]) -> Option<usize> {
+    if data.get(..2)? != [0xFF, 0xD8] {
+        return None;
+    }
+    let mut i = 2usize;
+    loop {
+        if *data.get(i)? != 0xFF {
+            return None;
+        }
+        let mut j = i + 1;
+        while *data.get(j)? == 0xFF {
+            j += 1;
+        }
+        let m = data[j];
+        let seg = j + 1;
+        let len = usize::from(u16::from_be_bytes([*data.get(seg)?, *data.get(seg + 1)?]));
+        match m {
+            0xC2 => {
+                let p = data.get(seg + 2..seg + len)?;
+                let y = usize::from(u16::from_be_bytes([*p.get(1)?, *p.get(2)?]));
+                let x = usize::from(u16::from_be_bytes([*p.get(3)?, *p.get(4)?]));
+                let nf = usize::from(*p.get(5)?);
+                // Every component at full resolution is the largest grid a
+                // header can declare; exact sampling is not needed for a bound.
+                let blocks = x.div_ceil(8).checked_mul(y.div_ceil(8))?.checked_mul(nf)?;
+                return blocks.min(MAX_FRAME_BLOCKS).checked_mul(16);
+            }
+            0xC0 | 0xC1 | 0xDA | 0xD9 => return None,
+            _ => i = seg.checked_add(len)?,
+        }
+    }
+}
+
 /// Rebuild `data`'s Huffman tables from its own symbol statistics.
 ///
 /// Returns the smaller, coefficient-identical stream, or `None` to mean

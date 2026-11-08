@@ -33,6 +33,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **TrueType table parsing bounds the bytes it copies by the font's size**,
   so a table directory that names one range 65535 times no longer copies it
   65535 times.
+- **The lossless JPEG table rewrite runs under a 1 GiB memory budget.**
+  Every JPEG was re-tabled at once, each needing up to ~72× its size, so a
+  32 MB PDF of eight photos peaked at 2.2 GB. JPEGs now run in parallel
+  batches that fit the budget (877 MiB peak on the same file, output
+  byte-identical). Nothing is skipped: a JPEG too large for the budget on
+  its own runs by itself.
 - **Type1 → CFF conversion no longer copies a subroutine on every call.**
   `callsubr` cloned the whole subroutine each time, so a large subroutine
   that returns immediately, called up to the per-glyph token budget, meant

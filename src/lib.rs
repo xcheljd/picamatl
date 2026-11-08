@@ -4127,6 +4127,37 @@ fn strip_stale_xref_trailer_keys(doc: &mut Document) {
 /// `inflate_capped` enforces everywhere else in the crate.
 const MAX_REDEFLATE_BYTES: usize = 128 * 1024 * 1024;
 
+/// Memory budget for concurrent lossless JPEG re-tabling. Each call needs up
+/// to ~72x its JPEG's size (see `jpeghuff::memory_estimate`); running every
+/// JPEG at once peaked at 2 GB on a 32 MB PDF of eight photos. Within the
+/// budget the work still runs in parallel; past it, JPEGs wait for a later
+/// batch. Nothing is skipped: a single JPEG whose estimate alone exceeds the
+/// budget runs in a batch by itself.
+const JPEG_REWRITE_BUDGET: usize = 1 << 30;
+
+/// Split `items` into batches whose summed `cost` stays within `budget`
+/// (first-fit, largest first). An item costing more than the whole budget
+/// gets a batch of its own — it is never dropped. Batches only change WHEN
+/// work runs, never WHAT it computes, so output bytes are unaffected.
+fn budget_batches<T>(mut items: Vec<T>, budget: usize, cost: impl Fn(&T) -> usize) -> Vec<Vec<T>> {
+    let mut costed: Vec<(usize, T)> = items.drain(..).map(|t| (cost(&t), t)).collect();
+    costed.sort_by_key(|c| std::cmp::Reverse(c.0));
+    let mut batches: Vec<(usize, Vec<T>)> = Vec::new();
+    for (c, item) in costed {
+        match batches
+            .iter_mut()
+            .find(|(used, _)| used.saturating_add(c) <= budget)
+        {
+            Some((used, batch)) => {
+                *used += c;
+                batch.push(item);
+            }
+            None => batches.push((c, vec![item])),
+        }
+    }
+    batches.into_iter().map(|(_, b)| b).collect()
+}
+
 /// Re-optimize the Huffman tables of every raw `/DCTDecode` payload in the
 /// document. Returns true when at least one stream was replaced — the answer
 /// `try_optimize` needs for a document nothing else qualified to touch, where
@@ -4149,8 +4180,9 @@ fn reoptimize_jpeg_streams(doc: &mut Document) -> bool {
     }
 
     // Collect first (classification resolves references against the immutable
-    // document), then do the entropy work off-document, in parallel.
-    let candidates: Vec<(ObjectId, Vec<u8>)> = doc
+    // document), then do the entropy work off-document, in parallel batches
+    // that fit the memory budget.
+    let candidates: Vec<(ObjectId, &[u8])> = doc
         .objects
         .iter()
         .filter_map(|(&id, obj)| {
@@ -4159,14 +4191,20 @@ fn reoptimize_jpeg_streams(doc: &mut Document) -> bool {
             };
             let filter = stream.dict.get(b"Filter").ok()?;
             matches!(classify_filter(doc, filter), FilterClass::DctOnly)
-                .then(|| (id, stream.content.clone()))
+                .then_some((id, stream.content.as_slice()))
         })
         .collect();
 
-    let shrunk: Vec<(ObjectId, Vec<u8>)> = candidates
-        .into_par_iter()
-        .filter_map(|(id, content)| jpeghuff::optimize(&content).map(|out| (id, out)))
-        .collect();
+    let mut shrunk: Vec<(ObjectId, Vec<u8>)> = Vec::new();
+    for batch in budget_batches(candidates, JPEG_REWRITE_BUDGET, |(_, data)| {
+        jpeghuff::memory_estimate(data)
+    }) {
+        let done: Vec<(ObjectId, Vec<u8>)> = batch
+            .into_par_iter()
+            .filter_map(|(id, data)| jpeghuff::optimize(data).map(|out| (id, out)))
+            .collect();
+        shrunk.extend(done);
+    }
 
     let mut changed = false;
     for (id, content) in shrunk {
@@ -8930,6 +8968,41 @@ mod tests {
             let out = optimize_with_options(&pdf, OptimizeOptions::default());
             assert_eq!(out, pdf, "{label} bomb must leave the file untouched");
         }
+    }
+
+    #[test]
+    fn budget_batches_never_drop_and_never_exceed_unless_alone() {
+        let costs = vec![900usize, 50, 400, 2_000, 600, 1, 300, 1_000];
+        let batches = budget_batches(costs.clone(), 1_000, |c| *c);
+        let mut seen: Vec<usize> = batches.iter().flatten().copied().collect();
+        seen.sort_unstable();
+        let mut want = costs;
+        want.sort_unstable();
+        assert_eq!(seen, want, "every item lands in exactly one batch");
+        for b in &batches {
+            let sum: usize = b.iter().sum();
+            assert!(
+                sum <= 1_000 || b.len() == 1,
+                "over budget only when alone: {b:?}"
+            );
+        }
+        assert!(
+            batches.iter().any(|b| b == &vec![2_000]),
+            "the oversized item runs alone"
+        );
+    }
+
+    /// Eight 4 MiB JPEGs: unbudgeted they all ran at once (2 GB peak); the
+    /// estimate puts each near 288 MiB, so the 1 GiB budget runs them in
+    /// batches of three.
+    #[test]
+    fn jpeg_budget_batches_large_photos() {
+        let sizes = vec![4usize << 20; 8];
+        let batches = budget_batches(sizes, JPEG_REWRITE_BUDGET, |n| n * 72);
+        assert_eq!(
+            batches.iter().map(Vec::len).collect::<Vec<_>>(),
+            vec![3, 3, 2]
+        );
     }
 
     /// `--collapse-gray-images` over a zero-width RGB image with an empty
