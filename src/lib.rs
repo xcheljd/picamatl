@@ -139,7 +139,7 @@ use lopdf::content::Content;
 use lopdf::{dictionary, Document, Object, ObjectId};
 use rayon::prelude::*;
 
-use classify::{image_is_figure_like, looks_like_line_art};
+use classify::{image_is_figure_like, looks_like_line_art, mask_carries_flat_ink};
 use cmyk::{jpeg_component_count, jpeg_frame_info, plan_dct_cmyk};
 use deflate::{deflate_backend, deflate_level9, inflate_capped, png_defilter, png_up_filter};
 use serialize::save_document;
@@ -2479,6 +2479,10 @@ fn reindex_raster(raw: &[u8], palette: &[u8], channels: usize) -> Option<Vec<u8>
 /// The mask half is the unchanged [`plan_mask_resample`] raster at the same
 /// target geometry, and the pair is judged by the same combined
 /// [`pair_savings_declined`] guard as every other coupled downsample.
+///
+/// Text drawn as an image — one flat ink color whose letter shapes live in
+/// the `/SMask` ([`mask_carries_flat_ink`]) — is left at full resolution:
+/// resampling the mask would soften the glyphs next to real text.
 fn plan_indexed_smask_pair_downsample(
     doc: &Document,
     id: ObjectId,
@@ -2495,6 +2499,13 @@ fn plan_indexed_smask_pair_downsample(
     } = geom;
     let indexed = decode_indexed_flate_image(doc, base_stream, px_w, px_h)?;
     let channels = indexed.channels;
+    // The mask is read at the base's geometry, as `plan_mask_resample` reads
+    // it; a mask that cannot be read that way leaves the pair untouched.
+    let mask_stream = doc.get_object(mask_id).ok()?.as_stream().ok()?;
+    let mask_px = inflate_image_samples(mask_stream, 1, px_w, px_h)?;
+    if mask_carries_flat_ink(indexed.expanded.as_bytes(), channels, &mask_px, px_w, px_h) {
+        return None;
+    }
     let resized =
         indexed
             .expanded
@@ -2549,7 +2560,6 @@ fn plan_indexed_smask_pair_downsample(
         }
     }
 
-    let mask_stream = doc.get_object(mask_id).ok()?.as_stream().ok()?;
     let mask_out = plan_mask_resample(doc, mask_stream, geom)?;
 
     // NO COMPOUNDING LOSSES (see `plan_flate_smask_pair_downsample`): the JPEG
@@ -9934,6 +9944,135 @@ mod tests {
         )
     }
 
+    /// [`build_pdf_smask_indexed`] over a caller-chosen mask: a 400-px
+    /// DeviceRGB-palette base drawn into 100 pt (target 181 px).
+    fn build_pdf_indexed_rgb_pair(palette: &[u8], indices: &[u8], mask: &[u8]) -> Vec<u8> {
+        build_pdf_indexed_rgb_pair_at(100, palette, indices, mask)
+    }
+
+    /// The same, drawn into `draw_pts`.
+    fn build_pdf_indexed_rgb_pair_at(
+        draw_pts: i64,
+        palette: &[u8],
+        indices: &[u8],
+        mask: &[u8],
+    ) -> Vec<u8> {
+        let cs = Object::Array(vec![
+            Object::Name(b"Indexed".to_vec()),
+            Object::Name(b"DeviceRGB".to_vec()),
+            Object::Integer((palette.len() / 3) as i64 - 1),
+            Object::String(palette.to_vec(), lopdf::StringFormat::Hexadecimal),
+        ]);
+        let set_cs = |d: &mut lopdf::Dictionary| d.set("ColorSpace", cs);
+        build_pdf_smask_flate_ext(400, draw_pts, indices, mask, set_cs, |_| {})
+    }
+
+    /// A smooth horizontal 0→255 ramp: no sharp transition anywhere.
+    fn ramp_mask(px: u32) -> Vec<u8> {
+        (0..px * px)
+            .map(|i| ((i % px) * 255 / (px - 1)) as u8)
+            .collect()
+    }
+
+    /// Anti-aliased "lettering": 8-px-wide rings ("o"s, radius 18) on a 50-px
+    /// grid over a transparent field — mostly 0/255 with a thin fringe, every
+    /// row different, like a rasterized heading.
+    fn glyph_mask(px: u32) -> Vec<u8> {
+        (0..px * px)
+            .map(|i| {
+                let (x, y) = (i % px, i / px);
+                // Per-tile radius and offset, so no two tiles repeat.
+                let tile = (x / 50) * 7 + (y / 50) * 13;
+                let (r, off) = (f64::from(12 + tile % 9), f64::from(tile % 7));
+                let (x, y) = (f64::from(x % 50), f64::from(y % 50));
+                let ring = ((x - 22.0 - off).hypot(y - 25.0 + off) - r).abs();
+                ((4.0 - ring) * 128.0 + 128.0).clamp(0.0, 255.0) as u8
+            })
+            .collect()
+    }
+
+    /// The masked base and its mask, as raw streams, from a PDF.
+    fn indexed_pair_streams(pdf: &[u8]) -> (lopdf::Stream, lopdf::Stream) {
+        let doc = Document::load_mem(pdf).unwrap();
+        let base = doc
+            .objects
+            .values()
+            .find_map(|o| match o {
+                Object::Stream(s) if s.dict.get(b"SMask").is_ok() => Some(s.clone()),
+                _ => None,
+            })
+            .expect("no smask-carrying image found");
+        let mask_id = base.dict.get(b"SMask").unwrap().as_reference().unwrap();
+        let mask = doc
+            .get_object(mask_id)
+            .unwrap()
+            .as_stream()
+            .unwrap()
+            .clone();
+        (base, mask)
+    }
+
+    #[test]
+    fn indexed_smask_text_drawn_as_an_image_stays_at_full_resolution() {
+        // The nist-ssdf headings and nist-sp800-63b section numbers: one flat
+        // ink color whose letters live in a hard-edged /SMask. Downsampling
+        // softens them next to real text, so the pair must ship untouched.
+        //
+        // Controls first, at the same geometry, so this also fails on code
+        // that declines every /Indexed pair: a multi-color figure and a
+        // one-color base under a SMOOTH mask (a soft shadow) still downsample.
+        let glyphs = glyph_mask(400);
+        let figure = build_pdf_indexed_rgb_pair(
+            &indexed_test_palette(16),
+            &indexed_block_indices(400, 8, 16),
+            &flate_pixels(400, 400, 1),
+        );
+        let shadow = build_pdf_indexed_rgb_pair(&[0, 0, 0], &vec![0u8; 400 * 400], &ramp_mask(400));
+        for (label, pdf) in [("figure", &figure), ("soft shadow", &shadow)] {
+            assert_eq!(
+                dict_wh(&indexed_pair_streams(&optimize(pdf)).0.dict),
+                (181, 181),
+                "control {label} must still downsample"
+            );
+        }
+
+        // Black text (a one-entry palette, nist-ssdf objs 26/28/30, every
+        // nist-sp800-63b pair) and white text on a palette that also holds
+        // near-white and an unpainted black (nist-ssdf objs 100/105/113).
+        let white_indices: Vec<u8> = glyphs
+            .iter()
+            .enumerate()
+            .map(|(i, &a)| match (a, i % 7) {
+                (0, _) => 2,
+                (_, 0) => 1,
+                _ => 0,
+            })
+            .collect();
+        let cases = [
+            ("black text", vec![0, 0, 0], vec![0u8; 400 * 400]),
+            (
+                "white text",
+                vec![255, 255, 255, 254, 254, 254, 0, 0, 0],
+                white_indices,
+            ),
+        ];
+        for (label, palette, indices) in cases {
+            // 400 px into 30 pt = 960 ppi, the heading's over-resolution.
+            let pdf = build_pdf_indexed_rgb_pair_at(30, &palette, &indices, &glyphs);
+            let (base0, mask0) = indexed_pair_streams(&pdf);
+            let (base1, mask1) = indexed_pair_streams(&optimize(&pdf));
+            assert_eq!(dict_wh(&base1.dict), (400, 400), "{label}: base geometry");
+            assert_eq!(dict_wh(&mask1.dict), (400, 400), "{label}: mask geometry");
+            assert_eq!(base1.content, base0.content, "{label}: base bytes");
+            assert_eq!(mask1.content, mask0.content, "{label}: mask bytes");
+            assert_eq!(
+                base1.dict.get(b"ColorSpace").ok(),
+                base0.dict.get(b"ColorSpace").ok(),
+                "{label}: color space"
+            );
+        }
+    }
+
     /// The masked base's dict and decoded (inflated + defiltered) samples,
     /// plus the mask's dict and decoded samples, from an output PDF.
     fn indexed_pair_after(pdf: &[u8]) -> (lopdf::Dictionary, Vec<u8>, lopdf::Dictionary, Vec<u8>) {
@@ -10032,20 +10171,13 @@ mod tests {
 
     #[test]
     fn indexed_smask_single_color_base_reindexes_into_its_palette() {
-        // The nist-ssdf shape: a one-entry palette (hival 0). Every resampled
-        // pixel is that entry, so the base stays /Indexed with the SAME color
-        // space and an all-zero index raster at the target geometry.
+        // A one-entry palette (hival 0) under a SMOOTH mask — a feathered
+        // one-color shadow, not text (`mask_carries_flat_ink` lets it
+        // through). Every resampled pixel is that entry, so the base stays
+        // /Indexed with the SAME color space and an all-zero index raster.
         let palette = vec![0x20, 0x40, 0x80];
         let indices = vec![0u8; 400 * 400];
-        let pdf = build_pdf_smask_indexed(
-            400,
-            100,
-            Object::Name(b"DeviceRGB".to_vec()),
-            &palette,
-            &indices,
-            |_| {},
-            |_| {},
-        );
+        let pdf = build_pdf_indexed_rgb_pair(&palette, &indices, &ramp_mask(400));
         let before = Document::load_mem(&pdf).unwrap();
         let cs_before = before
             .objects
@@ -10279,15 +10411,7 @@ mod tests {
         // leave it byte-identical, with defaults and with lossy consent.
         let palette = indexed_test_palette(16);
         let indices = indexed_block_indices(400, 8, 16);
-        let single = build_pdf_smask_indexed(
-            400,
-            100,
-            Object::Name(b"DeviceRGB".to_vec()),
-            &[1, 2, 3],
-            &vec![0u8; 400 * 400],
-            |_| {},
-            |_| {},
-        );
+        let single = build_pdf_indexed_rgb_pair(&[1, 2, 3], &vec![0u8; 400 * 400], &ramp_mask(400));
         let expanded = build_pdf_smask_indexed(
             400,
             100,

@@ -114,10 +114,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with `--allow-lossy`, a JPEG competes too. Indices are never interpolated,
   every candidate is decoded back before it ships, and the pair is still
   replaced only when it saves at least 5%. Other base spaces, a `/Decode`
-  array, or a `/Matte` mask leave the pair untouched, as before. Over the
-  17-file corpus, default outputs shrink by 150,624 B (nist-ssdf 10.1%,
-  nasa 1.7%, nist-sp800-63b 1.9%), and by 142,858 B with every lossy and
-  strip flag on; every other file's output is byte-identical. The
+  array, or a `/Matte` mask leave the pair untouched, as before. Text drawn
+  as an image — one flat color whose letter shapes live in a hard-edged
+  mask, like the nist-ssdf appendix headings and the nist-sp800-63b section
+  numbers — also stays at full resolution, so it stays as crisp as the real
+  text around it. Over the 17-file corpus, default outputs shrink by
+  77,538 B (all in nasa, 1.7%), and by 74,913 B with every lossy and strip
+  flag on; every other file's output is byte-identical. The
   `--figure-dpi` classifier now reads these images through their palette
   as well.
 - **The cross-reference stream is written with a PNG Up predictor** when

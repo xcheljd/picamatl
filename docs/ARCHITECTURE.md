@@ -128,7 +128,9 @@ they are one pipeline, and the pass ordering above is the reason.
   Flate base: the palette is expanded into its base space — Gray/RGB/ICCBased
   N=1,3 only — then resampled; indices are never interpolated, and the base
   is re-indexed into its own palette only when every resampled pixel is
-  exactly an entry), P-M1 (shared-mask refcount guard — a
+  exactly an entry; text drawn as an image — one flat painted color under a
+  hard-edged mask, `classify::mask_carries_flat_ink` — is left untouched),
+  P-M1 (shared-mask refcount guard — a
   shared mask is never resized). The mask always follows the base's target
   geometry.
 - **`--figure-dpi`** (2026-08-26): heuristic text/chart-aware DPI. Classifier:

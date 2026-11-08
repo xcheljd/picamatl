@@ -639,7 +639,9 @@ downsampled in place with the format and color space preserved.
 its `/SMask` are downsampled as an atomic pair to the same target geometry —
 both replaced or neither — for JPEG bases (D-M2) and Flate bases (D-M3),
 including 8-bit palette (`/Indexed`) Flate bases (D-M4), whose palette is
-expanded before resampling so no in-between index is ever invented. A
+expanded before resampling so no in-between index is ever invented (a
+palette pair that is text drawn as an image — one flat color, letter shapes
+in a hard-edged mask — stays at full resolution). A
 masked JPEG pair already at or below the target instead takes the
 dimension-preserving requantization (D-M1): the base is re-encoded at its own
 dimensions and the mask is not touched at all. All of them require the mask to

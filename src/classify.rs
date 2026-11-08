@@ -295,6 +295,69 @@ pub(crate) fn image_is_figure_like(
         && m.edges >= FIGURE_MIN_EDGES
 }
 
+/// Largest per-channel spread (max − min sample) that still counts as ONE
+/// flat ink color. 8 absorbs the 254/255 near-white pair the nist-ssdf
+/// white headings carry; a figure's palette spans far more.
+const FLAT_INK_MAX_SPREAD: u8 = 8;
+
+/// The D-M4 text guard: is this soft-masked pair TEXT DRAWN AS AN IMAGE —
+/// one flat ink color whose shapes live entirely in the `/SMask`? Such a
+/// pair is left at full resolution, because downsampling the mask turns
+/// crisp letters soft next to real text, and `--figure-dpi` cannot rescue
+/// them (the shape is in the mask, not the base it classifies).
+///
+/// `base` is the palette-expanded base and `mask` the 8-bit mask, both
+/// `w * h` pixels (`channels` samples per base pixel). The rule has two
+/// parts, and only both together say "text":
+///
+/// - the mask carries hard shapes: [`line_art_metrics`] finds at least one
+///   sharp transition (`edges > 0`, a step above `EDGE_STEP`). A constant or
+///   smoothly varying mask (opaque figures, feathered vignettes, soft
+///   shadows) has none, so the shape is in the base and the pair proceeds;
+/// - the base, where the mask paints it (alpha ≥ 128), is one flat color:
+///   every channel's spread is at most [`FLAT_INK_MAX_SPREAD`]. A pair with
+///   no such pixel at all counts as flat too.
+///
+/// Conservative by construction — any doubt keeps the full resolution: a
+/// buffer shorter than its geometry answers `true`, and the edge gate is the
+/// loosest one possible. Measured on the 17-file corpus (2026-11-08): every
+/// nist-ssdf heading (6 pairs, 1315-1317 x 188-190, mask edges 0.040-0.042)
+/// and nist-sp800-63b section number (58 pairs, 60-95 x 38-41, mask edges
+/// 0.144-0.247) paints one color (black, or white/254-white) through a
+/// hard-edged mask -> kept; all 23 NASA pairs (mostly 15-256-color plots)
+/// sit under a constant opaque mask (edges 0) -> handled as before.
+pub(crate) fn mask_carries_flat_ink(
+    base: &[u8],
+    channels: usize,
+    mask: &[u8],
+    w: u32,
+    h: u32,
+) -> bool {
+    let px = (w as usize).saturating_mul(h as usize);
+    if !(1..=METRICS_MAX_CHANNELS).contains(&channels)
+        || mask.len() < px
+        || base.len() < px.saturating_mul(channels)
+    {
+        return true;
+    }
+    if line_art_metrics(mask, 1, w, h).edges <= 0.0 {
+        return false;
+    }
+    let mut lo = [u8::MAX; METRICS_MAX_CHANNELS];
+    let mut hi = [u8::MIN; METRICS_MAX_CHANNELS];
+    for (color, _) in base
+        .chunks_exact(channels)
+        .zip(mask)
+        .filter(|(_, &alpha)| alpha >= 128)
+    {
+        for (c, &s) in color.iter().enumerate() {
+            lo[c] = lo[c].min(s);
+            hi[c] = hi[c].max(s);
+        }
+    }
+    (0..channels).all(|c| hi[c].saturating_sub(lo[c]) <= FLAT_INK_MAX_SPREAD)
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -461,6 +524,58 @@ pub(crate) mod tests {
             .map(|(id, _)| *id)
             .expect("an image stream");
         (doc, id)
+    }
+
+    #[test]
+    fn mask_carries_flat_ink_needs_a_hard_mask_over_one_painted_color() {
+        let (w, h) = (8u32, 8u32);
+        // Columns 0-3 opaque, 4-7 transparent: one hard edge per row.
+        let hard: Vec<u8> = (0..64).map(|i| if i % 8 < 4 { 255 } else { 0 }).collect();
+        let black = vec![0u8; 64 * 3];
+        assert!(
+            mask_carries_flat_ink(&black, 3, &hard, w, h),
+            "one ink color through a hard mask"
+        );
+        assert!(
+            !mask_carries_flat_ink(&black, 3, &[255; 64], w, h),
+            "a constant mask: the shape lives in the base"
+        );
+        let smooth: Vec<u8> = (0..64).map(|i| (i % 8 * 30) as u8).collect();
+        assert!(
+            !mask_carries_flat_ink(&black, 3, &smooth, w, h),
+            "steps of 30 stay under EDGE_STEP: a soft mask"
+        );
+        // Spread is measured only where alpha >= 128, inclusive at 8.
+        let mut base = vec![200u8; 64 * 3];
+        base[0] = 200 + FLAT_INK_MAX_SPREAD;
+        base[4 * 3] = 0; // pixel 4 is transparent: ignored
+        assert!(
+            mask_carries_flat_ink(&base, 3, &hard, w, h),
+            "spread 8 is flat"
+        );
+        base[0] += 1;
+        assert!(
+            !mask_carries_flat_ink(&base, 3, &hard, w, h),
+            "spread 9 is not"
+        );
+        // A gray base works the same way.
+        assert!(mask_carries_flat_ink(&[9; 64], 1, &hard, w, h));
+        // No painted pixel at all, but a sharp edge (0 -> 127): vacuously flat.
+        let faint: Vec<u8> = (0..64).map(|i| if i % 2 == 0 { 127 } else { 0 }).collect();
+        assert!(mask_carries_flat_ink(&base, 3, &faint, w, h));
+        // Any doubt keeps the full resolution.
+        assert!(
+            mask_carries_flat_ink(&black[..10], 3, &hard, w, h),
+            "short base"
+        );
+        assert!(
+            mask_carries_flat_ink(&black, 3, &hard[..10], w, h),
+            "short mask"
+        );
+        assert!(
+            mask_carries_flat_ink(&[0; 64 * 5], 5, &hard, w, h),
+            "5 channels"
+        );
     }
 
     #[test]

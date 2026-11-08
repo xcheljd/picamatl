@@ -168,6 +168,20 @@ color-contour plots with axis text, isolines and 1-px traces that such a
 resampler breaks or drops. Unmasked `/Indexed` images remain
 untouched.
 
+**Text guard** (2026-11-08, after visual review): most of that first
+measurement was TEXT DRAWN AS IMAGES — the nist-ssdf appendix headings
+(1200 ppi) and the nist-sp800-63b section numbers paint one flat color
+(black, or white/254-white) through a hard-edged `/SMask` that carries the
+letter shapes, and at 130 DPI they turned visibly soft next to real text.
+`classify::mask_carries_flat_ink` now leaves such a pair untouched: the mask
+has at least one sharp transition AND the base, where the mask paints it
+(alpha >= 128), spans at most 8 levels per channel. Every NASA pair sits
+under a constant opaque mask and is unaffected. Re-measured vs a845c0d:
+defaults -77,538 B (nasa only), kitchen -74,913 B; nist-ssdf and
+nist-sp800-63b are byte-identical to before D-M4. `--figure-dpi` was not
+taught to read the mask: a pair whose shape lives in its mask is exactly
+what the guard now keeps at full resolution, so the follow-up is moot.
+
 Where the remaining gap to Ghostscript actually lives (picamatl 5.55 MB output
 census): FlateDecode images 2.54 MB (122 streams, already at 130 DPI,
 lossless-by-contract) + JPEG 2.12 MB + fonts/structure 0.64 MB. GS's edge is
