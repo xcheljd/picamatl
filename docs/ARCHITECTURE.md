@@ -82,7 +82,9 @@ Executed in this order; each pass reports whether it did work.
   (jpegtran-equivalent), strictly lossless, verified by decode-back.
 - `pack_object_streams` (default ON) → puts a PDF 1.5 floor on output;
   opt out for pre-Acrobat-6 readers.
-- `renumber_objects`, `strip_stale_xref_trailer_keys`, compressed xref stream.
+- `renumber_objects`, `strip_stale_xref_trailer_keys`, compressed xref stream
+  (PNG-Up-predicted when strictly smaller; applied last, after the passes
+  that rewrite raw xref rows).
 - The real-literal restoration pass (`src/reals.rs`) splices the input's own
   literals back into the saved file — f32-parsing otherwise loses precision on
   e.g. `/MediaBox [0 0 595.91998 841.91998]`.

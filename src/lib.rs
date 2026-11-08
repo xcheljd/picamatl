@@ -6207,13 +6207,30 @@ mod tests {
             let out = optimize_with_options(&staged, opts);
             let header = xref_object_header(&out);
             let shown = String::from_utf8_lossy(&header).to_string();
-            for key in [b"/DecodeParms".as_slice(), b"/Prev", b"/XRefStm"] {
+            for key in [b"/Prev".as_slice(), b"/XRefStm"] {
                 assert!(
                     find_sub(&header, key, 0).is_none(),
                     "pack={pack}: stale {} leaked into the xref stream: {shown}",
                     String::from_utf8_lossy(key)
                 );
             }
+            // A `/DecodeParms` may appear only as the one the xref patch writes
+            // for its own predicted payload: `/Columns` = the `/W` sum (never
+            // the stale 5), declared exactly once.
+            let at = find_sub(&header, b"/W[", 0).unwrap() + 3;
+            let close = find_sub(&header, b"]", at).unwrap();
+            let row: usize = std::str::from_utf8(&header[at..close])
+                .unwrap()
+                .split_ascii_whitespace()
+                .map(|t| t.parse::<usize>().unwrap())
+                .sum();
+            assert_ne!(row, 5, "premise: the stale /Columns differs from ours");
+            let ours = format!("/DecodeParms<</Columns {row}/Predictor 12>>");
+            let decls = header.windows(12).filter(|w| w == b"/DecodeParms").count();
+            assert!(
+                decls == 0 || (decls == 1 && find_sub(&header, ours.as_bytes(), 0).is_some()),
+                "pack={pack}: stale /DecodeParms leaked into the xref stream: {shown}"
+            );
             // The dictionary must describe the payload it actually ships: one
             // /Filter (ours) and a table that reads back.
             assert!(

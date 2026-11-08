@@ -877,6 +877,13 @@ mod tests {
     const PLACEHOLDER_H: f32 = 1014.2468;
 
     fn a4_placeholders() -> Vec<u8> {
+        a4_placeholders_with_pages(0)
+    }
+
+    /// [`a4_placeholders`] plus `extra` more pages, so the
+    /// cross-reference table is long enough for its PNG-predicted encoding to
+    /// win (the two-page fixture's table is too short).
+    fn a4_placeholders_with_pages(extra: usize) -> Vec<u8> {
         let (width, height) = (PLACEHOLDER_W, PLACEHOLDER_H);
         assert_eq!(
             (format!("{width}").len(), format!("{height}").len()),
@@ -890,7 +897,7 @@ mod tests {
         // has real work for picamatl to do: without a win it hands the input
         // straight back and there is nothing to restore into.
         let body = b"BT /F1 12 Tf 72 720 Td (hello) Tj ET\n".repeat(200);
-        let kids: Vec<Object> = (0..2)
+        let mut kids: Vec<Object> = (0..2)
             .map(|_| {
                 let content = doc.add_object(Stream::new(dictionary! {}, body.clone()));
                 doc.add_object(dictionary! {
@@ -901,6 +908,21 @@ mod tests {
                 .into()
             })
             .collect();
+        // Extra pages share one small content stream and differ only in a
+        // harmless `/StructParents` key: a run of consecutive packable page
+        // dictionaries, the row shape real documents' tables are made of.
+        if extra > 0 {
+            let shared = doc.add_object(Stream::new(dictionary! {}, b"0 0 m 1 1 l S".to_vec()));
+            for i in 0..extra {
+                let page = doc.add_object(dictionary! {
+                    "Type" => "Page",
+                    "Parent" => pages_id,
+                    "Contents" => shared,
+                    "StructParents" => i as i64,
+                });
+                kids.push(page.into());
+            }
+        }
         // The page box sits on the page *tree* node, inherited by both pages
         // — the shape a producer uses for a uniform document, and one more
         // reason a restoration keyed by dictionary key would have to know
@@ -910,7 +932,7 @@ mod tests {
             Object::Dictionary(dictionary! {
                 "Type" => "Pages",
                 "Kids" => kids,
-                "Count" => 2,
+                "Count" => (2 + extra) as i64,
                 "MediaBox" => vec![
                     Object::Integer(0),
                     Object::Integer(0),
@@ -958,6 +980,55 @@ mod tests {
         let out = crate::optimize(&input);
         assert!(find_sub(&out, b"/Type/ObjStm", 0).is_some(), "packed path");
         assert_eq!(captured(&out), captured(&input));
+    }
+
+    /// `restore` rewrites raw cross-reference rows and declines an xref stream
+    /// that already carries a `/Filter`; the PNG-predicted encoding is applied
+    /// after it (`serialize::save_document`). A table long enough for the
+    /// predictor to win must therefore still come out restored, with every
+    /// repaired offset pointing at its object under the predicted encoding.
+    #[test]
+    fn restores_a_page_box_under_a_predicted_xref_stream() {
+        let input = undrift(&a4_placeholders_with_pages(300));
+        assert_eq!(
+            captured(&input).len(),
+            2,
+            "premise: two literals to restore"
+        );
+        for pack in [true, false] {
+            let opts = crate::OptimizeOptions::default().with_pack_object_streams(pack);
+            let out = crate::optimize_with_options(&input, opts);
+            let header = crate::tests::xref_object_header(&out);
+            assert!(
+                find_sub(&header, b"/DecodeParms<</Columns ", 0).is_some()
+                    && find_sub(&header, b"/Predictor 12>>", 0).is_some(),
+                "pack={pack}: premise: the xref stream is predicted: {}",
+                String::from_utf8_lossy(&header)
+            );
+            assert_eq!(captured(&out), captured(&input), "pack={pack}: restored");
+
+            // lopdf decodes the predicted table; every in-file offset it holds
+            // must land exactly on that object's `<id> <gen> obj` header.
+            let doc = Document::load_mem(&out).unwrap();
+            assert_eq!(doc.get_pages().len(), 302, "pack={pack}");
+            let mut checked = 0;
+            for (&id, entry) in &doc.reference_table.entries {
+                if let lopdf::xref::XrefEntry::Normal { offset, generation } = *entry {
+                    let head = format!("{id} {generation} obj");
+                    assert!(
+                        out[offset as usize..].starts_with(head.as_bytes()),
+                        "pack={pack}: object {id} offset {offset} is stale"
+                    );
+                    checked += 1;
+                }
+            }
+            assert!(checked > 0, "pack={pack}: premise: type-1 rows exist");
+            assert_eq!(
+                crate::optimize_with_options(&out, opts),
+                out,
+                "pack={pack}: idempotent"
+            );
+        }
     }
 
     /// The unpacked save path: plain object bodies and a classic `xref` table

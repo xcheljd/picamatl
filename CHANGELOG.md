@@ -103,6 +103,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The cross-reference stream is written with a PNG Up predictor** when
+  that makes the file smaller (`/DecodeParms<</Columns <W sum>/Predictor
+  12>>`). Consecutive xref rows differ only in their low bytes, so filtering
+  each row against the one above turns the table into long zero runs. Both
+  encodings are built and decoded back; the predicted one ships only when
+  the whole patched file is strictly smaller than the plain-deflate one, so
+  no output grows. Lossless — only the table's encoding changes. Over the
+  17-file corpus, default outputs shrink by 467,633 B in total (1.76%;
+  irs-1040gi 5.71%, adobe-spec 3.40%); with `--deflate-backend zopfli`,
+  which already finds most of that redundancy, by 19,017 B.
 - **lopdf 0.44 → 0.47.** Upstream's three releases are mostly parser
   robustness for malformed and hostile files (crash fixes, cross-reference
   reconstruction, more stream filters, bounded decompression), plus faster

@@ -8,7 +8,9 @@
 
 use lopdf::Document;
 
-use crate::deflate::{deflate_backend, deflate_zopfli, inflate_capped};
+use crate::deflate::{
+    deflate_backend, deflate_zopfli, inflate_capped, png_defilter, png_up_filter,
+};
 use crate::{reals, DeflateBackend, OptimizeOptions, MAX_REDEFLATE_BYTES};
 
 /// Serialize the document, optionally using PDF 1.5 object-stream packing when
@@ -43,7 +45,11 @@ pub(crate) fn save_document(
     } else {
         out
     };
-    // Both save paths emit an uncompressed cross-reference stream; deflate it.
+    // Both save paths emit an uncompressed cross-reference stream; deflate it
+    // (PNG-Up-predicted when that is smaller). Strictly LAST: `reals::restore`
+    // and `rezopfli_objstm` above both rewrite raw xref rows in place and
+    // decline any xref stream that already carries a `/Filter`, so neither may
+    // ever see the compressed or predicted form.
     Ok(compress_xref_stream(out, options.deflate_backend))
 }
 
@@ -56,6 +62,11 @@ pub(crate) fn save_document(
 /// every document-level pass has run. So picamatl's output shipped a raw
 /// 7-bytes-per-entry xref stream (17,479 B on the 2,497-object NASA reference,
 /// where Ghostscript spends 5,375 B).
+///
+/// Two candidates are built from the same raw rows: plain deflate, and deflate
+/// over PNG Up-filtered rows declared as `/DecodeParms<</Columns <W sum>
+/// /Predictor 12>>`. The predicted one ships only when strictly smaller; both
+/// are decoded back to the exact raw rows first.
 ///
 /// Patching the saved bytes is sound *because it is the last object in the
 /// file*: `startxref` points at its start offset, and its own xref entry
@@ -116,9 +127,9 @@ fn try_compress_xref_stream(out: &[u8], backend: DeflateBackend) -> Option<Vec<u
     let content_start = dict_end + b"stream\n".len();
     let dict = out.get(dict_start..dict_end)?;
     // A `/DecodeParms` already in the dictionary would be read as describing
-    // the payload this patch is about to install — it does not (the deflate
-    // below applies no predictor), so decline rather than emit a dictionary
-    // that lies about its own stream.
+    // the payload this patch is about to install — it does not (this patch
+    // writes its own, or none), so decline rather than emit a dictionary that
+    // lies about its own stream.
     if find_sub(dict, b"/Type/XRef", 0).is_none()
         || find_sub(dict, b"/Filter", 0).is_some()
         || find_sub(dict, b"/DecodeParms", 0).is_some()
@@ -155,14 +166,69 @@ fn try_compress_xref_stream(out: &[u8], backend: DeflateBackend) -> Option<Vec<u
         return None;
     }
 
-    let mut patched = Vec::with_capacity(out.len());
-    patched.extend_from_slice(&out[..dict_start + len_key]);
-    patched.extend_from_slice(b"/Filter/FlateDecode/Length ");
-    patched.extend_from_slice(deflated.len().to_string().as_bytes());
-    patched.extend_from_slice(&out[dict_start + val_end..content_start]);
-    patched.extend_from_slice(&deflated);
-    patched.extend_from_slice(&out[content_start + content_len..]);
-    Some(patched)
+    let patch_with = |payload: &[u8], decode_parms: &[u8]| {
+        let mut patched = Vec::with_capacity(out.len());
+        patched.extend_from_slice(&out[..dict_start + len_key]);
+        patched.extend_from_slice(decode_parms);
+        patched.extend_from_slice(b"/Filter/FlateDecode/Length ");
+        patched.extend_from_slice(payload.len().to_string().as_bytes());
+        patched.extend_from_slice(&out[dict_start + val_end..content_start]);
+        patched.extend_from_slice(payload);
+        patched.extend_from_slice(&out[content_start + content_len..]);
+        patched
+    };
+    let plain = patch_with(&deflated, b"");
+
+    // The PNG-Up-predicted candidate. Consecutive rows differ only in their
+    // low offset bytes (type 1) or a +1 index (type 2), so Up turns the table
+    // into long zero runs. It ships only when the WHOLE patched file is
+    // strictly smaller than the plain one — its `/DecodeParms` entry costs
+    // ~40 B of dictionary, which a short table's payload saving can miss.
+    match predicted_xref_payload(dict, content, backend) {
+        Some((payload, parms)) => {
+            let predicted = patch_with(&payload, &parms);
+            Some(if predicted.len() < plain.len() {
+                predicted
+            } else {
+                plain
+            })
+        }
+        None => Some(plain),
+    }
+}
+
+/// Deflate the raw xref rows under PNG Up prediction (`/Predictor 12`, one
+/// filter-tag byte per row) and return the payload together with the exact
+/// `/DecodeParms` entry that describes it.
+///
+/// The row width comes from the dictionary's own `/W` and must tile the
+/// payload exactly; the candidate is decoded back (inflate, then the crate's
+/// spec-correct PNG defilter, not lopdf's) and must reproduce `content`
+/// byte-for-byte. Any doubt returns `None` and the plain deflate ships.
+fn predicted_xref_payload(
+    dict: &[u8],
+    content: &[u8],
+    backend: DeflateBackend,
+) -> Option<(Vec<u8>, Vec<u8>)> {
+    let widths = parse_int_array(dict, b"/W[")?;
+    if widths.len() != 3 || widths.iter().any(|&w| w > 8) {
+        return None;
+    }
+    let row: usize = widths.iter().sum();
+    if row == 0 || content.is_empty() || !content.len().is_multiple_of(row) {
+        return None;
+    }
+    let filtered = png_up_filter(content, u32::try_from(row).ok()?, 1);
+    if filtered.len() != content.len() + content.len() / row {
+        return None;
+    }
+    let payload = deflate_backend(&filtered, backend)?;
+    let inflated = inflate_capped(&payload, filtered.len())?;
+    if png_defilter(&inflated, 1, row)?.as_slice() != content {
+        return None;
+    }
+    let parms = format!("/DecodeParms<</Columns {row}/Predictor 12>>").into_bytes();
+    Some((payload, parms))
 }
 
 /// Re-deflate every just-written `ObjStm` payload with zopfli.
@@ -460,7 +526,7 @@ fn pack_and_save(doc: &mut Document) -> Result<Vec<u8>, lopdf::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lopdf::Object;
+    use lopdf::{dictionary, Object};
 
     use crate::tests::{build_pdf, build_pdf_duplicate_images, xref_object_header};
     use crate::{optimize_with_options, DeflateBackend, OptimizeOptions};
@@ -536,6 +602,212 @@ mod tests {
                 "malformed input must pass through untouched"
             );
         }
+    }
+
+    /// Synthetic `/W[1 4 2]` xref rows in the shape lopdf writes: the free
+    /// head entry, `type1` ascending byte offsets, then `type2` packed entries
+    /// (one object stream, ascending index).
+    fn synthetic_xref_rows(type1: usize, type2: usize) -> Vec<u8> {
+        let mut rows = vec![0u8, 0, 0, 0, 0, 0xff, 0xff];
+        let mut offset: u32 = 15;
+        for i in 0..type1 {
+            rows.push(1);
+            rows.extend_from_slice(&offset.to_be_bytes());
+            rows.extend_from_slice(&[0, 0]);
+            offset += 40 + (i as u32 * 7919) % 900;
+        }
+        for i in 0..type2 {
+            rows.push(2);
+            rows.extend_from_slice(&7u32.to_be_bytes());
+            rows.extend_from_slice(&(i as u16).to_be_bytes());
+        }
+        rows
+    }
+
+    /// The predicted payload must decode back to the exact raw rows — through
+    /// this crate's own defilter AND through lopdf's reader (an independent
+    /// implementation, and the one pass 2 actually loads with).
+    #[test]
+    fn xref_up_predictor_round_trips_rows() {
+        let rows = synthetic_xref_rows(300, 500);
+        let dict = format!("<</Type/XRef/W[1 4 2]/Length {}>>", rows.len()).into_bytes();
+        for backend in [DeflateBackend::Zlib, DeflateBackend::Zopfli] {
+            let (payload, parms) =
+                predicted_xref_payload(&dict, &rows, backend).expect("rows tile /W exactly");
+            assert_eq!(parms, b"/DecodeParms<</Columns 7/Predictor 12>>".to_vec());
+
+            let filtered = inflate_capped(&payload, rows.len() * 2).unwrap();
+            assert_eq!(
+                filtered.len(),
+                rows.len() + rows.len() / 7,
+                "one tag per row"
+            );
+            assert!(
+                filtered.chunks(8).all(|r| r[0] == 2),
+                "every row is Up-filtered"
+            );
+            assert_eq!(png_defilter(&filtered, 1, 7).unwrap(), rows);
+
+            let mut stream = lopdf::Stream::new(
+                dictionary! {
+                    "Type" => "XRef",
+                    "Filter" => "FlateDecode",
+                    "DecodeParms" => dictionary! { "Columns" => 7, "Predictor" => 12 },
+                },
+                payload.clone(),
+            );
+            stream.allows_compression = false;
+            assert_eq!(stream.decompressed_content().unwrap(), rows, "lopdf decode");
+
+            // The whole point: this table is smaller predicted than plain.
+            let plain = deflate_backend(&rows, backend).unwrap();
+            assert!(
+                payload.len() < plain.len(),
+                "{backend:?}: predicted {} vs plain {}",
+                payload.len(),
+                plain.len()
+            );
+        }
+
+        // Shapes the predictor must refuse: a payload /W does not tile, a
+        // /W that is not three fields, a field wider than 8 bytes, no /W.
+        let z = DeflateBackend::Zlib;
+        assert!(predicted_xref_payload(&dict, &rows[..rows.len() - 1], z).is_none());
+        assert!(predicted_xref_payload(b"<</W[1 4 2 1]>>", &rows, z).is_none());
+        assert!(predicted_xref_payload(b"<</W[1 9 2]>>", &rows, z).is_none());
+        assert!(predicted_xref_payload(b"<</W[0 0 0]>>", &rows, z).is_none());
+        assert!(predicted_xref_payload(b"<</Type/XRef>>", &rows, z).is_none());
+        assert!(predicted_xref_payload(&dict, &[], z).is_none());
+    }
+
+    /// A document of `n` small dictionaries, saved through the packed writer
+    /// with its raw (uncompressed) cross-reference stream still in place.
+    fn raw_packed_save(n: usize) -> Vec<u8> {
+        let mut doc = Document::with_version("1.5");
+        let pages = doc.new_object_id();
+        let refs: Vec<Object> = (0..n)
+            .map(|i| doc.add_object(dictionary! { "N" => i as i64 }).into())
+            .collect();
+        // One stream object too, so the table carries type-1 offset rows next
+        // to the type-2 packed rows.
+        let content = doc.add_object(lopdf::Stream::new(
+            dictionary! {},
+            b"0 0 m 1 1 l S".to_vec(),
+        ));
+        let page = doc.add_object(dictionary! {
+            "Type" => "Page", "Parent" => pages, "Contents" => content,
+        });
+        doc.objects.insert(
+            pages,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages", "Kids" => vec![page.into()], "Count" => 1,
+                "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            }),
+        );
+        let catalog = doc.add_object(dictionary! {
+            "Type" => "Catalog", "Pages" => pages, "Extra" => refs,
+        });
+        doc.trailer.set("Root", catalog);
+        let raw = pack_and_save(&mut doc).unwrap();
+        let header = xref_object_header(&raw);
+        assert!(
+            find_sub(&header, b"/Filter", 0).is_none(),
+            "premise: lopdf writes the xref stream raw"
+        );
+        raw
+    }
+
+    /// The xref stream's payload as written (between `stream\n` and
+    /// `\nendstream`).
+    fn xref_payload(pdf: &[u8]) -> Vec<u8> {
+        let header = xref_object_header(pdf);
+        let start = find_sub(pdf, &header, 0).unwrap() + header.len() + b">>stream\n".len();
+        let end = find_sub(pdf, b"\nendstream", start).unwrap();
+        pdf[start..end].to_vec()
+    }
+
+    /// The predictor is strictly-smaller-or-absent: the predicted encoding
+    /// ships only when its patched FILE (payload + `/DecodeParms` entry) is
+    /// strictly smaller than the plain-deflate file this patch shipped before
+    /// it existed, so no output grows. `/DecodeParms` is declared exactly
+    /// when the payload is predicted, and a table whose deflate does not
+    /// shrink is left raw. Covers tables too short to deflate, too short for
+    /// Up to pay, and long enough for it to.
+    #[test]
+    fn xref_compression_ships_the_strictly_smaller_candidate() {
+        let (mut saw_predicted, mut saw_plain) = (false, false);
+        for n in [0usize, 2, 10, 40, 2_000] {
+            let raw = raw_packed_save(n);
+            let rows = xref_payload(&raw);
+            let dict = xref_object_header(&raw);
+            // The file size each candidate patch produces, from first
+            // principles: swap the payload, add the dictionary entries, and
+            // re-print `/Length`.
+            let digits = |n: usize| n.to_string().len();
+            let size_with = |payload: usize, parms: usize| {
+                raw.len() - rows.len()
+                    + payload
+                    + parms
+                    + b"/Filter/FlateDecode".len()
+                    + digits(payload)
+                    - digits(rows.len())
+            };
+            for backend in [DeflateBackend::Zlib, DeflateBackend::Zopfli] {
+                let out = compress_xref_stream(raw.clone(), backend);
+                let plain = deflate_backend(&rows, backend).unwrap();
+                let plain_size = size_with(plain.len(), 0);
+                let (pred, parms) = predicted_xref_payload(&dict, &rows, backend).unwrap();
+                let pred_size = size_with(pred.len(), parms.len());
+                let tag = format!("n={n} {backend:?}");
+
+                let (want_size, want_payload, want_parms) = if pred_size < plain_size {
+                    (pred_size, pred, true)
+                } else {
+                    (plain_size, plain.clone(), false)
+                };
+                if plain.len() >= rows.len() {
+                    assert_eq!(out, raw, "{tag}: deflate does not shrink, ship the input");
+                    continue;
+                }
+                assert_eq!(out.len(), want_size, "{tag}: smallest candidate ships");
+                assert!(out.len() <= plain_size, "{tag}: never larger than plain");
+                if want_parms {
+                    assert!(out.len() < plain_size, "{tag}: predictor strictly smaller");
+                }
+                assert_eq!(xref_payload(&out), want_payload, "{tag}");
+                let header = xref_object_header(&out);
+                assert_eq!(
+                    find_sub(&header, b"/DecodeParms", 0).is_some(),
+                    want_parms,
+                    "{tag}: /DecodeParms iff predicted: {}",
+                    String::from_utf8_lossy(&header)
+                );
+                saw_predicted |= want_parms;
+                saw_plain |= !want_parms;
+
+                let doc =
+                    Document::load_mem(&out).unwrap_or_else(|e| panic!("{tag}: must load: {e}"));
+                let before = Document::load_mem(&raw).unwrap();
+                assert_eq!(doc.objects.len(), before.objects.len(), "{tag}");
+                for (&id, object) in &before.objects {
+                    if object.type_name().ok() == Some(b"XRef".as_slice()) {
+                        continue; // the patched object itself
+                    }
+                    assert_eq!(
+                        doc.get_object(id).ok(),
+                        Some(object),
+                        "{tag}: object {id:?}"
+                    );
+                }
+            }
+        }
+        // (A table whose deflate does not shrink cannot come out of lopdf's
+        // writer — even the empty document's six rows deflate — so the raw
+        // branch is exercised by `xref_compression_declines_unrecognized_tails`.)
+        assert!(
+            saw_predicted && saw_plain,
+            "premise: both encodings are exercised (predicted {saw_predicted}, plain {saw_plain})"
+        );
     }
 
     /// The ObjStm zopfli patch: on a packed save it must produce output that
