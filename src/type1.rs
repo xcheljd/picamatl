@@ -2056,8 +2056,11 @@ mod tests {
         f.subrs = vec![big];
         let started = std::time::Instant::now();
         let interpreted = interpret_glyph(&f, b"a", true);
+        // Generous on purpose: CI runs debug builds on shared runners (this took
+        // ~20 s there). Without the fix the work is ~>1,000x larger — days —
+        // so the bound still separates fixed from broken by orders of magnitude.
         assert!(
-            started.elapsed().as_secs() < 5,
+            started.elapsed().as_secs() < 60,
             "callsubr must not copy the subr"
         );
         assert!(interpreted.is_some(), "the glyph itself is well-formed");

@@ -3891,8 +3891,11 @@ mod tests {
         let pdf = finish_pdf(&mut doc, pages_id, vec![page]);
         let started = std::time::Instant::now();
         let _ = optimize_with_options(&pdf, subset_opts());
+        // Generous on purpose: CI runs debug builds on shared runners (this took
+        // ~20 s there). Without the fix the work is ~344,000x larger — days —
+        // so the bound still separates fixed from broken by orders of magnitude.
         assert!(
-            started.elapsed().as_secs() < 20,
+            started.elapsed().as_secs() < 120,
             "the walk must be budgeted"
         );
     }

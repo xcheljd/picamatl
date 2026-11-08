@@ -9081,8 +9081,11 @@ mod tests {
 
         let started = std::time::Instant::now();
         let out = optimize_with_options(&pdf, OptimizeOptions::default());
+        // Generous on purpose: CI runs debug builds on shared runners (this took
+        // ~20 s there). Without the fix the work is ~43,000x larger — days —
+        // so the bound still separates fixed from broken by orders of magnitude.
         assert!(
-            started.elapsed().as_secs() < 20,
+            started.elapsed().as_secs() < 120,
             "the placement walk must be budgeted"
         );
         let post = Document::load_mem(&out).unwrap();

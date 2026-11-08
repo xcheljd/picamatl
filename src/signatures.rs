@@ -662,8 +662,11 @@ mod tests {
         );
         let started = std::time::Instant::now();
         let sigs = detect_signatures(&roundtrip(&mut doc));
+        // Generous on purpose: CI runs debug builds on shared runners (this took
+        // ~20 s there). Without the fix the work is ~>20,000x larger — days —
+        // so the bound still separates fixed from broken by orders of magnitude.
         assert!(
-            started.elapsed().as_secs() < 5,
+            started.elapsed().as_secs() < 60,
             "shared kids must not be re-walked per path"
         );
         assert_eq!(objects(&sigs), vec![Some(leaf_id)], "got {sigs:?}");

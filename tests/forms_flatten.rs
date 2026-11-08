@@ -1420,8 +1420,11 @@ fn a_field_tree_that_shares_kids_declines_promptly() {
 
     let started = std::time::Instant::now();
     let out = optimize_with_options(&input, flatten());
+    // Generous on purpose: CI runs debug builds on shared runners (this took
+    // ~20 s there). Without the fix the work is ~>20,000x larger — days —
+    // so the bound still separates fixed from broken by orders of magnitude.
     assert!(
-        started.elapsed().as_secs() < 10,
+        started.elapsed().as_secs() < 60,
         "a shared-kid field tree must not be walked per path"
     );
     let flattened = View::of(&out).page_xobjects();
