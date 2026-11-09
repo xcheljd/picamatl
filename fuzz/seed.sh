@@ -45,7 +45,32 @@ for pair in lzw_lzw:0 lzw_lzw:1 lzw_a85:2 lzw_ahx:3 lzw_rl:4; do
     done
 done
 cp ../fixtures/jpeg/*.jpg corpus/jpeghuff/ 2>/dev/null || true
+# Whole-pipeline seeds must be SMALL: libFuzzer runs every seed once before it
+# mutates anything, and under the sanitizer a multi-megabyte PDF takes many
+# seconds, so big seeds eat the whole campaign. Keep inputs under SEED_MAX
+# whole, and (when poppler's pdfseparate is installed) up to 20 evenly spaced
+# single pages of every input, again only under SEED_MAX.
+SEED_MAX=${SEED_MAX:-262144}
+pages=$(mktemp -d)
+trap 'rm -rf "$raw" "$pages"' EXIT
+n=0
 for f in "$@"; do
+    n=$((n + 1))
+    [ "$(wc -c < "$f")" -le "$SEED_MAX" ] && cp "$f" "$pages/whole-$n.pdf"
+    command -v pdfseparate >/dev/null 2>&1 || continue
+    count=$(pdfinfo "$f" 2>/dev/null | awk '/^Pages:/ {print $2}')
+    [ -n "$count" ] && [ "$count" -gt 0 ] || continue
+    step=$(( (count + 19) / 20 ))
+    p=1
+    while [ "$p" -le "$count" ]; do
+        out="$pages/p$n-$p.pdf"
+        pdfseparate -f "$p" -l "$p" "$f" "$out" 2>/dev/null || true
+        [ -f "$out" ] && [ "$(wc -c < "$out")" -gt "$SEED_MAX" ] && rm -f "$out"
+        p=$((p + step))
+    done
+done
+for f in "$pages"/*.pdf; do
+    [ -f "$f" ] || continue
     cp "$f" corpus/optimize/
     cp "$f" corpus/optimize_all/
 done

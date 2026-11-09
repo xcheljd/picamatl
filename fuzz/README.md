@@ -66,9 +66,15 @@ in force), and an out-of-memory abort is the one failure picamatl's
   mozjpeg C code defines one static table twice, which AddressSanitizer
   reports at startup before any input runs. `cargo fuzz run` sets the same
   option itself.
-- The whole-pipeline targets run at ~25 inputs per second; the focused
-  targets at hundreds to tens of thousands. Give the pipeline targets the
-  longest runs.
+- Whole-pipeline seeds are kept small: `seed.sh` copies inputs under 256 KB
+  (`SEED_MAX`) whole and, when poppler's `pdfseparate` is installed, up to 20
+  single pages of each input. libFuzzer runs every seed once before it
+  mutates anything, so multi-megabyte seeds would spend the whole campaign
+  on that first pass. `campaign.sh` also shrinks any corpus over 100 files to
+  its coverage-adding inputs (`-merge=1`) before each run, because libFuzzer
+  keeps adding new inputs to it. Pipeline targets run at ~5-10 inputs per
+  second under the sanitizer; the focused targets at hundreds to tens of
+  thousands. Give the pipeline targets the longest runs.
 - The sanitizer build is ~20x slower than release, so `campaign.sh` gives the
   whole-pipeline targets a 60 s hang limit (10 s for the rest). A `timeout-*`
   artifact that is just one of your seed PDFs, unchanged, is that slowdown,

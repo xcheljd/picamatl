@@ -12,7 +12,20 @@ for t in optimize optimize_all jpeghuff type1 cff cff_font truetype deflate cont
     # Whole-pipeline targets get a longer hang limit: the sanitizer build runs
     # ~20x slower than release (a 0.9 s corpus PDF takes ~17 s), so 10 s
     # would flag ordinary seeds as hangs.
-    case $t in optimize*) ML=1048576 TO=60 ;; *) ML=300000 TO=10 ;; esac
+    case $t in optimize*) ML=262144 TO=60 ;; *) ML=300000 TO=10 ;; esac
+    # libFuzzer saves every new-coverage input back into corpus/<t>, so the
+    # corpus grows run after run. Before fuzzing, shrink each corpus to the
+    # inputs that add coverage (-merge=1); for the pipeline targets this is
+    # what keeps the startup pass from eating the campaign.
+    if [ "$(ls "corpus/$t" | wc -l)" -gt 100 ]; then
+        rm -rf "corpus/$t.min" && mkdir -p "corpus/$t.min"
+        if "$B/$t" -merge=1 -max_len=$ML -timeout=$TO -rss_limit_mb=2048 \
+            -malloc_limit_mb=512 "corpus/$t.min" "corpus/$t" > "logs/$t.merge.log" 2>&1; then
+            rm -rf "corpus/$t" && mv "corpus/$t.min" "corpus/$t"
+        else
+            rm -rf "corpus/$t.min"
+        fi
+    fi
     "$B/$t" "corpus/$t" -artifact_prefix="artifacts/$t/" -fork=1 \
         -ignore_crashes=1 -ignore_timeouts=1 -ignore_ooms=1 \
         -max_total_time=$((${MINUTES:-90} * 60)) -rss_limit_mb=2048 -malloc_limit_mb=512 \
