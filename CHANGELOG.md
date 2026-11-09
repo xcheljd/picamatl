@@ -112,6 +112,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Flate images get the best PNG row filter.** In a file picamatl
+  rewrites, every 8-bit `/FlateDecode` image and soft mask is decoded to its
+  samples and stored again under plain rows or the best of the four uniform
+  PNG filters (Sub, Up, Average, Paeth), when that is strictly smaller than
+  what was stored, counting the `/DecodeParms` the filter needs. Lossless:
+  the samples are decoded back and compared, and `/Decode`, masks and every
+  other image key are untouched. It runs after the image passes, so it never
+  changes which images are downsampled. Images the downsample passes re-encode
+  get the same treatment. Over the 17-file corpus and 15 scans, default
+  outputs shrink by 164,916 B: wiki-pdf by 73,769 B (7.0%), nasa by 64,268
+  B, arxiv-gpt4, irs-w2, arxiv-diffusion and adobe-spec by 840 to 11,221 B.
+  Every page renders identically at 150 dpi and every other output is
+  byte-identical. With `--deflate-backend zopfli` the filter is chosen with
+  zlib, then the new and the stored rows are both zopflied and the smaller
+  is kept, so that lane is never larger than before; it saves 10,957 B on
+  the full-options lane, where most such images become JPEGs. Default runs
+  on image-heavy files take longer (nasa 0.66 s to 1.15 s).
 - **Streams stored with legacy filters are re-stored as Flate.**
   `/LZWDecode` (common in Acrobat Capture-era scans), `/ASCII85Decode`,
   `/ASCIIHexDecode` and `/RunLengthDecode` streams, and chains of them that
