@@ -23,8 +23,8 @@
 //! - Decode-back verified (the Flate payload re-inflates to the decoded
 //!   bytes) and strictly smaller counting the dictionary text it changes.
 //! - Encrypted and PDF/A-declared documents are declined wholesale, the same
-//!   posture as the content minifier and the final re-deflate (unless
-//!   `--strip-metadata` removes the PDF/A claim anyway; see `plan`).
+//!   posture as every other structural pass (unless `--strip-metadata`
+//!   removes the PDF/A claim anyway; see `fonts::pdfa_declined`).
 
 use lopdf::{Dictionary, Document, Object, ObjectId};
 
@@ -68,18 +68,17 @@ pub(crate) struct Transcode {
 /// (`true`) or every other stream (`false`): the caller applies the two
 /// halves at different points in the pipeline (see `try_optimize`).
 ///
-/// `metadata_stripped` is the `strip_metadata` option: the output then
-/// carries no PDF/A claim, so the PDF/A decline does not apply. Without
-/// this, a second pass over our own output (XMP gone) would transcode what
-/// the first pass declined — not idempotent.
+/// `pdfa` is the per-run PDF/A decision from `fonts::pdfa_declined`, which
+/// already folds in `--strip-metadata` (the output then carries no PDF/A
+/// claim, so the decline does not apply).
 pub(crate) fn plan(
     doc: &Document,
     backend: DeflateBackend,
     images: bool,
-    metadata_stripped: bool,
+    pdfa: bool,
     limit: usize,
 ) -> Vec<Transcode> {
-    if doc.is_encrypted() || (!metadata_stripped && crate::fonts::pdfa_blocked(doc)) {
+    if doc.is_encrypted() || pdfa {
         return Vec::new();
     }
     let mut plans = Vec::new();

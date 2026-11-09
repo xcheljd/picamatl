@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`--strip-metadata` runs on PDF/A files are idempotent.** Each pass
+  checked for a PDF/A claim on its own, and the passes that run before the
+  metadata strip still saw it. So on a PDF/A file the content-stream
+  minifier declined on the first run, and so did the font, form-flattening
+  and hint passes. A second run over that output found no claim and did the
+  work, so it came out smaller (five PDF/A scans, 26 to 9,490 bytes). The
+  decision is now made once per run, from the claim the output will carry.
+  With `--strip-metadata` no claim survives, so those passes run on the
+  first run. Without it, PDF/A files are treated exactly as before.
 - **Font subsetting now tracks the text font through `q`/`Q`.** The font is
   part of the graphics state, so text shown after a `Q` is drawn in the font
   that was current at the matching `q`. The glyph walk credited it to the

@@ -293,7 +293,12 @@ pub struct OptimizeOptions {
     /// render — but it discards document provenance and breaks PDF/A and
     /// PDF/UA identification, so it is strictly opt-in. Producers that write a
     /// full XMP packet per page/XObject can spend a double-digit percentage of
-    /// the file on it (adobe-spec: 860 KB, 12%). Default: `false`.
+    /// the file on it (adobe-spec: 860 KB, 12%). Because the output then
+    /// carries no PDF/A claim, the passes that decline PDF/A-declared
+    /// documents (font subsetting and conversion, hint stripping, form
+    /// flattening, content minification, the lossless re-encodes) run on
+    /// them too — otherwise a second run over the output would do that work
+    /// and the result would not be idempotent. Default: `false`.
     pub strip_metadata: bool,
 
     /// If true, remove every `/PieceInfo` entry — the "page-piece"
@@ -330,8 +335,9 @@ pub struct OptimizeOptions {
     /// rewritten, and `/W`, `/DW`, `/Widths`, `/Encoding`, and `/ToUnicode`
     /// stay untouched, so text extraction is bit-identical. Any parse
     /// uncertainty disables subsetting for the affected font or the whole
-    /// document — output is always valid. PDF/A-declared and encrypted
-    /// documents are skipped. Default: `true` (was `false` through 0.3.1;
+    /// document — output is always valid. PDF/A-declared (unless
+    /// `strip_metadata` removes the claim) and encrypted documents are
+    /// skipped. Default: `true` (was `false` through 0.3.1;
     /// rendering-preserving and verified, so it joined the lossless
     /// defaults).
     pub subset_fonts: bool,
@@ -3898,8 +3904,8 @@ fn replan_content(
 ///
 /// Declined wholesale for encrypted, PDF/A-declared, and signed documents,
 /// same posture as `redeflate_flate_streams`.
-fn minify_content_streams(doc: &mut Document, backend: DeflateBackend) -> bool {
-    if doc.is_encrypted() || fonts::pdfa_blocked(doc) {
+fn minify_content_streams(doc: &mut Document, backend: DeflateBackend, pdfa: bool) -> bool {
+    if doc.is_encrypted() || pdfa {
         return false;
     }
     let refcounts = count_object_references(doc);
@@ -4175,6 +4181,13 @@ fn try_optimize(input: &[u8], options: OptimizeOptions) -> Result<OptimizeOutcom
         }
     }
 
+    // The PDF/A decline, decided ONCE here on the input and passed to every
+    // pass that honors it. Deciding per pass let passes disagree within one
+    // run AND across runs: `--strip-metadata` removes the claim, so a second
+    // pass over our own output ran what the first had declined (the content
+    // minifier on PDF/A scans) — not idempotent. See `fonts::pdfa_declined`.
+    let pdfa = fonts::pdfa_declined(&doc, options.strip_metadata);
+
     // Legacy-filter transcode (LZW / ASCII85 / ASCIIHex / RunLength chains →
     // one FlateDecode, src/legacy.rs), lossless. Non-image streams are
     // rewritten HERE, before the dedup passes and the content minifier, so
@@ -4189,7 +4202,7 @@ fn try_optimize(input: &[u8], options: OptimizeOptions) -> Result<OptimizeOutcom
             &doc,
             options.deflate_backend,
             images,
-            options.strip_metadata,
+            pdfa,
             MAX_REDEFLATE_BYTES,
         )
     };
@@ -4216,7 +4229,7 @@ fn try_optimize(input: &[u8], options: OptimizeOptions) -> Result<OptimizeOutcom
     // optimized exactly as it would have been with the flag off. Counts as
     // work: dropping a megabyte of XFA is the whole point.
     let flattened = options.flatten_forms
-        && match forms::plan_flatten(&doc) {
+        && match forms::plan_flatten(&doc, pdfa) {
             Some(plan) => {
                 forms::apply_flatten(&mut doc, plan);
                 true
@@ -4229,7 +4242,7 @@ fn try_optimize(input: &[u8], options: OptimizeOptions) -> Result<OptimizeOutcom
     // smaller bytes. Counts as work — a file whose only win is a genuinely
     // smaller content re-emit deserves the rewrite (guarded so that pure
     // re-serialization does NOT count; see `replan_content`).
-    let minified = minify_content_streams(&mut doc, options.deflate_backend);
+    let minified = minify_content_streams(&mut doc, options.deflate_backend, pdfa);
 
     // Plan every image in parallel: each is an independent decode -> resize ->
     // re-encode against an immutable &Document, so there is no shared mutable
@@ -4252,6 +4265,7 @@ fn try_optimize(input: &[u8], options: OptimizeOptions) -> Result<OptimizeOutcom
             options.subset_fonts,
             options.convert_type1,
             options.strip_hinting,
+            pdfa,
         )
     } else {
         Vec::new()
@@ -4260,7 +4274,7 @@ fn try_optimize(input: &[u8], options: OptimizeOptions) -> Result<OptimizeOutcom
     // Plan lossless same-family Type1C union merges (read-only; empty unless
     // at least one family clears every byte-conservative precondition).
     let t1c_merge_plans = if options.subset_fonts {
-        fonts::plan_type1c_merges(&doc)
+        fonts::plan_type1c_merges(&doc, pdfa)
     } else {
         Vec::new()
     };
@@ -4325,14 +4339,14 @@ fn try_optimize(input: &[u8], options: OptimizeOptions) -> Result<OptimizeOutcom
     // unoptimized Huffman tables is a real win, not a serialization detail,
     // and must not be declined.
     let jpeg_huffman_done = nothing_else_qualified;
-    let jpeg_huffman_work = jpeg_huffman_done && reoptimize_jpeg_streams(&mut doc);
+    let jpeg_huffman_work = jpeg_huffman_done && reoptimize_jpeg_streams(&mut doc, pdfa);
 
     if nothing_else_qualified
         && !jpeg_huffman_work
         // Same story for the opt-in Type1C hint strip: it is real work, and
         // it is the only thing that happens in a `--strip-hinting` run over a
         // document whose fonts nothing else qualifies to touch.
-        && !(options.strip_hinting && fonts::any_type1c_hint_work(&doc))
+        && !(options.strip_hinting && fonts::any_type1c_hint_work(&doc, pdfa))
     {
         return Ok((None, signatures));
     }
@@ -4487,7 +4501,7 @@ fn try_optimize(input: &[u8], options: OptimizeOptions) -> Result<OptimizeOutcom
     // covers the programs this run just produced — union merges and
     // Type1 → Type1C conversions — not only the ones nothing else touched.
     if options.strip_hinting {
-        fonts::strip_type1c_hints(&mut doc);
+        fonts::strip_type1c_hints(&mut doc, pdfa);
     }
 
     // Optionally strip the PDF's structure tree (accessibility metadata). This
@@ -4574,7 +4588,7 @@ fn try_optimize(input: &[u8], options: OptimizeOptions) -> Result<OptimizeOutcom
     // which it only does for a document where nothing else qualified, so no
     // image decision came after it there either.
     if !jpeg_huffman_done {
-        reoptimize_jpeg_streams(&mut doc);
+        reoptimize_jpeg_streams(&mut doc, pdfa);
     }
 
     // Last planning-free pass: re-deflate every already-Flate stream with the
@@ -4582,7 +4596,7 @@ fn try_optimize(input: &[u8], options: OptimizeOptions) -> Result<OptimizeOutcom
     // Runs after EVERY other decision (images, fonts, bitonal, lossy, dedup,
     // prune, compress) so it is purely a serialization improvement and can
     // never influence, or be influenced by, what the planners chose.
-    redeflate_flate_streams(&mut doc, options.deflate_backend);
+    redeflate_flate_streams(&mut doc, options.deflate_backend, pdfa);
 
     // Renumber to a contiguous id space so the saved trailer /Size matches the
     // highest object number. Without this, lopdf 0.41's classic save emits a
@@ -4678,8 +4692,8 @@ fn budget_batches<T>(mut items: Vec<T>, budget: usize, cost: impl Fn(&T) -> usiz
 /// simply decline (nothing is smaller). The headroom is in the JPEGs the image
 /// path passes through untouched: CMYK/Separation payloads, and any image
 /// whose effective DPI is already at target.
-fn reoptimize_jpeg_streams(doc: &mut Document) -> bool {
-    if doc.is_encrypted() || fonts::pdfa_blocked(doc) {
+fn reoptimize_jpeg_streams(doc: &mut Document, pdfa: bool) -> bool {
+    if doc.is_encrypted() || pdfa {
         return false;
     }
 
@@ -4742,8 +4756,8 @@ fn reoptimize_jpeg_streams(doc: &mut Document) -> bool {
 /// and PDF/A-declared documents. Signed documents are NOT declined: see the
 /// module header of `src/signatures.rs` for why a signature guard here
 /// protects nothing.
-fn redeflate_flate_streams(doc: &mut Document, backend: DeflateBackend) {
-    if doc.is_encrypted() || fonts::pdfa_blocked(doc) {
+fn redeflate_flate_streams(doc: &mut Document, backend: DeflateBackend, pdfa: bool) {
+    if doc.is_encrypted() || pdfa {
         return;
     }
 
@@ -5561,6 +5575,91 @@ mod tests {
             once,
             "pass 2 must be a no-op"
         );
+    }
+
+    /// One-page PDF/A-1B-declared document whose content stream is spelled
+    /// loosely (`0.50000`, runs of spaces — the minifier's target) and stored
+    /// at deflate level 0 (the final re-deflate's target).
+    fn build_loose_pdfa_pdf() -> Vec<u8> {
+        use std::io::Write;
+        let mut payload = Vec::new();
+        for i in 0..2_000u32 {
+            payload.extend_from_slice(
+                format!(
+                    "q   0.50000 0 0 0.50000 {}.00000 {}.00000 cm   BT /F1 12 Tf (row {i}) Tj ET   Q\n",
+                    i % 97,
+                    i % 89
+                )
+                .as_bytes(),
+            );
+        }
+        let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::none());
+        enc.write_all(&payload).unwrap();
+        let mut doc = Document::with_version("1.4");
+        let content_id = doc.add_object(Stream::new(
+            dictionary! { "Filter" => "FlateDecode" },
+            enc.finish().unwrap(),
+        ));
+        let pages_id = doc.new_object_id();
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "Contents" => content_id,
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        });
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages", "Kids" => vec![page_id.into()], "Count" => 1,
+            }),
+        );
+        let xmp = doc.add_object(Stream::new(
+            dictionary! { "Type" => "Metadata", "Subtype" => "XML" },
+            b"<x:xmpmeta><rdf:Description xmlns:pdfaid=\"http://www.aiim.org/pdfa/ns/id/\"><pdfaid:part>1</pdfaid:part></rdf:Description></x:xmpmeta>".to_vec(),
+        ));
+        let catalog_id = doc.add_object(dictionary! {
+            "Type" => "Catalog", "Pages" => pages_id, "Metadata" => xmp,
+        });
+        doc.trailer.set("Root", catalog_id);
+        let mut pdf = Vec::new();
+        doc.save_to(&mut pdf).unwrap();
+        pdf
+    }
+
+    #[test]
+    fn pdfa_decline_is_decided_once_from_the_claim_the_output_carries() {
+        let pdf = build_loose_pdfa_pdf();
+        // Defaults: the PDF/A claim is kept, so every structural pass
+        // declines and nothing else qualifies — the exact input comes back.
+        assert_eq!(optimize(&pdf), pdf, "default PDF/A protection");
+
+        // Kitchen-lane shape: --strip-metadata removes the claim. Before the
+        // decision was made once per run, pass 1 still saw the claim in the
+        // minifier (it runs before the strip) and declined it, while the
+        // re-deflate (after the strip) did not; pass 2 then saw no claim and
+        // minified the content stream — pass 2 != pass 1. Now pass 1 already
+        // minifies and pass 2 has nothing left to do.
+        let opts = OptimizeOptions::default()
+            .with_strip_metadata(true)
+            .with_strip_accessibility(true);
+        let once = optimize_with_options(&pdf, opts);
+        assert!(once.len() < pdf.len(), "{} -> {}", pdf.len(), once.len());
+        let reloaded = Document::load_mem(&once).unwrap();
+        let (_, page) = reloaded.get_pages().into_iter().next().unwrap();
+        let content = reloaded.get_page_content(page);
+        assert!(
+            !contains_subslice(&content, b"0.50000"),
+            "pass 1 must already minify the content stream"
+        );
+        assert_eq!(
+            optimize_with_options(&once, opts),
+            once,
+            "pass 2 must be a no-op"
+        );
+    }
+
+    fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.windows(needle.len()).any(|w| w == needle)
     }
 
     #[test]
@@ -6886,7 +6985,8 @@ mod tests {
         let before_len = image_stream_len(&pdf);
 
         let mut doc = Document::load_mem(&pdf).unwrap();
-        redeflate_flate_streams(&mut doc, DeflateBackend::Zlib);
+        let pdfa = fonts::pdfa_blocked(&doc);
+        redeflate_flate_streams(&mut doc, DeflateBackend::Zlib, pdfa);
         let mut out: Vec<u8> = Vec::new();
         doc.save_to(&mut out).unwrap();
 
@@ -7059,12 +7159,14 @@ mod tests {
         let before_pixels = flate_image_pixels(&pdf);
 
         let mut doc = Document::load_mem(&pdf).unwrap();
-        redeflate_flate_streams(&mut doc, DeflateBackend::Zlib);
+        let pdfa = fonts::pdfa_blocked(&doc);
+        redeflate_flate_streams(&mut doc, DeflateBackend::Zlib, pdfa);
         let mut zlib_out: Vec<u8> = Vec::new();
         doc.save_to(&mut zlib_out).unwrap();
 
         let mut doc = Document::load_mem(&pdf).unwrap();
-        redeflate_flate_streams(&mut doc, DeflateBackend::Zopfli);
+        let pdfa = fonts::pdfa_blocked(&doc);
+        redeflate_flate_streams(&mut doc, DeflateBackend::Zopfli, pdfa);
         let mut zopfli_out: Vec<u8> = Vec::new();
         doc.save_to(&mut zopfli_out).unwrap();
 
@@ -7090,7 +7192,8 @@ mod tests {
         let mut reloaded: Vec<u8> = Vec::new();
         doc.save_to(&mut reloaded).unwrap();
         let mut doc = Document::load_mem(&zopfli_out).unwrap();
-        redeflate_flate_streams(&mut doc, DeflateBackend::Zopfli);
+        let pdfa = fonts::pdfa_blocked(&doc);
+        redeflate_flate_streams(&mut doc, DeflateBackend::Zopfli, pdfa);
         let mut twice: Vec<u8> = Vec::new();
         doc.save_to(&mut twice).unwrap();
         assert_eq!(reloaded, twice, "a second zopfli pass must change nothing");
@@ -7127,7 +7230,8 @@ mod tests {
         doc.save_to(&mut marked).unwrap();
 
         let mut reloaded = Document::load_mem(&marked).unwrap();
-        redeflate_flate_streams(&mut reloaded, DeflateBackend::Zlib);
+        let pdfa = fonts::pdfa_blocked(&reloaded);
+        redeflate_flate_streams(&mut reloaded, DeflateBackend::Zlib, pdfa);
         assert_eq!(
             image_stream_len_of(&reloaded),
             before,
@@ -7156,7 +7260,8 @@ mod tests {
         doc.save_to(&mut marked).unwrap();
 
         let mut reloaded = Document::load_mem(&marked).unwrap();
-        redeflate_flate_streams(&mut reloaded, DeflateBackend::Zlib);
+        let pdfa = fonts::pdfa_blocked(&reloaded);
+        redeflate_flate_streams(&mut reloaded, DeflateBackend::Zlib, pdfa);
         assert!(
             image_stream_len_of(&reloaded) < before,
             "signed: the weakly-deflated stream must still be re-deflated"
@@ -7830,7 +7935,8 @@ mod tests {
         doc.trailer.set("Root", catalog_id);
         let before = doc.get_and_decode_page_content(page_id).unwrap();
 
-        let changed = minify_content_streams(&mut doc, DeflateBackend::Zlib);
+        let pdfa = fonts::pdfa_blocked(&doc);
+        let changed = minify_content_streams(&mut doc, DeflateBackend::Zlib, pdfa);
         assert!(changed, "sloppy multi-stream page must minify");
         let ids = doc.get_page_contents(page_id);
         assert_eq!(ids.len(), 1, "array must merge to a single stream");

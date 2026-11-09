@@ -159,8 +159,9 @@ pub(crate) fn plan_font_subsets(
     subset_fonts: bool,
     convert_type1: bool,
     strip_hinting: bool,
+    pdfa: bool,
 ) -> Vec<FontPlan> {
-    if doc.is_encrypted() || pdfa_blocked(doc) {
+    if doc.is_encrypted() || pdfa {
         return Vec::new();
     }
 
@@ -246,8 +247,8 @@ struct T1cMember {
 /// (lossless: see src/cffmerge.rs for the byte-conservative preconditions).
 /// Read-only; any global disqualifier or per-family doubt yields no plan for
 /// that family.
-pub(crate) fn plan_type1c_merges(doc: &Document) -> Vec<T1cMergePlan> {
-    if doc.is_encrypted() || pdfa_blocked(doc) {
+pub(crate) fn plan_type1c_merges(doc: &Document, pdfa: bool) -> Vec<T1cMergePlan> {
+    if doc.is_encrypted() || pdfa {
         return Vec::new();
     }
     let mut refcounts: HashMap<ObjectId, usize> = HashMap::new();
@@ -441,8 +442,8 @@ pub(crate) fn plan_type1c_merges(doc: &Document) -> Vec<T1cMergePlan> {
 /// Per-program fail-safe: [`cffhint::strip_hints`] verifies the rewritten
 /// program traces glyph-for-glyph identically to the original and is strictly
 /// smaller; anything else leaves that stream exactly as it was.
-pub(crate) fn strip_type1c_hints(doc: &mut Document) {
-    if doc.is_encrypted() || pdfa_blocked(doc) {
+pub(crate) fn strip_type1c_hints(doc: &mut Document, pdfa: bool) {
+    if doc.is_encrypted() || pdfa {
         return;
     }
     let mut ids: Vec<ObjectId> = doc.objects.keys().copied().collect();
@@ -488,8 +489,8 @@ pub(crate) fn strip_type1c_hints(doc: &mut Document) {
 /// True when at least one `Type1C` program in the document has strippable
 /// hints. Read-only; used only to answer "is there any work at all" for a
 /// document nothing else touches. Stops at the first program that strips.
-pub(crate) fn any_type1c_hint_work(doc: &Document) -> bool {
-    if doc.is_encrypted() || pdfa_blocked(doc) {
+pub(crate) fn any_type1c_hint_work(doc: &Document, pdfa: bool) -> bool {
+    if doc.is_encrypted() || pdfa {
         return false;
     }
     doc.objects.values().any(|obj| {
@@ -665,13 +666,32 @@ fn resolve_ref<'a>(doc: &'a Document, mut obj: &'a Object) -> (Option<ObjectId>,
     (last, obj)
 }
 
+/// The PDF/A decline for one optimize run, decided ONCE on the input and
+/// handed to every pass that honors it (the `pdfa` parameter of the font
+/// planners, the hint strip, form flattening, the legacy-filter transcode,
+/// the content minifier, the JPEG Huffman pass and the final re-deflate).
+///
+/// With `metadata_stripped` (`--strip-metadata`) the output carries no XMP,
+/// so no PDF/A claim survives the run: a second pass over our own output
+/// could not see one and would run every pass the first one declined — not
+/// idempotent. The decline therefore follows the claim the OUTPUT will
+/// carry. An unreadable catalog stays declined either way: the strip cannot
+/// change that answer, so neither pass would see a different one.
+pub(crate) fn pdfa_declined(doc: &Document, metadata_stripped: bool) -> bool {
+    if metadata_stripped {
+        doc.catalog().is_err()
+    } else {
+        pdfa_blocked(doc)
+    }
+}
+
 /// True when the document declares PDF/A conformance in its XMP metadata (or
 /// when the metadata exists but cannot be read strictly — treated as "cannot
 /// rule PDF/A out"). Subsetting would invalidate `/CIDSet`-style conformance
-/// artifacts, so such documents are skipped wholesale in C-M1. Also consumed by
-/// the final re-deflate pass in `lib.rs`, which declines conformance-claiming
+/// artifacts, and every other structural pass declines conformance-claiming
 /// documents for the same "do not touch a document that asserts its own byte
-/// shape" reason.
+/// shape" reason. Passes never call this directly: they take the per-run
+/// decision from [`pdfa_declined`].
 pub(crate) fn pdfa_blocked(doc: &Document) -> bool {
     let Ok(catalog) = doc.catalog() else {
         return true;

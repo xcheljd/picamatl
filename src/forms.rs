@@ -23,7 +23,7 @@ use std::collections::{HashMap, HashSet};
 use lopdf::content::Content;
 use lopdf::{dictionary, Dictionary, Document, Object, ObjectId, Stream};
 
-use crate::{fonts, resolve};
+use crate::resolve;
 
 /// Depth bound for the field-tree walk and the `/Parent` climb.
 const MAX_DEPTH: usize = 32;
@@ -72,9 +72,10 @@ pub(crate) struct FlattenPlan {
 // -- planning ---------------------------------------------------------------
 
 /// Plan the flattening, or return `None` to decline the document.
-pub(crate) fn plan_flatten(doc: &Document) -> Option<FlattenPlan> {
-    // D1 — same posture as every other structural pass.
-    if doc.is_encrypted() || fonts::pdfa_blocked(doc) {
+pub(crate) fn plan_flatten(doc: &Document, pdfa: bool) -> Option<FlattenPlan> {
+    // D1 — same posture as every other structural pass (`pdfa` is the
+    // per-run decision from `fonts::pdfa_declined`).
+    if doc.is_encrypted() || pdfa {
         return None;
     }
     let catalog = doc.catalog().ok()?;
