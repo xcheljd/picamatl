@@ -590,8 +590,8 @@ pub(crate) mod tests {
         let rgb: Vec<u8> = chart_pixels(w, h).iter().map(|v| v | 7).collect();
         let mut palette: Vec<[u8; 3]> = Vec::new();
         let mut indices = Vec::with_capacity((w * h) as usize);
-        for px in rgb.chunks_exact(3) {
-            let c = [px[0], px[1], px[2]];
+        for px in rgb.as_chunks::<3>().0 {
+            let c = *px;
             let i = palette.iter().position(|p| *p == c).unwrap_or_else(|| {
                 palette.push(c);
                 palette.len() - 1
