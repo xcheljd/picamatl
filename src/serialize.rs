@@ -9,7 +9,7 @@
 use lopdf::Document;
 
 use crate::deflate::{
-    deflate_backend, deflate_zopfli, inflate_capped, png_defilter, png_up_filter,
+    deflate_backend, deflate_zopfli, inflate_capped, png_defilter, png_filter, PNG_UP,
 };
 use crate::{reals, DeflateBackend, OptimizeOptions, MAX_REDEFLATE_BYTES};
 
@@ -218,7 +218,7 @@ fn predicted_xref_payload(
     if row == 0 || content.is_empty() || !content.len().is_multiple_of(row) {
         return None;
     }
-    let filtered = png_up_filter(content, u32::try_from(row).ok()?, 1);
+    let filtered = png_filter(content, row, 1, PNG_UP);
     if filtered.len() != content.len() + content.len() / row {
         return None;
     }

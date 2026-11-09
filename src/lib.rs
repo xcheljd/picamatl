@@ -144,7 +144,7 @@ pub mod fuzz_api {
     }
 }
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use image::{DynamicImage, ImageFormat};
 use lopdf::content::Content;
@@ -153,7 +153,10 @@ use rayon::prelude::*;
 
 use classify::{image_is_figure_like, looks_like_line_art, mask_carries_flat_ink};
 use cmyk::{jpeg_component_count, jpeg_frame_info, plan_dct_cmyk};
-use deflate::{deflate_backend, deflate_level9, inflate_capped, png_defilter, png_up_filter};
+use deflate::{
+    deflate_backend, deflate_level9, deflate_zopfli, inflate_capped, png_defilter, png_filter,
+    PNG_FILTERS,
+};
 use serialize::save_document;
 use signatures::detect_signatures;
 
@@ -1093,7 +1096,7 @@ enum DictUpdate {
     /// JPEG path: the payload is still raw DCTDecode, nothing else changes.
     Dct,
     /// Flate path: normalize `/Filter` to the scalar name and set the new
-    /// `/DecodeParms` (Up-predictor variant) or remove it (plain deflate).
+    /// `/DecodeParms` (PNG-predictor variant) or remove it (plain deflate).
     Flate {
         decode_parms: Option<lopdf::Dictionary>,
     },
@@ -2284,8 +2287,8 @@ fn plan_flate_smask_pair_downsample(
 
     // Base: the exact eligibility gates and re-encode variants of the unmasked
     // Flate route (8bpc only, no /Decode, capped inflate + exact length check,
-    // plain-vs-Up-predictor output selection). Flate is lossless, so the
-    // deflate round trip needs no MAD-style decode-back of its own.
+    // plain-vs-Up-predictor output selection). Flate is lossless; the
+    // exact decode-back lives in `encode_flate_raster`.
     let (base_out, decode_parms) = plan_flate(doc, base_stream, px_w, px_h, target_w, target_h)?;
 
     // Mask: decode (JPEG or Flate) + resample to the SAME geometry + Flate
@@ -2534,17 +2537,9 @@ fn plan_indexed_smask_pair_downsample(
         resized.into_luma8().into_raw()
     };
 
-    // Candidate 1: the base-space raster, decode-back verified.
+    // Candidate 1: the base-space raster, decode-back verified (inside
+    // `encode_flate_raster`).
     let (expanded_out, expanded_parms) = encode_flate_raster(&raw, target_w, channels)?;
-    if !flate_raster_round_trips(
-        &expanded_out,
-        expanded_parms.is_some(),
-        &raw,
-        target_w,
-        channels,
-    ) {
-        return None;
-    }
     let mut best = (
         expanded_out,
         DictUpdate::IndexedToFlate {
@@ -2564,10 +2559,7 @@ fn plan_indexed_smask_pair_downsample(
                     indexed.palette[start..start + channels].iter().copied()
                 })
                 .eq(raw.iter().copied());
-            if expands_back
-                && idx_out.len() < best.0.len()
-                && flate_raster_round_trips(&idx_out, idx_parms.is_some(), &indices, target_w, 1)
-            {
+            if expands_back && idx_out.len() < best.0.len() {
                 best = (
                     idx_out,
                     DictUpdate::Flate {
@@ -2652,7 +2644,8 @@ const MAX_FLATE_PIXEL_BYTES: u64 = 256 * 1024 * 1024;
 
 /// The Flate same-format path: inflate (hard-capped), un-apply any PNG
 /// predictor, resize, and re-deflate at level 9 — trying both a PNG
-/// Up-predictor variant and a plain no-predictor variant, keeping the smaller.
+/// Up-predictor variant and a plain no-predictor variant, keeping the smaller
+/// ([`encode_flate_raster`]).
 /// `/ColorSpace` is never touched, so no artifact-class change is possible.
 ///
 /// Every eligibility gate returns `None` (image untouched) on doubt. Decoding
@@ -2682,34 +2675,97 @@ fn plan_flate(
     encode_flate_raster(&raw, target_w, channels)
 }
 
+/// Serialized cost charged to a PNG-predicted Flate image for the
+/// `/DecodeParms` dict it forces into the image dictionary (~70 bytes for
+/// `/Predictor 15 /Colors n /BitsPerComponent 8 /Columns w`). Every
+/// predictor-vs-plain comparison in the crate charges exactly this.
+const PARMS_OVERHEAD: usize = 70;
+
+/// The PNG filters the final row-filter pass ([`refilter_flate_images`])
+/// tries beside plain rows: Sub, Up, Avg, Paeth.
+const REFILTER_TAGS: &[u8] = &[
+    PNG_FILTERS[1],
+    PNG_FILTERS[2],
+    PNG_FILTERS[3],
+    PNG_FILTERS[4],
+];
+
+/// The PNG filter the image PLANNERS try beside plain rows: Up only. Planner
+/// output feeds never-larger guards that decide whether an image is
+/// downsampled at all, so a better encoder there would flip decisions (on the
+/// NASA reference, five images that were kept would be downsampled) — a
+/// pixel change, not a lossless one. The planners keep this choice; the final
+/// row-filter pass then re-encodes whatever they shipped under the best
+/// filter.
+const PLANNER_TAGS: &[u8] = &[PNG_FILTERS[2]];
+
+/// The smallest zlib-level-9 encoding of an 8-bit raster of
+/// `bytes_per_row`-byte rows among plain rows and the uniform PNG filters in
+/// `tags` (every row tagged with the same type). A predicted candidate pays
+/// [`PARMS_OVERHEAD`] for its `/DecodeParms`, and must be STRICTLY cheaper
+/// than every earlier candidate to win, so ties go to plain rows, then the
+/// earliest tag: the choice is a pure function of the samples (idempotent on
+/// a re-run over its own output).
+///
+/// Returns the payload and the winning tag (`None` = plain rows). Per-row
+/// adaptive filtering was measured at only 6 KB more over the corpus than
+/// the uniform choice, and is deliberately not attempted.
+fn best_flate_raster(
+    raw: &[u8],
+    bytes_per_row: usize,
+    bytes_per_pixel: usize,
+    tags: &[u8],
+) -> Option<(Vec<u8>, Option<u8>)> {
+    let mut best = (deflate_level9(raw)?, None);
+    let mut best_cost = best.0.len();
+    for &tag in tags {
+        let filtered = png_filter(raw, bytes_per_row, bytes_per_pixel, tag);
+        let payload = deflate_level9(&filtered)?;
+        let cost = payload.len() + PARMS_OVERHEAD;
+        if cost < best_cost {
+            best_cost = cost;
+            best = (payload, Some(tag));
+        }
+    }
+    Some(best)
+}
+
+/// The `/DecodeParms` that describe a [`best_flate_raster`] payload encoded
+/// under a PNG filter: `/Predictor 15` (per-row tags, so any tag decodes)
+/// with the raster's own geometry.
+fn png_decode_parms(channels: usize, width: u32) -> lopdf::Dictionary {
+    dictionary! {
+        "Predictor" => 15_i64,
+        "Colors" => channels as i64,
+        "BitsPerComponent" => 8_i64,
+        "Columns" => width as i64,
+    }
+}
+
 /// Deflate an 8-bit raster of `width`-pixel rows two ways — plain rows and
-/// PNG Up-filtered rows — and keep the smaller. The Up-predictor variant must
-/// also pay for the `/DecodeParms` dict it forces into the image dictionary
-/// (~70 serialized bytes), so the comparison includes that. Returns the
-/// payload and the parms it needs (`None` = plain rows).
+/// PNG Up-filtered rows ([`PLANNER_TAGS`]) — and keep the smaller, the
+/// predicted variant paying for the `/DecodeParms` dict it forces into the
+/// image dictionary. Returns the payload and the parms it needs (`None` =
+/// plain rows). The final row-filter pass later revisits the choice with
+/// every PNG filter.
+///
+/// The winner is decoded back ([`flate_raster_round_trips`]) before it is
+/// returned: every caller gets a payload proven to reproduce `raw` exactly,
+/// or `None`.
 fn encode_flate_raster(
     raw: &[u8],
     width: u32,
     channels: usize,
 ) -> Option<(Vec<u8>, Option<lopdf::Dictionary>)> {
-    let plain = deflate_level9(raw)?;
-    let up = deflate_level9(&png_up_filter(raw, width, channels))?;
-    const PARMS_OVERHEAD: usize = 70;
-    if up.len() + PARMS_OVERHEAD < plain.len() {
-        let parms = dictionary! {
-            "Predictor" => 15_i64,
-            "Colors" => channels as i64,
-            "BitsPerComponent" => 8_i64,
-            "Columns" => width as i64,
-        };
-        Some((up, Some(parms)))
-    } else {
-        Some((plain, None))
-    }
+    let bytes_per_row = (width as usize).checked_mul(channels)?;
+    let (payload, tag) = best_flate_raster(raw, bytes_per_row, channels, PLANNER_TAGS)?;
+    flate_raster_round_trips(&payload, tag.is_some(), raw, width, channels)
+        .then(|| (payload, tag.map(|_| png_decode_parms(channels, width))))
 }
 
 /// Decode-back for a payload [`encode_flate_raster`] produced: inflate it
-/// (capped), undo the Up predictor when `predicted`, and require the result
+/// (capped), undo the PNG predictor (any row tag) when `predicted`, and
+/// require the result
 /// to equal `raw` byte for byte. Flate is lossless, so anything short of
 /// exact equality is a bug and declines the candidate.
 fn flate_raster_round_trips(
@@ -2813,22 +2869,10 @@ fn plan_gray_collapses(doc: &Document) -> Vec<GrayCollapse> {
             }
             let gray: Vec<u8> = rgb.iter().step_by(3).copied().collect();
 
-            // Same encoder choice as `plan_flate`: plain vs Up-filtered rows,
-            // the predictor variant paying for the /DecodeParms it forces in.
-            let plain = deflate_level9(&gray)?;
-            let up = deflate_level9(&png_up_filter(&gray, px_w, 1))?;
-            const PARMS_OVERHEAD: usize = 70;
-            let (content, decode_parms) = if up.len() + PARMS_OVERHEAD < plain.len() {
-                let parms = dictionary! {
-                    "Predictor" => 15_i64,
-                    "Colors" => 1_i64,
-                    "BitsPerComponent" => 8_i64,
-                    "Columns" => px_w as i64,
-                };
-                (up, Some(parms))
-            } else {
-                (plain, None)
-            };
+            // Same encoder choice as `plan_flate` (plain vs Up-filtered rows,
+            // the predictor variant paying for the /DecodeParms it forces
+            // in), decode-back verified inside `encode_flate_raster`.
+            let (content, decode_parms) = encode_flate_raster(&gray, px_w, 1)?;
             (content.len() < stream.content.len()).then_some(GrayCollapse {
                 id,
                 content,
@@ -4306,9 +4350,11 @@ fn try_optimize(input: &[u8], options: OptimizeOptions) -> Result<OptimizeOutcom
     let gray_work = options.collapse_gray_images && !plan_gray_collapses(&doc).is_empty();
 
     // If we have no work to do at all, hand back the original bytes.
-    // Note: the serialization-time passes — pack_object_streams, the final
-    // re-deflate, and the xref-stream compression — are deliberately NOT
-    // counted as work here. Rewriting a file we otherwise decided not to touch
+    // Note: the serialization-time passes — pack_object_streams, the
+    // row-filter choice for Flate images, the final re-deflate, and the
+    // xref-stream compression — are deliberately NOT counted as work here
+    // (`refilter_alone_does_not_rewrite_an_otherwise_unchanged_file` pins the
+    // row-filter case). Rewriting a file we otherwise decided not to touch
     // would break the "declined everything ⇒ your exact bytes back" property
     // that `flate_ineligible_images_are_untouched` and friends pin; they only
     // apply to files we were already going to rewrite. Pinned by
@@ -4596,7 +4642,22 @@ fn try_optimize(input: &[u8], options: OptimizeOptions) -> Result<OptimizeOutcom
     // Runs after EVERY other decision (images, fonts, bitonal, lossy, dedup,
     // prune, compress) so it is purely a serialization improvement and can
     // never influence, or be influenced by, what the planners chose.
-    redeflate_flate_streams(&mut doc, options.deflate_backend, pdfa);
+    //
+    // Right before it, the lossless row-filter choice for Flate images
+    // (plain or the best uniform PNG filter over the same samples). Same
+    // posture: after every decision, after `doc.compress()` (an image it
+    // just deflated would otherwise first qualify on the NEXT run), a pure
+    // re-encoding. Two images with identical samples but differently
+    // predicted rows can come out byte-identical, so the dedup fixpoint runs
+    // again when anything changed — otherwise the next run would merge them.
+    // Not counted as work, like the re-deflate itself: a file nothing else
+    // touches keeps the "declined everything => your exact bytes" contract.
+    let refiltered = refilter_flate_images(&mut doc, options.deflate_backend, pdfa);
+    if !refiltered.is_empty() {
+        while dedup_objects(&mut doc) | dedup_streams(&mut doc) {}
+        doc.prune_objects();
+    }
+    redeflate_flate_streams(&mut doc, options.deflate_backend, pdfa, &refiltered);
 
     // Renumber to a contiguous id space so the saved trailer /Size matches the
     // highest object number. Without this, lopdf 0.41's classic save emits a
@@ -4756,7 +4817,16 @@ fn reoptimize_jpeg_streams(doc: &mut Document, pdfa: bool) -> bool {
 /// and PDF/A-declared documents. Signed documents are NOT declined: see the
 /// module header of `src/signatures.rs` for why a signature guard here
 /// protects nothing.
-fn redeflate_flate_streams(doc: &mut Document, backend: DeflateBackend, pdfa: bool) {
+///
+/// `skip` holds the images [`refilter_flate_images`] just re-encoded with this
+/// same backend, whose re-deflate could only reproduce the payload they
+/// already have (empty everywhere else).
+fn redeflate_flate_streams(
+    doc: &mut Document,
+    backend: DeflateBackend,
+    pdfa: bool,
+    skip: &HashSet<ObjectId>,
+) {
     if doc.is_encrypted() || pdfa {
         return;
     }
@@ -4771,6 +4841,9 @@ fn redeflate_flate_streams(doc: &mut Document, backend: DeflateBackend, pdfa: bo
             let Object::Stream(stream) = obj else {
                 return None;
             };
+            if skip.contains(&id) {
+                return None;
+            }
             // Object and cross-reference streams are the writer's business:
             // lopdf rebuilds both from scratch at save time (and the xref
             // stream is deflated by `compress_xref_stream` afterwards).
@@ -4809,6 +4882,274 @@ fn replan_deflate(content: &[u8], backend: DeflateBackend) -> Option<Vec<u8>> {
     (inflate_capped(&out, plain.len())? == plain).then_some(out)
 }
 
+/// Memory budget for concurrent PNG re-filtering ([`refilter_flate_images`]).
+/// One image holds its stored payload, the inflated rows, the defiltered
+/// samples, one filtered candidate and two deflate outputs at once — priced
+/// at six times the inflated size. Within the budget images run in parallel;
+/// past it they wait for a later batch, and an image over budget on its own
+/// runs alone. Nothing is skipped.
+const REFILTER_BUDGET: usize = 1 << 30;
+
+/// One Flate image XObject [`refilter_flate_images`] may re-encode: its
+/// geometry, its channel count (the PNG predictor's `/Colors`) and whether
+/// the stored rows are PNG-predicted today.
+struct RefilterJob<'a> {
+    id: ObjectId,
+    content: &'a [u8],
+    width: u32,
+    height: u32,
+    channels: usize,
+    predicted: bool,
+}
+
+/// A planned re-encode. `parms` is `Some(new /DecodeParms or None)` when the
+/// row filter changed (the dict is rewritten to match), `None` when only the
+/// payload changed under the SAME row bytes (a zopfli re-deflate of the
+/// stored rows, dict untouched — exactly what the final re-deflate would
+/// have shipped).
+struct Refilter {
+    id: ObjectId,
+    content: Vec<u8>,
+    parms: Option<Option<lopdf::Dictionary>>,
+}
+
+/// Lossless row-filter selection for Flate images picamatl otherwise keeps:
+/// every 8-bit, single-`FlateDecode` image XObject (and `/SMask`) is decoded
+/// to its raw samples and re-encoded under plain rows or the best uniform PNG
+/// filter ([`best_flate_raster`] over [`REFILTER_TAGS`]) — including the
+/// images the downsample planners just re-encoded under plain-vs-Up. The samples never change — only how the
+/// rows are predicted before deflate — so, like the re-deflate pass, this
+/// needs no consent flag; `/Decode`, a color-key `/Mask` and every other dict
+/// key still apply to identical samples and are preserved. Only `/Filter`
+/// (normalized to the scalar name) and `/DecodeParms` (`/Predictor 15` with
+/// the image's geometry, or removed for plain rows) are rewritten.
+///
+/// Scope (anything else is left exactly as it is): `/BitsPerComponent 8`, no
+/// `/ImageMask`, a color space with a certain component count of 1-4
+/// (Gray/RGB/CMYK, ICCBased N, Indexed, Cal*, Lab, Separation, DeviceN of up
+/// to four) or none at all for an image some image uses as its `/SMask`, and
+/// stored rows that are either plain or PNG-predicted with parms matching
+/// the image ([`flate_encoding`]: TIFF Predictor 2, parms arrays/references
+/// and mismatched `/Colors`/`/Columns` decline). The inflated length must be
+/// exact.
+///
+/// A new encoding ships only when it is STRICTLY cheaper — with the
+/// predictor paying [`PARMS_OVERHEAD`] — than both the stored payload and a
+/// level-9 re-deflate of the stored rows (what the final re-deflate would
+/// ship anyway), and only after it decodes back to the identical samples.
+/// Under [`DeflateBackend::Zopfli`] the filter is still chosen on zlib level
+/// 9 (zopfli per candidate would be ~5x the zopfli bill for a choice zlib
+/// already ranks), then the winner AND the stored rows are both zopflied and
+/// the smaller ships, so the zopfli lane is never larger than the final
+/// re-deflate alone would make it.
+///
+/// Idempotent: the choice is a pure function of the samples, and on a re-run
+/// the stored rows ARE the winner's rows, so nothing is strictly cheaper.
+///
+/// Returns the ids it rewrote; the final re-deflate skips them (their
+/// payload is already the backend's output for these rows). Declined
+/// wholesale for encrypted and PDF/A documents, like the re-deflate pass.
+fn refilter_flate_images(
+    doc: &mut Document,
+    backend: DeflateBackend,
+    pdfa: bool,
+) -> HashSet<ObjectId> {
+    let planned = plan_refilters(doc, backend, pdfa);
+    let mut written = HashSet::new();
+    for r in planned {
+        if let Ok(Object::Stream(stream)) = doc.get_object_mut(r.id) {
+            stream.set_content(r.content); // keeps /Length in sync
+            if let Some(parms) = r.parms {
+                stream
+                    .dict
+                    .set("Filter", Object::Name(b"FlateDecode".to_vec()));
+                match parms {
+                    Some(p) => stream.dict.set("DecodeParms", Object::Dictionary(p)),
+                    None => {
+                        stream.dict.remove(b"DecodeParms");
+                    }
+                }
+            }
+            written.insert(r.id);
+        }
+    }
+    written
+}
+
+/// The read-only planning half of [`refilter_flate_images`]: every planned
+/// re-encode, computed in memory-budgeted parallel batches.
+fn plan_refilters(doc: &Document, backend: DeflateBackend, pdfa: bool) -> Vec<Refilter> {
+    if doc.is_encrypted() || pdfa {
+        return Vec::new();
+    }
+    let is_image =
+        |s: &lopdf::Stream| matches!(s.dict.get(b"Subtype"), Ok(Object::Name(n)) if n == b"Image");
+    let smask_ids: HashSet<ObjectId> = doc
+        .objects
+        .values()
+        .filter_map(|obj| match obj {
+            Object::Stream(s) if is_image(s) => match s.dict.get(b"SMask") {
+                Ok(Object::Reference(r)) => Some(*r),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+
+    let jobs: Vec<RefilterJob> = doc
+        .objects
+        .iter()
+        .filter_map(|(&id, obj)| {
+            let Object::Stream(stream) = obj else {
+                return None;
+            };
+            if !is_image(stream) {
+                return None;
+            }
+            refilter_job(doc, id, stream, &smask_ids)
+        })
+        .collect();
+
+    let mut planned: Vec<Refilter> = Vec::new();
+    for batch in budget_batches(jobs, REFILTER_BUDGET, |j| {
+        let stored = (j.width as usize * j.channels + usize::from(j.predicted))
+            .saturating_mul(j.height as usize);
+        stored.saturating_mul(6).saturating_add(j.content.len())
+    }) {
+        let done: Vec<Refilter> = batch
+            .into_par_iter()
+            .filter_map(|j| plan_refilter(&j, backend))
+            .collect();
+        planned.extend(done);
+    }
+    planned
+}
+
+/// The eligibility gates of [`refilter_flate_images`] for one image stream.
+/// `None` on any doubt (stream untouched).
+fn refilter_job<'a>(
+    doc: &Document,
+    id: ObjectId,
+    stream: &'a lopdf::Stream,
+    smask_ids: &HashSet<ObjectId>,
+) -> Option<RefilterJob<'a>> {
+    let dict = &stream.dict;
+    if !matches!(
+        classify_filter(doc, dict.get(b"Filter").ok()?),
+        FilterClass::FlateOnly
+    ) {
+        return None;
+    }
+    if dict
+        .get(b"ImageMask")
+        .is_ok_and(|o| matches!(resolve(doc, o), Object::Boolean(true)))
+    {
+        return None;
+    }
+    let int = |key: &[u8]| resolve(doc, dict.get(key).ok()?).as_i64().ok();
+    if int(b"BitsPerComponent")? != 8 {
+        return None;
+    }
+    let width = u32::try_from(int(b"Width")?).ok().filter(|&w| w > 0)?;
+    let height = u32::try_from(int(b"Height")?).ok().filter(|&h| h > 0)?;
+    let channels = if dict.get(b"ColorSpace").is_ok() {
+        colorspace_component_count(doc, dict)?
+    } else if smask_ids.contains(&id) {
+        1
+    } else {
+        return None;
+    };
+    if !(1..=4).contains(&channels)
+        || !raster_within_budget(u64::from(width), u64::from(height), channels as u64)
+    {
+        return None;
+    }
+    let predicted = match flate_encoding(dict, channels, width)? {
+        FlateEncoding::Plain => false,
+        FlateEncoding::PngPredictor => true,
+    };
+    Some(RefilterJob {
+        id,
+        content: &stream.content,
+        width,
+        height,
+        channels,
+        predicted,
+    })
+}
+
+/// Plan one [`refilter_flate_images`] re-encode (pure; see there for the
+/// cost rule and the zopfli handling). Every shipped payload is decoded back
+/// and must reproduce the stored samples (or, for a payload-only change, the
+/// stored rows) exactly.
+fn plan_refilter(job: &RefilterJob, backend: DeflateBackend) -> Option<Refilter> {
+    let channels = job.channels;
+    let bytes_per_row = (job.width as usize).checked_mul(channels)?;
+    let stored_row = bytes_per_row + usize::from(job.predicted);
+    let stored_len = stored_row.checked_mul(job.height as usize)?;
+    let rows = inflate_capped(job.content, stored_len)?;
+    if rows.len() != stored_len {
+        return None;
+    }
+    let defiltered;
+    let raw: &[u8] = if job.predicted {
+        defiltered = png_defilter(&rows, channels, bytes_per_row)?;
+        &defiltered
+    } else {
+        &rows
+    };
+    let stored_parms = if job.predicted { PARMS_OVERHEAD } else { 0 };
+    let parms_cost = |tag: Option<u8>| if tag.is_some() { PARMS_OVERHEAD } else { 0 };
+
+    // What the pipeline ships for this stream without this pass: the stored
+    // payload, or the final re-deflate's level-9 output when smaller.
+    let reflated = deflate_level9(&rows)?;
+    let baseline = job.content.len().min(reflated.len()) + stored_parms;
+    drop(reflated);
+    let (payload, tag) = best_flate_raster(raw, bytes_per_row, channels, REFILTER_TAGS)?;
+    if payload.len() + parms_cost(tag) >= baseline {
+        return None;
+    }
+
+    let (content, new_rows) = match backend {
+        DeflateBackend::Zlib => (payload, true),
+        DeflateBackend::Zopfli => {
+            drop(payload);
+            let winner_rows = match tag {
+                Some(t) => png_filter(raw, bytes_per_row, channels, t),
+                None => raw.to_vec(),
+            };
+            let new_z = deflate_zopfli(&winner_rows)?;
+            drop(winner_rows);
+            let stored_z = deflate_zopfli(&rows)?;
+            let stored_best = job.content.len().min(stored_z.len()) + stored_parms;
+            if new_z.len() + parms_cost(tag) < stored_best {
+                (new_z, true)
+            } else if stored_z.len() < job.content.len() {
+                (stored_z, false)
+            } else {
+                return None;
+            }
+        }
+    };
+
+    if new_rows {
+        flate_raster_round_trips(&content, tag.is_some(), raw, job.width, channels).then(|| {
+            Refilter {
+                id: job.id,
+                content,
+                parms: Some(tag.map(|_| png_decode_parms(channels, job.width))),
+            }
+        })
+    } else {
+        (inflate_capped(&content, stored_len)? == rows).then_some(Refilter {
+            id: job.id,
+            content,
+            parms: None,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4820,7 +5161,7 @@ mod tests {
         line_art_metrics, FIGURE_MAX_BACKGROUND, FIGURE_MIN_BACKGROUND, FIGURE_MIN_EDGES,
     };
     use crate::cmyk::tests::jpeg_fixture;
-    use crate::deflate::paeth_predict;
+    use crate::deflate::{paeth_predict, PNG_UP};
     use crate::serialize::find_sub;
 
     /// Build a one-page PDF embedding a `px`×`px` RGB JPEG drawn into a
@@ -6299,15 +6640,31 @@ mod tests {
         out.into_iter().map(|(_, v)| v).collect()
     }
 
-    /// A mask stream's `(bytes, width, height)`.
+    /// A mask stream's `(decoded samples, width, height)`. Samples, not
+    /// stored bytes: the lossless row-filter pass may re-encode a mask it
+    /// otherwise leaves alone (same samples, different PNG predictor).
     fn mask_shape(pdf: &[u8], mask_id: ObjectId) -> (Vec<u8>, i64, i64) {
         let doc = Document::load_mem(pdf).unwrap();
         let s = doc.get_object(mask_id).unwrap().as_stream().unwrap();
         (
-            s.content.clone(),
+            stream_samples(s),
             s.dict.get(b"Width").unwrap().as_i64().unwrap(),
             s.dict.get(b"Height").unwrap().as_i64().unwrap(),
         )
+    }
+
+    /// A Flate image stream's decoded samples (inflate, then the crate's own
+    /// spec-correct PNG defilter when `/DecodeParms` carries a predictor).
+    fn stream_samples(s: &lopdf::Stream) -> Vec<u8> {
+        let rows = inflate_capped(&s.content, 1 << 26).unwrap();
+        match s.dict.get(b"DecodeParms") {
+            Ok(Object::Dictionary(p)) if p.get(b"Predictor").unwrap().as_i64().unwrap() >= 10 => {
+                let colors = p.get(b"Colors").unwrap().as_i64().unwrap() as usize;
+                let cols = p.get(b"Columns").unwrap().as_i64().unwrap() as usize;
+                png_defilter(&rows, colors, cols * colors).unwrap()
+            }
+            _ => rows,
+        }
     }
 
     #[test]
@@ -6344,7 +6701,7 @@ mod tests {
         assert_eq!(
             mask_shape(&out, mask_id),
             mask_before,
-            "the mask stream must be byte-identical, same dimensions"
+            "the mask samples must be identical, same dimensions"
         );
         assert!(Document::load_mem(&out).is_ok(), "output must load back");
 
@@ -6450,7 +6807,7 @@ mod tests {
         assert_eq!(
             mask_shape(&out, before[0].1),
             mask_before,
-            "the shared mask must be byte-identical, same dimensions"
+            "the shared mask samples must be identical, same dimensions"
         );
         assert!(Document::load_mem(&out).is_ok(), "output must load back");
     }
@@ -6986,7 +7343,7 @@ mod tests {
 
         let mut doc = Document::load_mem(&pdf).unwrap();
         let pdfa = fonts::pdfa_blocked(&doc);
-        redeflate_flate_streams(&mut doc, DeflateBackend::Zlib, pdfa);
+        redeflate_flate_streams(&mut doc, DeflateBackend::Zlib, pdfa, &HashSet::new());
         let mut out: Vec<u8> = Vec::new();
         doc.save_to(&mut out).unwrap();
 
@@ -7160,13 +7517,13 @@ mod tests {
 
         let mut doc = Document::load_mem(&pdf).unwrap();
         let pdfa = fonts::pdfa_blocked(&doc);
-        redeflate_flate_streams(&mut doc, DeflateBackend::Zlib, pdfa);
+        redeflate_flate_streams(&mut doc, DeflateBackend::Zlib, pdfa, &HashSet::new());
         let mut zlib_out: Vec<u8> = Vec::new();
         doc.save_to(&mut zlib_out).unwrap();
 
         let mut doc = Document::load_mem(&pdf).unwrap();
         let pdfa = fonts::pdfa_blocked(&doc);
-        redeflate_flate_streams(&mut doc, DeflateBackend::Zopfli, pdfa);
+        redeflate_flate_streams(&mut doc, DeflateBackend::Zopfli, pdfa, &HashSet::new());
         let mut zopfli_out: Vec<u8> = Vec::new();
         doc.save_to(&mut zopfli_out).unwrap();
 
@@ -7193,7 +7550,7 @@ mod tests {
         doc.save_to(&mut reloaded).unwrap();
         let mut doc = Document::load_mem(&zopfli_out).unwrap();
         let pdfa = fonts::pdfa_blocked(&doc);
-        redeflate_flate_streams(&mut doc, DeflateBackend::Zopfli, pdfa);
+        redeflate_flate_streams(&mut doc, DeflateBackend::Zopfli, pdfa, &HashSet::new());
         let mut twice: Vec<u8> = Vec::new();
         doc.save_to(&mut twice).unwrap();
         assert_eq!(reloaded, twice, "a second zopfli pass must change nothing");
@@ -7231,7 +7588,7 @@ mod tests {
 
         let mut reloaded = Document::load_mem(&marked).unwrap();
         let pdfa = fonts::pdfa_blocked(&reloaded);
-        redeflate_flate_streams(&mut reloaded, DeflateBackend::Zlib, pdfa);
+        redeflate_flate_streams(&mut reloaded, DeflateBackend::Zlib, pdfa, &HashSet::new());
         assert_eq!(
             image_stream_len_of(&reloaded),
             before,
@@ -7261,7 +7618,7 @@ mod tests {
 
         let mut reloaded = Document::load_mem(&marked).unwrap();
         let pdfa = fonts::pdfa_blocked(&reloaded);
-        redeflate_flate_streams(&mut reloaded, DeflateBackend::Zlib, pdfa);
+        redeflate_flate_streams(&mut reloaded, DeflateBackend::Zlib, pdfa, &HashSet::new());
         assert!(
             image_stream_len_of(&reloaded) < before,
             "signed: the weakly-deflated stream must still be re-deflated"
@@ -10802,5 +11159,551 @@ mod tests {
         );
         assert_eq!(reindex_raster(&[40, 50, 61], &palette, 3), None);
         assert_eq!(reindex_raster(&[7, 9], &[9, 7], 1), Some(vec![1, 0]));
+    }
+
+    // ---- Row-filter selection (png_filter / best_flate_raster / refilter) ----
+
+    /// Smooth, non-repeating 8-bit raster: plain deflate finds few matches,
+    /// while every PNG predictor turns it into small residuals. Used where a
+    /// fixture needs the row-filter pass to have a real win.
+    fn smooth_field(px_w: u32, px_h: u32, channels: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(px_w as usize * px_h as usize * channels);
+        for y in 0..px_h as usize {
+            for x in 0..px_w as usize {
+                for c in 0..channels {
+                    out.push(((x * x / 97 + y * y / 131 + x * y / 211 + c * 17) % 256) as u8);
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn png_filter_round_trips_every_tag_and_channel_count() {
+        for channels in [1usize, 3, 4] {
+            for (w, h) in [(1u32, 1u32), (7, 5), (33, 17)] {
+                let mut raw = flate_pixels(w, h, channels);
+                // Mix in smooth data so the predictors see both regimes.
+                for (r, s) in raw.iter_mut().zip(smooth_field(w, h, channels)) {
+                    *r = r.wrapping_add(s) / 2;
+                }
+                let bpr = w as usize * channels;
+                for tag in PNG_FILTERS {
+                    let filtered = png_filter(&raw, bpr, channels, tag);
+                    assert_eq!(
+                        filtered.len(),
+                        raw.len() + h as usize,
+                        "tag {tag} c{channels}"
+                    );
+                    assert_eq!(
+                        filtered,
+                        png_filter_rows(&raw, w, channels, tag),
+                        "production encoder must match the independent oracle (tag {tag}, c{channels})"
+                    );
+                    assert_eq!(
+                        png_defilter(&filtered, channels, bpr).as_deref(),
+                        Some(raw.as_slice()),
+                        "tag {tag}, {channels} channels, {w}x{h}: defilter must invert"
+                    );
+                }
+            }
+        }
+        // Degenerate shapes yield nothing rather than panicking.
+        assert!(png_filter(&[1, 2, 3], 0, 1, 2).is_empty());
+        assert!(png_filter(&[1, 2, 3], 3, 1, 5).is_empty());
+    }
+
+    #[test]
+    fn png_filter_up_matches_the_old_lopdf_up_encoder() {
+        // The xref-stream predictor and the planners' Up candidate used
+        // lopdf's `encode_row(Up)`; switching to `png_filter` must leave
+        // their bytes identical.
+        use lopdf::filters::png;
+        for channels in [1usize, 3, 4] {
+            let (w, h) = (29u32, 11u32);
+            let raw = flate_pixels(w, h, channels);
+            let bpr = w as usize * channels;
+            let mut old = Vec::new();
+            let mut previous = vec![0u8; bpr];
+            for row in raw.chunks_exact(bpr) {
+                let mut current = row.to_vec();
+                png::encode_row(png::FilterType::Up, channels, &previous, &mut current);
+                old.push(2);
+                old.extend_from_slice(&current);
+                previous.copy_from_slice(row);
+            }
+            assert_eq!(png_filter(&raw, bpr, channels, PNG_UP), old);
+        }
+    }
+
+    #[test]
+    fn best_flate_raster_picks_the_cheapest_candidate() {
+        let fixtures: Vec<(Vec<u8>, u32, u32, usize)> = vec![
+            (smooth_field(120, 90, 3), 120, 90, 3),
+            (smooth_field(64, 64, 1), 64, 64, 1),
+            (smooth_field(50, 40, 4), 50, 40, 4),
+            (flate_pixels(80, 80, 3), 80, 80, 3), // noise: plain should win
+            (vec![200u8; 300 * 3 * 20], 300, 20, 3), // flat: plain should win
+        ];
+        let mut predicted_wins = 0;
+        for (raw, w, _h, c) in fixtures {
+            let bpr = w as usize * c;
+            let (payload, tag) = best_flate_raster(&raw, bpr, c, REFILTER_TAGS).unwrap();
+            // Brute force every candidate's cost, same rule.
+            let mut costs = vec![(deflate_level9(&raw).unwrap().len(), None)];
+            for &t in REFILTER_TAGS {
+                let z = deflate_level9(&png_filter(&raw, bpr, c, t)).unwrap();
+                costs.push((z.len() + PARMS_OVERHEAD, Some(t)));
+            }
+            let min = costs.iter().map(|c| c.0).min().unwrap();
+            let first_min = costs.iter().find(|c| c.0 == min).unwrap().1;
+            let chosen_cost = payload.len() + if tag.is_some() { PARMS_OVERHEAD } else { 0 };
+            assert_eq!(chosen_cost, min, "must pick the cheapest of {costs:?}");
+            assert_eq!(tag, first_min, "ties go to plain, then the lowest tag");
+            predicted_wins += usize::from(tag.is_some());
+            // The planners' rule is plain-vs-Up only.
+            let (_, planner_tag) = best_flate_raster(&raw, bpr, c, PLANNER_TAGS).unwrap();
+            assert!(matches!(planner_tag, None | Some(2)));
+        }
+        assert!(
+            predicted_wins >= 3,
+            "smooth fixtures must exercise the predictors"
+        );
+    }
+
+    /// Rows of a horizontal ramp, each shifted by a pseudo-random offset:
+    /// Sub turns every row into a constant, Up sees noise.
+    fn sub_friendly(px_w: u32, px_h: u32, channels: usize) -> Vec<u8> {
+        let offsets = flate_pixels(px_h, 1, 1);
+        let mut out = Vec::with_capacity(px_w as usize * px_h as usize * channels);
+        for &offset in &offsets {
+            for x in 0..px_w as usize {
+                for c in 0..channels {
+                    out.push((x * 3 + c * 5 + usize::from(offset)) as u8);
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn planner_encoder_keeps_the_plain_vs_up_choice() {
+        // The downsample planners' output feeds the never-larger guards that
+        // decide whether an image is downsampled at all, so their encoder
+        // must stay exactly the old plain-vs-Up rule (a better one would
+        // flip decisions — a pixel change). Byte-for-byte against that rule.
+        let mut other_filter_would_win = false;
+        for (raw, w, c) in [
+            (smooth_field(120, 90, 3), 120u32, 3usize),
+            (smooth_field(64, 64, 1), 64, 1),
+            (flate_pixels(80, 80, 3), 80, 3),
+            (sub_friendly(90, 70, 3), 90, 3),
+        ] {
+            let bpr = w as usize * c;
+            let plain = deflate_level9(&raw).unwrap();
+            let up = deflate_level9(&png_filter(&raw, bpr, c, PNG_UP)).unwrap();
+            let expected = if up.len() + PARMS_OVERHEAD < plain.len() {
+                (up, true)
+            } else {
+                (plain, false)
+            };
+            let (out, parms) = encode_flate_raster(&raw, w, c).unwrap();
+            assert_eq!((out, parms.is_some()), expected);
+            let (_, best) = best_flate_raster(&raw, bpr, c, REFILTER_TAGS).unwrap();
+            other_filter_would_win |= !matches!(best, None | Some(PNG_UP));
+        }
+        assert!(
+            other_filter_would_win,
+            "premise: a non-Up filter wins somewhere"
+        );
+    }
+
+    /// One page drawing each image at its own pixel size (72 DPI, far below
+    /// the downsample target), so nothing but the lossless passes qualifies.
+    fn wrap_images_pdf(doc: &mut Document, images: &[(ObjectId, i64)]) -> Vec<u8> {
+        let mut ops = vec![];
+        let mut xobjs = lopdf::Dictionary::new();
+        for (i, &(id, size)) in images.iter().enumerate() {
+            let name = format!("Im{i}");
+            xobjs.set(name.as_bytes().to_vec(), id);
+            ops.push(Operation::new("q", vec![]));
+            ops.push(Operation::new(
+                "cm",
+                vec![
+                    size.into(),
+                    0.into(),
+                    0.into(),
+                    size.into(),
+                    (i as i64 * size).into(),
+                    0.into(),
+                ],
+            ));
+            ops.push(Operation::new("Do", vec![Object::Name(name.into_bytes())]));
+            ops.push(Operation::new("Q", vec![]));
+        }
+        let content_id = doc.add_object(Stream::new(
+            dictionary! {},
+            Content { operations: ops }.encode().unwrap(),
+        ));
+        let pages_id = doc.new_object_id();
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page", "Parent" => pages_id, "Contents" => content_id,
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Resources" => dictionary! { "XObject" => xobjs },
+        });
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages", "Kids" => vec![page_id.into()], "Count" => 1,
+            }),
+        );
+        let catalog_id = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+        doc.trailer.set("Root", catalog_id);
+        let mut out: Vec<u8> = Vec::new();
+        doc.save_to(&mut out).unwrap();
+        out
+    }
+
+    /// A Flate image stream of `raw` (plain rows, or rows under PNG `tag`
+    /// with matching `/DecodeParms`), with `extra` keys merged into its dict.
+    fn flate_image_stream(
+        raw: &[u8],
+        px: u32,
+        channels: usize,
+        tag: Option<u8>,
+        extra: lopdf::Dictionary,
+    ) -> Stream {
+        let colorspace = match channels {
+            1 => "DeviceGray",
+            3 => "DeviceRGB",
+            _ => "DeviceCMYK",
+        };
+        let mut dict = dictionary! {
+            "Type" => "XObject", "Subtype" => "Image",
+            "Width" => px as i64, "Height" => px as i64,
+            "ColorSpace" => colorspace, "BitsPerComponent" => 8_i64,
+            "Filter" => "FlateDecode",
+        };
+        let payload = match tag {
+            Some(t) => {
+                dict.set("DecodeParms", png_decode_parms(channels, px));
+                deflate_level9(&png_filter(raw, px as usize * channels, channels, t)).unwrap()
+            }
+            None => deflate_level9(raw).unwrap(),
+        };
+        for (k, v) in extra.iter() {
+            dict.set(k.clone(), v.clone());
+        }
+        Stream::new(dict, payload)
+    }
+
+    /// Options that make every run a real rewrite (stripping the structure
+    /// tree counts as work), so the row-filter pass — which, like the final
+    /// re-deflate, never makes an otherwise-untouched file a rewrite — runs.
+    fn rewrite_opts() -> OptimizeOptions {
+        OptimizeOptions::default().with_strip_accessibility(true)
+    }
+
+    /// Every image stream of `pdf`: (dict, decoded samples via the crate's
+    /// own spec-correct decoder).
+    fn image_samples(pdf: &[u8]) -> Vec<(lopdf::Dictionary, Vec<u8>)> {
+        let doc = Document::load_mem(pdf).unwrap();
+        let mut out = vec![];
+        for obj in doc.objects.values() {
+            let Object::Stream(s) = obj else { continue };
+            if !matches!(s.dict.get(b"Subtype"), Ok(Object::Name(n)) if n == b"Image") {
+                continue;
+            }
+            out.push((s.dict.clone(), stream_samples(s)));
+        }
+        out
+    }
+
+    #[test]
+    fn refilter_picks_a_better_png_filter_for_stored_flate_images() {
+        // Stored plain, at its own size (nothing downsamples it): only the
+        // row-filter pass can improve the image.
+        for channels in [1usize, 3, 4] {
+            let px = 160;
+            let raw = smooth_field(px, px, channels);
+            let mut doc = Document::with_version("1.5");
+            let extra = dictionary! {
+                "Decode" => (0..channels).flat_map(|_| [Object::Integer(1), Object::Integer(0)]).collect::<Vec<_>>(),
+                "Interpolate" => true,
+            };
+            let id = doc.add_object(flate_image_stream(&raw, px, channels, None, extra));
+            let pdf = wrap_images_pdf(&mut doc, &[(id, px as i64)]);
+
+            let once = optimize_with_options(&pdf, rewrite_opts());
+            assert!(
+                once.len() < pdf.len(),
+                "c{channels}: the re-filter must shrink"
+            );
+            let images = image_samples(&once);
+            assert_eq!(images.len(), 1);
+            let (dict, samples) = &images[0];
+            assert_eq!(samples, &raw, "c{channels}: samples must be identical");
+            let parms = dict.get(b"DecodeParms").unwrap().as_dict().unwrap();
+            assert_eq!(parms.get(b"Predictor").unwrap().as_i64().unwrap(), 15);
+            assert_eq!(
+                parms.get(b"Colors").unwrap().as_i64().unwrap(),
+                channels as i64
+            );
+            assert_eq!(parms.get(b"Columns").unwrap().as_i64().unwrap(), px as i64);
+            assert_eq!(parms.get(b"BitsPerComponent").unwrap().as_i64().unwrap(), 8);
+            // Every other key survives untouched.
+            assert!(dict.get(b"Decode").is_ok() && dict.get(b"Interpolate").is_ok());
+
+            // The payload is exactly the best uniform choice over the samples.
+            let (best, tag) =
+                best_flate_raster(&raw, px as usize * channels, channels, REFILTER_TAGS).unwrap();
+            assert!(tag.is_some());
+            let doc_out = Document::load_mem(&once).unwrap();
+            let stored = doc_out
+                .objects
+                .values()
+                .find_map(|o| match o {
+                    Object::Stream(s) if s.dict.get(b"Width").is_ok() => Some(s.content.clone()),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(stored, best);
+
+            let twice = optimize_with_options(&once, rewrite_opts());
+            assert_eq!(
+                once, twice,
+                "c{channels}: a second pass must be byte-identical"
+            );
+        }
+    }
+
+    #[test]
+    fn refilter_replaces_a_worse_stored_predictor_and_can_drop_parms() {
+        let px = 160;
+        // Smooth data stored under Avg where another filter wins.
+        let raw = smooth_field(px, px, 3);
+        let (_, best_tag) = best_flate_raster(&raw, px as usize * 3, 3, REFILTER_TAGS).unwrap();
+        let worse = (1..=4u8).find(|&t| Some(t) != best_tag).unwrap();
+        let mut doc = Document::with_version("1.5");
+        let id = doc.add_object(flate_image_stream(&raw, px, 3, Some(worse), dictionary! {}));
+        let pdf = wrap_images_pdf(&mut doc, &[(id, px as i64)]);
+        let once = optimize_with_options(&pdf, rewrite_opts());
+        let images = image_samples(&once);
+        assert_eq!(images[0].1, raw);
+        assert!(once.len() < pdf.len());
+        assert_eq!(optimize_with_options(&once, rewrite_opts()), once);
+
+        // Noise stored under Up: plain rows win, so /DecodeParms must go.
+        let noise = flate_pixels(px, px, 3);
+        let mut doc = Document::with_version("1.5");
+        let id = doc.add_object(flate_image_stream(&noise, px, 3, Some(2), dictionary! {}));
+        let pdf = wrap_images_pdf(&mut doc, &[(id, px as i64)]);
+        let once = optimize_with_options(&pdf, rewrite_opts());
+        let images = image_samples(&once);
+        assert_eq!(images[0].1, noise);
+        assert!(
+            images[0].0.get(b"DecodeParms").is_err(),
+            "plain rows carry no parms"
+        );
+        assert_eq!(optimize_with_options(&once, rewrite_opts()), once);
+    }
+
+    #[test]
+    fn refilter_alone_does_not_rewrite_an_otherwise_unchanged_file() {
+        // Same placement contract as the final re-deflate
+        // (`serialization_wins_do_not_rewrite_an_otherwise_unchanged_file`):
+        // a file whose ONLY win would be a better row filter comes back
+        // byte-identical under default options.
+        let px = 160;
+        let raw = smooth_field(px, px, 3);
+        let mut doc = Document::with_version("1.5");
+        let id = doc.add_object(flate_image_stream(&raw, px, 3, None, dictionary! {}));
+        let pdf = wrap_images_pdf(&mut doc, &[(id, px as i64)]);
+        let job_doc = Document::load_mem(&pdf).unwrap();
+        assert!(
+            !plan_refilters(&job_doc, DeflateBackend::Zlib, false).is_empty(),
+            "premise: the pass would have a win"
+        );
+        assert_eq!(optimize(&pdf), pdf);
+    }
+
+    #[test]
+    fn refilter_declines_out_of_scope_images() {
+        let px = 120;
+        let raw = smooth_field(px, px, 3);
+        let tiff_parms = dictionary! {
+            "Predictor" => 2_i64, "Colors" => 3_i64, "BitsPerComponent" => 8_i64,
+            "Columns" => px as i64,
+        };
+        let cases: Vec<(&str, Stream)> = vec![
+            (
+                "TIFF Predictor 2",
+                flate_image_stream(
+                    &raw,
+                    px,
+                    3,
+                    None,
+                    dictionary! { "DecodeParms" => tiff_parms },
+                ),
+            ),
+            ("16-bit", {
+                let mut s = flate_image_stream(&raw, px, 3, None, dictionary! {});
+                s.dict.set("Width", (px / 2) as i64);
+                s.dict.set("BitsPerComponent", 16_i64);
+                s
+            }),
+            ("multi-filter chain", {
+                let mut s = flate_image_stream(&raw, px, 3, None, dictionary! {});
+                let hex: Vec<u8> = s
+                    .content
+                    .iter()
+                    .flat_map(|b| format!("{b:02x}").into_bytes())
+                    .collect();
+                s.set_content(hex);
+                s.dict.set(
+                    "Filter",
+                    vec![
+                        Object::Name(b"ASCIIHexDecode".to_vec()),
+                        Object::Name(b"FlateDecode".to_vec()),
+                    ],
+                );
+                s
+            }),
+            ("unknown color space", {
+                let mut s = flate_image_stream(&raw, px, 3, None, dictionary! {});
+                s.dict.set("ColorSpace", Object::Name(b"Pattern".to_vec()));
+                s
+            }),
+            ("trailing excess data", {
+                let mut doubled = raw.clone();
+                doubled.extend_from_slice(&raw);
+                let mut s = flate_image_stream(&raw, px, 3, None, dictionary! {});
+                s.set_content(deflate_level9(&doubled).unwrap());
+                s
+            }),
+            ("parms /Colors mismatch", {
+                let mut s = flate_image_stream(&raw, px, 3, Some(1), dictionary! {});
+                if let Ok(Object::Dictionary(p)) = s.dict.get_mut(b"DecodeParms") {
+                    p.set("Colors", 1_i64);
+                    p.set("Columns", (px * 3) as i64);
+                }
+                s
+            }),
+        ];
+        for (label, stream) in cases {
+            let mut doc = Document::with_version("1.5");
+            let job_stream = stream.clone();
+            let id = doc.add_object(stream);
+            assert!(
+                refilter_job(&doc, id, &job_stream, &HashSet::new())
+                    .and_then(|j| plan_refilter(&j, DeflateBackend::Zlib))
+                    .is_none(),
+                "{label}: must be declined"
+            );
+            let pdf = wrap_images_pdf(&mut doc, &[(id, px as i64)]);
+            // A legacy chain is transcoded to one FlateDecode by its own pass
+            // (and the result is then fair game); every other shape must come
+            // back byte-identical.
+            if label != "multi-filter chain" {
+                assert_eq!(
+                    optimize(&pdf),
+                    pdf,
+                    "{label}: file must come back unchanged"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn refilter_handles_a_dictless_smask_and_merges_images_it_makes_identical() {
+        // Two copies of the same samples, stored under different row
+        // filters behind the SAME dict shape (so no dedup pass can merge
+        // them up front: their payloads and decoded rows differ), each with
+        // an /SMask that has no /ColorSpace of its own.
+        let px = 140;
+        let raw = smooth_field(px, px, 3);
+        let mask = smooth_field(px, px, 1);
+        let mut doc = Document::with_version("1.5");
+        let mut mask_stream = flate_image_stream(&mask, px, 1, None, dictionary! {});
+        mask_stream.dict.remove(b"ColorSpace");
+        let mask_id = doc.add_object(mask_stream);
+        let a = doc.add_object(flate_image_stream(
+            &raw,
+            px,
+            3,
+            Some(1),
+            dictionary! { "SMask" => mask_id },
+        ));
+        let b = doc.add_object(flate_image_stream(
+            &raw,
+            px,
+            3,
+            Some(3),
+            dictionary! { "SMask" => mask_id },
+        ));
+        let pdf = wrap_images_pdf(&mut doc, &[(a, px as i64), (b, px as i64)]);
+
+        let once = optimize_with_options(&pdf, rewrite_opts());
+        let images = image_samples(&once);
+        assert_eq!(images.len(), 2, "one merged base + its mask");
+        let (mask_dict, mask_samples) = images
+            .iter()
+            .find(|(d, _)| d.get(b"ColorSpace").is_err())
+            .unwrap();
+        assert_eq!(mask_samples, &mask);
+        assert!(
+            mask_dict.get(b"DecodeParms").is_ok(),
+            "the mask is re-filtered too"
+        );
+        let (_, base_samples) = images
+            .iter()
+            .find(|(d, _)| d.get(b"SMask").is_ok())
+            .unwrap();
+        assert_eq!(base_samples, &raw);
+        assert_eq!(
+            optimize_with_options(&once, rewrite_opts()),
+            once,
+            "a second pass must be byte-identical"
+        );
+    }
+
+    #[test]
+    fn refilter_under_zopfli_is_never_larger_than_redeflate_alone_and_idempotent() {
+        let px = 96;
+        let raw = smooth_field(px, px, 3);
+        let mut doc = Document::with_version("1.5");
+        let id = doc.add_object(flate_image_stream(&raw, px, 3, None, dictionary! {}));
+        let pdf = wrap_images_pdf(&mut doc, &[(id, px as i64)]);
+
+        let zopfli = rewrite_opts().with_deflate_backend(DeflateBackend::Zopfli);
+        let once = optimize_with_options(&pdf, zopfli);
+        assert_eq!(image_samples(&once)[0].1, raw);
+        assert_eq!(
+            optimize_with_options(&once, zopfli),
+            once,
+            "zopfli lane idempotent"
+        );
+
+        // Per stream: the refiltered payload beats what the re-deflate pass
+        // alone would ship (a zopfli re-deflate of the stored plain rows).
+        let stored = Document::load_mem(&pdf).unwrap();
+        let Object::Stream(s) = stored.get_object(id).unwrap() else {
+            panic!()
+        };
+        let redeflated =
+            replan_deflate(&s.content, DeflateBackend::Zopfli).map_or(s.content.len(), |o| o.len());
+        let out_doc = Document::load_mem(&once).unwrap();
+        let out_len = out_doc
+            .objects
+            .values()
+            .find_map(|o| match o {
+                Object::Stream(s) if s.dict.get(b"Width").is_ok() => Some(s.content.len()),
+                _ => None,
+            })
+            .unwrap();
+        assert!(
+            out_len + PARMS_OVERHEAD < redeflated,
+            "{out_len} + parms vs {redeflated}"
+        );
     }
 }

@@ -86,8 +86,21 @@ Executed in this order; each pass reports whether it did work.
 - `doc.prune_objects()` — drop now-orphaned objects (struct elems, stripped
   metadata/private-data, unused font programs).
 - `doc.compress()` — lopdf's stream compression.
+- `refilter_flate_images` — lossless row-filter choice for 8-bit Flate image
+  XObjects and soft masks: decode to samples, re-encode under plain rows or
+  the best uniform PNG filter (None/Sub/Up/Avg/Paeth, predictor charged
+  70 B for its `/DecodeParms`), ship only when strictly cheaper than the
+  stored payload AND its level-9 re-deflate, decode-back verified. Runs here,
+  after every planner, because the planners' never-larger guards decide
+  WHETHER an image is downsampled — they keep plain-vs-Up so a better
+  encoder never flips a downsample decision. Filter chosen on zlib; under
+  `--deflate-backend zopfli` the winner and the stored rows are both
+  zopflied and the smaller ships. Dedup fixpoint re-runs when it changed
+  anything (two copies under different filters can converge). Not counted as
+  work, like the re-deflate.
 - `redeflate_flate_streams` — re-deflate every Flate stream at max level via
-  zlib-rs (or zopfli backend), strictly-smaller-guarded.
+  zlib-rs (or zopfli backend), strictly-smaller-guarded (skips the images the
+  row-filter pass just wrote).
 - `reoptimize_jpeg_streams` — rebuild Huffman tables on untouched JPEGs
   (jpegtran-equivalent), strictly lossless, verified by decode-back.
 - `pack_object_streams` (default ON) → puts a PDF 1.5 floor on output;

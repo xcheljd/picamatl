@@ -97,28 +97,64 @@ pub(crate) fn png_defilter(
     Some(out)
 }
 
-/// Apply the PNG Up filter to every row, producing the predictor-encoded byte
-/// stream FlateDecode + `/Predictor >= 10` expects: each row is a leading
-/// filter-type byte (2 = Up) followed by the filtered row bytes.
-pub(crate) fn png_up_filter(raw: &[u8], width: u32, channels: usize) -> Vec<u8> {
-    use lopdf::filters::png;
+/// PNG filter-type tag: Up (PNG spec §9.2). The tag the xref-stream predictor
+/// uses; the image paths try all five (see [`PNG_FILTERS`]).
+pub(crate) const PNG_UP: u8 = 2;
 
-    let bytes_per_row = width as usize * channels;
-    if bytes_per_row == 0 {
+/// Every PNG filter type (None, Sub, Up, Average, Paeth), in tag order.
+pub(crate) const PNG_FILTERS: [u8; 5] = [0, 1, 2, 3, 4];
+
+/// Apply ONE PNG filter type to every row, producing the predictor-encoded
+/// byte stream FlateDecode + `/Predictor >= 10` expects: each row is a
+/// leading filter-type byte (`tag`, 0-4) followed by the filtered row bytes.
+/// Spec-correct forward filtering (PNG spec §9) against the UNFILTERED prior
+/// row; [`png_defilter`] is its exact inverse for every tag. Hand-rolled for
+/// the same reason the inverse is: lopdf's `encode_row` mis-computes Avg.
+///
+/// `bytes_per_pixel` is the predictor's left distance (the PDF `/Colors`
+/// value for 8-bit samples). A trailing partial row is dropped, and a zero
+/// row width or an unknown tag yields an empty output — callers check the
+/// length (`rows * (bytes_per_row + 1)`) before using it.
+pub(crate) fn png_filter(
+    raw: &[u8],
+    bytes_per_row: usize,
+    bytes_per_pixel: usize,
+    tag: u8,
+) -> Vec<u8> {
+    if bytes_per_row == 0 || tag > 4 {
         // No pixel bytes per row: `chunks_exact(0)` would panic, and there is
         // nothing to filter.
         return Vec::new();
     }
+    let bpp = bytes_per_pixel;
     let rows = raw.len() / bytes_per_row;
     let mut out = Vec::with_capacity(raw.len() + rows);
-    let mut previous = vec![0u8; bytes_per_row];
+    let zero = vec![0u8; bytes_per_row];
+    let mut previous: &[u8] = &zero;
     for row in raw.chunks_exact(bytes_per_row) {
-        let mut current = row.to_vec();
-        // `previous` must be the UNFILTERED prior row (encode_row subtracts it).
-        png::encode_row(png::FilterType::Up, channels, &previous, &mut current);
-        out.push(2); // PNG filter-type tag: Up
-        out.extend_from_slice(&current);
-        previous.copy_from_slice(row);
+        out.push(tag);
+        match tag {
+            0 => out.extend_from_slice(row),
+            1 => out.extend(
+                row.iter()
+                    .enumerate()
+                    .map(|(i, &x)| x.wrapping_sub(if i >= bpp { row[i - bpp] } else { 0 })),
+            ),
+            2 => out.extend(row.iter().zip(previous).map(|(&x, &up)| x.wrapping_sub(up))),
+            3 => out.extend(row.iter().enumerate().map(|(i, &x)| {
+                let left = if i >= bpp { u16::from(row[i - bpp]) } else { 0 };
+                x.wrapping_sub(((left + u16::from(previous[i])) / 2) as u8)
+            })),
+            _ => out.extend(row.iter().enumerate().map(|(i, &x)| {
+                let (left, upper_left) = if i >= bpp {
+                    (row[i - bpp], previous[i - bpp])
+                } else {
+                    (0, 0)
+                };
+                x.wrapping_sub(paeth_predict(left, previous[i], upper_left))
+            })),
+        }
+        previous = row;
     }
     out
 }
