@@ -42,6 +42,15 @@ picamatl. Every feature below is a special case of it.
 Executed in this order; each pass reports whether it did work.
 
 **Phase A — coalescing (pre-plan):**
+- Legacy-filter transcode (`src/legacy.rs`) — always on: streams stored with
+  `/LZWDecode`, `/ASCII85Decode`, `/ASCIIHexDecode`, `/RunLengthDecode` (or a
+  chain of them, optionally ending in Flate) are decoded with strict
+  decoders and re-stored as one `/FlateDecode`, strictly smaller counting the
+  dictionary text, decode-back verified. A last-filter predictor carries over
+  unchanged. Non-image streams are rewritten first, so the dedup passes and
+  the minifier below treat them as ordinary Flate streams; image XObjects
+  are planned here but applied only after the image planners (Phase C), so
+  the transcode never newly exposes an image to a resampling path.
 - `dedup_streams` — merge byte-identical stream objects (repeated logos/product
   shots). Run *before* image planning so a repeated image is decoded, resized,
   and deduped once.
@@ -67,7 +76,8 @@ Executed in this order; each pass reports whether it did work.
 
 **Phase C — apply:**
 - Each `Replacement` applied; every candidate that fails strictly-smaller is
-  skipped (per-stream guard).
+  skipped (per-stream guard). Then the bitonal, JPX and legacy-filter image
+  plans.
 - Fonts applied; strips (accessibility / metadata / private-data / hinting)
   applied; then `dedup_objects` + `dedup_streams` again (the dedup passes are
   mutually-interfering, so they run both sides of the apply phase).
@@ -113,6 +123,8 @@ Everything from `pack_object_streams` down is `save_document` in
 | `src/classify.rs` | ~0.5K | Line-art guard and the `--figure-dpi` figure classifier, with their tuning constants |
 | `src/main.rs` | ~0.4K | CLI (every flag maps 1:1 to an `OptimizeOptions` builder method) |
 | `src/deflate.rs` | ~0.2K | Deflate/inflate backends, the capped inflate, PNG row-filter codec |
+| `src/legacy.rs` | ~0.7K | Legacy-filter → Flate transcode: chain/parms rules, strict ASCII85/ASCIIHex/RunLength decoders |
+| `src/lzw.rs` | ~0.4K | Strict, capped `/LZWDecode` decoder (EarlyChange 0/1) |
 
 `try_optimize` and the `plan_*` family deliberately stay together in `lib.rs`:
 they are one pipeline, and the pass ordering above is the reason.

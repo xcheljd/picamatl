@@ -34,6 +34,16 @@ for t in type1 deflate; do
         done
     done
 done
+# lzw reads a decoder-selector byte (0/1 = LZW EarlyChange 0/1, 2 = ASCII85,
+# 3 = ASCIIHex, 4 = RunLength). LZW seeds get both EarlyChange settings.
+mkdir -p corpus/lzw
+for pair in lzw_lzw:0 lzw_lzw:1 lzw_a85:2 lzw_ahx:3 lzw_rl:4; do
+    k=${pair%%:*} sel=${pair##*:}
+    [ -d "$raw/$k" ] || continue
+    for f in "$raw/$k/"*; do
+        { printf "\\00$sel"; cat "$f"; } > "corpus/lzw/$(basename "$f")-$sel"
+    done
+done
 cp ../fixtures/jpeg/*.jpg corpus/jpeghuff/ 2>/dev/null || true
 for f in "$@"; do
     cp "$f" corpus/optimize/

@@ -103,6 +103,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Streams stored with legacy filters are re-stored as Flate.**
+  `/LZWDecode` (common in Acrobat Capture-era scans), `/ASCII85Decode`,
+  `/ASCIIHexDecode` and `/RunLengthDecode` streams, and chains of them that
+  may end in Flate, are decoded and stored again as one `/FlateDecode`
+  stream when that is strictly smaller, dictionary text included. Lossless:
+  every candidate is inflated back and compared with the decoded bytes,
+  and a predictor in `/DecodeParms` carries over unchanged. The decoders are
+  strict and capped — a malformed stream, an LZW table that overflows
+  without a clear code, or output past the 128 MiB cap leaves the stream as
+  it was. Images are re-stored only after the image passes have run, so an
+  LZW image is never newly downsampled. Encrypted and PDF/A-declared
+  documents are left alone, unless `--strip-metadata` drops the PDF/A
+  claim. Over 15 public scans, default outputs shrink by 391,551 B in
+  total: gao-104000, which picamatl used to return unchanged, goes from
+  5.28 MB to 4.89 MB (7.3%), and fbi-custodial saves 4,987 B; every other
+  scan's default output is byte-identical. The 17-file corpus has no LZW;
+  its only change is cmyk-jpeg, whose two ASCII85+Flate streams lose their
+  text layer (226 B), and every other corpus output is byte-identical.
 - **Over-resolution palette (`/Indexed`) images with a soft mask are
   downsampled.** They were left at full size, because the Flate downsample
   cannot resample palette indices. The palette is now expanded into its

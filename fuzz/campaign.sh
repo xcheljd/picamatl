@@ -7,7 +7,7 @@ cd "$(dirname "$0")"
 export ASAN_OPTIONS=detect_odr_violation=0
 B=target/x86_64-unknown-linux-gnu/release
 mkdir -p logs
-for t in optimize optimize_all jpeghuff type1 cff cff_font truetype deflate content; do
+for t in optimize optimize_all jpeghuff type1 cff cff_font truetype deflate content lzw; do
     mkdir -p "artifacts/$t"
     # Whole-pipeline targets get a longer hang limit: the sanitizer build runs
     # ~20x slower than release (a 0.9 s corpus PDF takes ~17 s), so 10 s
@@ -21,7 +21,7 @@ done
 wait
 echo "CAMPAIGN DONE"
 status=0
-for t in optimize optimize_all jpeghuff type1 cff cff_font truetype deflate content; do
+for t in optimize optimize_all jpeghuff type1 cff cff_font truetype deflate content lzw; do
     runs=$(grep -aoE '^#[0-9]+' "logs/$t.log" | tail -1)
     counters=$(grep -aoE 'oom/timeout/crash: [0-9]+/[0-9]+/[0-9]+' "logs/$t.log" | tail -1)
     if [ -z "$runs" ]; then

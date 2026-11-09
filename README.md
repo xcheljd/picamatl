@@ -374,12 +374,13 @@ What each level buys:
   downsampling (D-M1/D-M2), masked and unmasked Flate coupled downsampling
   (D-M3), shared-mask and under-threshold requantization (Phase 6), font
   subsetting (Type0/CIDFontType2 Identity-H/V and nonsymbolic simple
-  TrueType — rendering-preserving, text extraction bit-identical), then a
-  serialization pass — object-stream packing (PDF 1.5), a final level-9
-  re-deflate of every Flate stream through the zlib-rs backend, and a
-  compressed cross-reference stream. Every image keeps its encoding class;
-  lossless images stay lossless; soft masks are never resized when another
-  image shares them.
+  TrueType — rendering-preserving, text extraction bit-identical), lossless
+  re-storing of legacy LZW, ASCII85, ASCIIHex and RunLength streams as
+  Flate, then a serialization pass — object-stream packing (PDF 1.5), a
+  final level-9 re-deflate of every Flate stream through the zlib-rs
+  backend, and a compressed cross-reference stream. Every image keeps its
+  encoding class; lossless images stay lossless; soft masks are never
+  resized when another image shares them.
 - **`--allow-lossy`:** additionally re-encodes *unmasked photographic-looking*
   FlateDecode images as JPEG at the configured quality. A built-in content
   heuristic declines line-art-like images (thin lines pick up visible JPEG

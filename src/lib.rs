@@ -66,6 +66,8 @@ mod encodings;
 mod fonts;
 mod forms;
 mod jpeghuff;
+mod legacy;
+mod lzw;
 mod reals;
 mod serialize;
 mod signatures;
@@ -96,6 +98,16 @@ pub mod fuzz_api {
     }
     pub fn png_defilter(d: &[u8], bpp: usize, bpr: usize) -> Option<Vec<u8>> {
         crate::deflate::png_defilter(d, bpp, bpr)
+    }
+    /// The legacy-filter decoders: `kind` 0/1 = LZW with EarlyChange 0/1,
+    /// 2 = ASCII85, 3 = ASCIIHex, anything else = RunLength.
+    pub fn legacy_decode(kind: u8, d: &[u8], limit: usize) -> Option<Vec<u8>> {
+        match kind {
+            0 | 1 => crate::lzw::lzw_decode(d, kind == 1, limit),
+            2 => crate::legacy::ascii85_decode(d, limit),
+            3 => crate::legacy::ascii_hex_decode(d, limit),
+            _ => crate::legacy::run_length_decode(d, limit),
+        }
     }
     pub fn number_tokens(d: &[u8]) -> Option<Vec<std::ops::Range<usize>>> {
         crate::content_number_tokens(d)
@@ -4163,6 +4175,29 @@ fn try_optimize(input: &[u8], options: OptimizeOptions) -> Result<OptimizeOutcom
         }
     }
 
+    // Legacy-filter transcode (LZW / ASCII85 / ASCIIHex / RunLength chains →
+    // one FlateDecode, src/legacy.rs), lossless. Non-image streams are
+    // rewritten HERE, before the dedup passes and the content minifier, so
+    // a transcoded content stream is then deduplicated, minified and
+    // re-deflated like any other Flate stream. Image XObjects are planned
+    // now but applied only AFTER the image planners have run: the planners
+    // never see an LZW image as Flate, so this pass never newly hands an
+    // image to a resampling path — it stays a pure re-encode. Counts as
+    // work (it is a real size win on files nothing else touches).
+    let legacy_plan = |images| {
+        legacy::plan(
+            &doc,
+            options.deflate_backend,
+            images,
+            options.strip_metadata,
+            MAX_REDEFLATE_BYTES,
+        )
+    };
+    let legacy_images = legacy_plan(true);
+    let legacy_streams = legacy_plan(false);
+    let transcoded = !legacy_images.is_empty() || !legacy_streams.is_empty();
+    legacy::apply(&mut doc, legacy_streams);
+
     // Collapse repeated images first: every downstream step (placement
     // collection, decode/resize/re-encode, and the final write) then sees one
     // object instead of N identical ones.
@@ -4277,6 +4312,7 @@ fn try_optimize(input: &[u8], options: OptimizeOptions) -> Result<OptimizeOutcom
         && !merged_decoded
         && !minified
         && !flattened
+        && !transcoded
         && !gray_work;
 
     // The JPEG Huffman re-optimizer normally runs at the end of the pipeline,
@@ -4413,6 +4449,11 @@ fn try_optimize(input: &[u8], options: OptimizeOptions) -> Result<OptimizeOutcom
             stream.dict.remove(b"DecodeParms");
         }
     }
+
+    // Legacy-filter image transcodes, planned before the image planners
+    // (see the top of this function). No overlap with the replacements
+    // above: every image planner declines non-Flate/DCT/JPX/CCITT filters.
+    legacy::apply(&mut doc, legacy_images);
 
     // Collapse channel-identical DeviceRGB Flate images to DeviceGray.
     // Planned HERE — after the image replacements above are applied — so a
@@ -5404,6 +5445,162 @@ mod tests {
             }
             assert!(has_exotic, "{label}: filter name must be preserved");
         }
+    }
+
+    /// Every stream's `/Filter` names in the document, flattened.
+    fn filter_names(doc: &Document) -> Vec<Vec<u8>> {
+        let mut names = Vec::new();
+        for obj in doc.objects.values() {
+            if let Object::Stream(s) = obj {
+                match s.dict.get(b"Filter") {
+                    Ok(Object::Name(n)) => names.push(n.clone()),
+                    Ok(Object::Array(items)) => names.extend(
+                        items
+                            .iter()
+                            .filter_map(|o| o.as_name().ok().map(<[u8]>::to_vec)),
+                    ),
+                    _ => {}
+                }
+            }
+        }
+        names
+    }
+
+    /// One-page document whose content stream is `/LZWDecode` (returned
+    /// with its decoded payload); `pdfa` adds a PDF/A-1B XMP claim.
+    fn build_lzw_content_pdf(pdfa: bool) -> (Vec<u8>, Vec<u8>) {
+        let mut payload = Vec::new();
+        for i in 0..3_000u32 {
+            payload.extend_from_slice(
+                format!(
+                    "BT /F1 {} Tf {} {} Td (line {i}) Tj ET\n",
+                    9 + i % 4,
+                    72 + i % 7,
+                    700 - i % 600
+                )
+                .as_bytes(),
+            );
+        }
+        let mut doc = Document::with_version("1.4");
+        let content_id = doc.add_object(Stream::new(
+            dictionary! { "Filter" => "LZWDecode" },
+            crate::lzw::tests::lzw_encode(&payload, true, true),
+        ));
+        let pages_id = doc.new_object_id();
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "Contents" => content_id,
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        });
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages", "Kids" => vec![page_id.into()], "Count" => 1,
+            }),
+        );
+        let catalog_id = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+        if pdfa {
+            let xmp = doc.add_object(Stream::new(
+                dictionary! { "Type" => "Metadata", "Subtype" => "XML" },
+                b"<x:xmpmeta><rdf:Description xmlns:pdfaid=\"http://www.aiim.org/pdfa/ns/id/\"><pdfaid:part>1</pdfaid:part></rdf:Description></x:xmpmeta>".to_vec(),
+            ));
+            if let Ok(Object::Dictionary(cat)) = doc.get_object_mut(catalog_id) {
+                cat.set("Metadata", xmp);
+            }
+        }
+        doc.trailer.set("Root", catalog_id);
+        let mut pdf = Vec::new();
+        doc.save_to(&mut pdf).unwrap();
+        (pdf, payload)
+    }
+
+    #[test]
+    fn lzw_content_stream_is_transcoded_to_flate() {
+        // Acrobat Capture-era shape: page content stored as /LZWDecode,
+        // which zlib stores far smaller. Before the legacy pass picamatl
+        // returned such a file byte-for-byte unchanged.
+        let (pdf, payload) = build_lzw_content_pdf(false);
+        let out = optimize(&pdf);
+        assert!(out.len() < pdf.len(), "{} -> {}", pdf.len(), out.len());
+        let reloaded = Document::load_mem(&out).unwrap();
+        assert!(
+            !filter_names(&reloaded).iter().any(|n| n == b"LZWDecode"),
+            "no LZW stream may survive"
+        );
+        // Same operations (the minifier may re-space them).
+        let (_, page) = reloaded.get_pages().into_iter().next().unwrap();
+        let new_ops = Content::decode(&reloaded.get_page_content(page)).unwrap();
+        let old_ops = Content::decode(&payload).unwrap();
+        assert_eq!(
+            format!("{:?}", new_ops.operations),
+            format!("{:?}", old_ops.operations)
+        );
+        // Idempotent: a second pass has nothing left to do here.
+        assert_eq!(optimize(&out), out);
+    }
+
+    #[test]
+    fn lzw_transcode_follows_the_pdfa_claim_the_output_will_carry() {
+        // PDF/A-declared: declined by default (the minifier's posture) ...
+        let (pdf, _) = build_lzw_content_pdf(true);
+        let kept = optimize(&pdf);
+        assert!(filter_names(&Document::load_mem(&kept).unwrap())
+            .iter()
+            .any(|n| n == b"LZWDecode"));
+        // ... but --strip-metadata removes the claim, so the transcode runs
+        // on pass 1 — otherwise pass 2 (XMP already gone) would do it, and
+        // the output would not be idempotent.
+        let opts = OptimizeOptions::default().with_strip_metadata(true);
+        let once = optimize_with_options(&pdf, opts);
+        assert!(!filter_names(&Document::load_mem(&once).unwrap())
+            .iter()
+            .any(|n| n == b"LZWDecode"));
+        assert_eq!(
+            optimize_with_options(&once, opts),
+            once,
+            "pass 2 must be a no-op"
+        );
+    }
+
+    #[test]
+    fn lzw_image_is_transcoded_but_never_resampled() {
+        // A 400 px image drawn into 100 pt (288 ppi) is over-resolved: as
+        // Flate it would be downsampled. Stored as LZW it is re-encoded
+        // losslessly AFTER the image planners ran, so geometry and every
+        // sample survive — the pass never newly exposes an image to a lossy
+        // path.
+        let raw = flate_pixels(400, 400, 3);
+        let mut doc = Document::with_version("1.4");
+        let img_id = doc.add_object(Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Image",
+                "Width" => 400_i64,
+                "Height" => 400_i64,
+                "ColorSpace" => "DeviceRGB",
+                "BitsPerComponent" => 8_i64,
+                "Filter" => "LZWDecode",
+            },
+            crate::lzw::tests::lzw_encode(&raw, true, true),
+        ));
+        let pdf = wrap_image_pdf(&mut doc, img_id, 100);
+        let out = optimize(&pdf);
+        assert!(out.len() < pdf.len(), "{} -> {}", pdf.len(), out.len());
+        let reloaded = Document::load_mem(&out).unwrap();
+        let img = reloaded
+            .objects
+            .values()
+            .filter_map(|o| o.as_stream().ok())
+            .find(|s| matches!(s.dict.get(b"Subtype"), Ok(Object::Name(n)) if n == b"Image"))
+            .unwrap();
+        assert_eq!(
+            img.dict.get(b"Filter").unwrap(),
+            &Object::Name(b"FlateDecode".to_vec())
+        );
+        assert_eq!(img.dict.get(b"Width").unwrap(), &Object::Integer(400));
+        assert_eq!(img.dict.get(b"Height").unwrap(), &Object::Integer(400));
+        assert_eq!(inflate_capped(&img.content, raw.len()).unwrap(), raw);
     }
 
     #[test]

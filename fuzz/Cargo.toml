@@ -87,6 +87,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "lzw"
+path = "fuzz_targets/lzw.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "extract_seeds"
 path = "tools/extract_seeds.rs"
 test = false

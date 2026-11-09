@@ -12,8 +12,9 @@ cargo install cargo-fuzz --locked
 
 ## Seed, then run
 
-Seeds come from real PDFs (fonts, JPEGs, Flate and content streams are
-extracted from each one). Corpora are git-ignored; build them locally:
+Seeds come from real PDFs (fonts, JPEGs, Flate, content and
+LZW/ASCII85/ASCIIHex/RunLength streams are extracted from each one).
+Corpora are git-ignored; build them locally:
 
 ```sh
 cd fuzz
@@ -48,6 +49,7 @@ summary. Reproduce a finding with
 | `truetype` | sfnt table, cmap, subset-tag and hint-stripping parsers | same |
 | `deflate` | capped inflate + PNG predictor decoding | same |
 | `content` | content-stream number lexer and re-planner | same |
+| `lzw` | the legacy-filter decoders (LZW, ASCII85, ASCIIHex, RunLength) | same, and decoded output never exceeds the cap |
 
 The focused targets reach internals through the `fuzzing` cargo feature
 (`picamatl::fuzz_api`). It is off by default, hidden from the docs, and not a

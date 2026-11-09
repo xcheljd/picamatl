@@ -42,6 +42,21 @@ fn main() {
             if filter.as_deref() == Some(b"DCTDecode") {
                 save("jpeghuff", &s.content);
             }
+            // Legacy filters, by decoder: the raw payload of the FIRST
+            // filter in the chain (what that decoder reads). seed.sh adds
+            // the selector byte the lzw target expects.
+            let first = match s.dict.get(b"Filter") {
+                Ok(Object::Name(n)) => Some(n.clone()),
+                Ok(Object::Array(a)) => a.first().and_then(|o| o.as_name().ok()).map(<[u8]>::to_vec),
+                _ => None,
+            };
+            match first.as_deref() {
+                Some(b"LZWDecode") => save("lzw_lzw", &s.content),
+                Some(b"ASCII85Decode") => save("lzw_a85", &s.content),
+                Some(b"ASCIIHexDecode") => save("lzw_ahx", &s.content),
+                Some(b"RunLengthDecode") => save("lzw_rl", &s.content),
+                _ => {}
+            }
             let decoded = s.decompressed_content().ok();
             let body = decoded.as_deref().unwrap_or(&s.content);
             if s.dict.has(b"Length1") || s.dict.has(b"Length2") {
