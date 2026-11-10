@@ -242,9 +242,11 @@ fn plan_one(doc: &Document, id: ObjectId, targets: BitonalTargets) -> Option<Bit
     let jb2 = jbig2_ok
         .then(|| {
             let mut bm = jbig2::samples_to_bitmap(&samples, w as usize, h)?;
-            // `encode_best` decodes every candidate back through the
-            // in-house decoder and keeps only exact reproductions.
-            jbig2::encode_best(&mut bm, &JBIG2_CANDIDATES)
+            // `encode_best` decodes its pick back through the in-house
+            // decoder and ships only an exact reproduction; candidates
+            // stop early once they cannot beat the stored stream or the
+            // best so far.
+            jbig2::encode_best(&mut bm, &JBIG2_CANDIDATES, stored)
         })
         .flatten()
         .filter(|jb2| jb2.len() < stored);
@@ -1146,8 +1148,12 @@ mod tests {
     fn existing_jbig2_images_are_never_touched() {
         let rows = doc_rows(W, H);
         let mut bm = jbig2::samples_to_bitmap(&pack_samples(&rows, false), W, H).unwrap();
-        let stream =
-            jbig2::encode_best(&mut bm, &[jbig2::GenericParams::nominal(3, false)]).unwrap();
+        let stream = jbig2::encode_best(
+            &mut bm,
+            &[jbig2::GenericParams::nominal(3, false)],
+            usize::MAX,
+        )
+        .unwrap();
         let mut d = image_dict(W, H, "JBIG2Decode", None);
         d.set("Filter", "JBIG2Decode");
         let pdf = bitonal_pdf(d, stream);

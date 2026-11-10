@@ -77,7 +77,10 @@ Executed in this order; each pass reports whether it did work.
   the cheapest that is strictly smaller than the stored stream ships, decode-
   back verified. JBIG2 (`src/jbig2.rs`, in-house MQ coder + generic-region
   codec from T.88, no dependency) tries all four templates × TPGD plus three
-  moved AT pixels per image, writes a page-information + one immediate
+  moved AT pixels per image (each candidate stops as soon as its finished
+  bytes show it cannot be strictly smaller than the stored stream or the
+  best so far — same pick as the exhaustive search, much less time on
+  near-blank images), writes a page-information + one immediate
   generic-region segment (embedded organization, no `/JBIG2Globals`), drops
   `/DecodeParms`, and leaves every other key (`/Decode`, `/ColorSpace`,
   `/ImageMask`) as is: the samples are identical, so they paint identically.

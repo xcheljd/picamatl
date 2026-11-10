@@ -90,16 +90,20 @@ struct MqEncoder {
     /// (the virtual byte at `BPST - 1`, which is never emitted).
     b: Option<u8>,
     out: Vec<u8>,
+    /// Give up once `out` holds this many finished bytes (see
+    /// [`encode_bounded`]); `usize::MAX` = never.
+    limit: usize,
 }
 
 impl MqEncoder {
-    fn new() -> Self {
+    fn new(limit: usize) -> Self {
         MqEncoder {
             a: 0x8000,
             c: 0,
             ct: 12,
             b: None,
             out: Vec::new(),
+            limit,
         }
     }
 
@@ -417,6 +421,10 @@ pub(crate) fn samples_to_bitmap(samples: &[u8], width: usize, height: usize) -> 
 trait Coder {
     const ENCODING: bool;
     fn code(&mut self, cx: &mut Cx, bit: u32) -> u32;
+    /// Checked once per row: true ends the coding loop early.
+    fn stop(&self) -> bool {
+        false
+    }
 }
 
 impl Coder for MqEncoder {
@@ -425,6 +433,9 @@ impl Coder for MqEncoder {
     fn code(&mut self, cx: &mut Cx, bit: u32) -> u32 {
         self.encode(cx, bit);
         bit
+    }
+    fn stop(&self) -> bool {
+        self.out.len() >= self.limit
     }
 }
 
@@ -479,6 +490,9 @@ fn run<C: Coder>(bm: &mut Bitmap, p: &GenericParams, coder: &mut C) {
     let n_at = p.at_count();
     let mut ltp = false;
     for y in 0..h {
+        if coder.stop() {
+            return;
+        }
         if p.tpgd {
             let typical = C::ENCODING
                 && if y == 0 {
@@ -544,12 +558,25 @@ fn run<C: Coder>(bm: &mut Bitmap, p: &GenericParams, coder: &mut C) {
 /// `bm` is only read: it is borrowed mutably because the decoder writes
 /// through the same coding loop, and borrowing beats cloning a bitmap of up
 /// to 32 MiB per candidate.
+#[cfg(any(test, feature = "fuzzing"))]
 pub(crate) fn encode_generic(bm: &mut Bitmap, p: &GenericParams) -> Option<Vec<u8>> {
-    if !p.valid() {
+    encode_bounded(bm, p, usize::MAX)
+}
+
+/// The MQ encode with a give-up: `None` once the MQ data holds
+/// `limit` finished bytes (checked once per row). Flushing only appends, so
+/// a give-up means the full data would be longer than `limit`. Otherwise
+/// the result is byte-identical to the unbounded encode, possibly `limit`
+/// bytes or a few more: callers compare lengths themselves.
+fn encode_bounded(bm: &mut Bitmap, p: &GenericParams, limit: usize) -> Option<Vec<u8>> {
+    if !p.valid() || limit == 0 {
         return None;
     }
-    let mut enc = MqEncoder::new();
+    let mut enc = MqEncoder::new(limit);
     run(bm, p, &mut enc);
+    if enc.out.len() >= limit {
+        return None;
+    }
     Some(enc.finish())
 }
 
@@ -686,22 +713,36 @@ pub(crate) fn decode_embedded(stream: &[u8], width: u32, height: u32) -> Option<
 }
 
 /// Encode `bm` under each candidate parameter set and return the smallest
-/// embedded stream that [`decode_embedded`] reproduces exactly (ties keep
-/// the earlier candidate). Only the running smallest stream is held, and
-/// only the winner is decoded back; should it fail, every candidate is
-/// re-run with its own decode-back, so a defect costs time, never bytes or
-/// correctness. `None` when no candidate verifies.
-pub(crate) fn encode_best(bm: &mut Bitmap, candidates: &[GenericParams]) -> Option<Vec<u8>> {
+/// embedded stream shorter than `below` bytes that [`decode_embedded`]
+/// reproduces exactly (ties keep the earlier candidate). Only the running
+/// smallest stream is held, and only the winner is decoded back; should it
+/// fail, every candidate is re-run with its own decode-back, so a defect
+/// costs time, never bytes or correctness. `None` when no candidate
+/// verifies under `below`.
+///
+/// Each candidate is encoded under [`encode_bounded`] with the bytes the
+/// running best (or `below`) leaves it, so a candidate stops as soon as it
+/// can no longer win. The result is the same stream an exhaustive search
+/// returns; the bound only saves time, mostly on near-blank images whose
+/// CCITT costs a bit per row while every unbounded candidate codes each
+/// pixel (one 16384 x 16384 blank image: 15.9 s without the bound).
+pub(crate) fn encode_best(
+    bm: &mut Bitmap,
+    candidates: &[GenericParams],
+    below: usize,
+) -> Option<Vec<u8>> {
     let (w, h) = (
         u32::try_from(bm.width).ok()?,
         u32::try_from(bm.height).ok()?,
     );
     let mut best: Option<Vec<u8>> = None;
     for p in candidates {
-        let Some(stream) = encode_generic(bm, p).and_then(|mq| embed(w, h, p, &mq)) else {
+        let bound = best.as_ref().map_or(below, Vec::len);
+        let limit = bound.saturating_sub(framing_len(p));
+        let Some(stream) = encode_bounded(bm, p, limit).and_then(|mq| embed(w, h, p, &mq)) else {
             continue;
         };
-        if best.as_ref().is_none_or(|b| stream.len() < b.len()) {
+        if stream.len() < bound {
             best = Some(stream);
         }
     }
@@ -712,12 +753,12 @@ pub(crate) fn encode_best(bm: &mut Bitmap, candidates: &[GenericParams]) -> Opti
     }
     let mut best: Option<Vec<u8>> = None;
     for p in candidates {
-        let Some(stream) = encode_generic(bm, p).and_then(|mq| embed(w, h, p, &mq)) else {
+        let bound = best.as_ref().map_or(below, Vec::len);
+        let limit = bound.saturating_sub(framing_len(p));
+        let Some(stream) = encode_bounded(bm, p, limit).and_then(|mq| embed(w, h, p, &mq)) else {
             continue;
         };
-        if best.as_ref().is_none_or(|b| stream.len() < b.len())
-            && decode_embedded(&stream, w, h).as_ref() == Some(&*bm)
-        {
+        if stream.len() < bound && decode_embedded(&stream, w, h).as_ref() == Some(&*bm) {
             best = Some(stream);
         }
     }
@@ -849,7 +890,7 @@ pub(crate) mod tests {
                 (ctx, u32::from(rng.next() % 100 < p))
             })
             .collect();
-        let mut enc = MqEncoder::new();
+        let mut enc = MqEncoder::new(usize::MAX);
         let mut cx = [0 as Cx; 4];
         for &(c, b) in &bits {
             enc.encode(&mut cx[c], b);
@@ -877,7 +918,7 @@ pub(crate) mod tests {
             0xBB, 0x86, 0xF4, 0x31, 0x7F, 0xFF, 0x88, 0xFF, 0x37, 0x47, 0x1A, 0xDB, 0x6A, 0xDF,
             0xFF, 0xAC,
         ];
-        let mut enc = MqEncoder::new();
+        let mut enc = MqEncoder::new(usize::MAX);
         let mut cx: Cx = 0;
         for byte in INPUT {
             for i in (0..8).rev() {
@@ -951,11 +992,51 @@ pub(crate) mod tests {
     fn encode_best_picks_the_smallest_verified_candidate() {
         let mut bm = text_like(300, 200, 4);
         let cands = all_params();
-        let best = encode_best(&mut bm, &cands).unwrap();
+        let best = encode_best(&mut bm, &cands, usize::MAX).unwrap();
+        // Exhaustive reference: every candidate unbounded, first smallest.
+        let mut want: Option<Vec<u8>> = None;
         for p in &cands {
             let s = embed(300, 200, p, &encode_generic(&mut bm, p).unwrap()).unwrap();
             assert!(best.len() <= s.len());
+            if want.as_ref().is_none_or(|b| s.len() < b.len()) {
+                want = Some(s);
+            }
         }
+        assert_eq!(
+            Some(&best),
+            want.as_ref(),
+            "the bound must not change the pick"
+        );
         assert_eq!(decode_embedded(&best, 300, 200).as_ref(), Some(&bm));
+        // `below` is strict: the winner's own length excludes it.
+        assert!(encode_best(&mut bm, &cands, best.len()).is_none());
+        assert_eq!(
+            encode_best(&mut bm, &cands, best.len() + 1).as_ref(),
+            Some(&best)
+        );
+    }
+
+    #[test]
+    fn bounded_encode_is_exact_or_gives_up() {
+        let mut bm = text_like(257, 90, 9);
+        for p in all_params() {
+            let full = encode_generic(&mut bm, &p).unwrap();
+            // A limit above the finished length changes nothing.
+            assert_eq!(
+                encode_bounded(&mut bm, &p, full.len() + 1),
+                Some(full.clone())
+            );
+            // At any limit the result is the exact encode or a give-up,
+            // and a give-up only when the full data is longer than `limit`.
+            for limit in 0..=full.len() + 1 {
+                match encode_bounded(&mut bm, &p, limit) {
+                    Some(got) => assert_eq!(got, full),
+                    None => assert!(limit == 0 || full.len() > limit),
+                }
+            }
+            // Well under the finished length it gives up (the last row and
+            // the flush add only a few bytes after the final check).
+            assert_eq!(encode_bounded(&mut bm, &p, full.len() / 2), None);
+        }
     }
 }

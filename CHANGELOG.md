@@ -112,6 +112,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **CCITT scans are re-stored as lossless JBIG2.** In a file picamatl
+  rewrites, every CCITT image (G3 or G4) that decodes strictly is coded
+  again as one JBIG2 generic region by picamatl's own encoder (the ITU-T
+  T.88 MQ arithmetic coder, no new dependency). It tries all four templates
+  with and without typical prediction, plus three moved adaptive pixels,
+  and ships the smallest stream that is strictly smaller than the stored one
+  and decodes back to exactly the same samples. `/Decode`, `/ColorSpace`,
+  `/ImageMask` and masks are untouched; `/DecodeParms` is dropped. On by
+  default; `--no-jbig2-bitonal-images` (library:
+  `with_jbig2_bitonal_images(false)`) keeps CCITT for readers without JBIG2
+  support. Documents claiming PDF/A and encrypted documents are declined,
+  existing JBIG2 images are never touched, and a pre-1.4 header is raised to
+  1.4. Over the 17-file corpus and 15 scans, default outputs shrink by
+  16,459,255 B (14.3%), all on nine scans: us10522188 by 5,470,937 B
+  (74.7%), us20120251502 and us10174323 by about 3.2 MB each (48%),
+  nasa-tn-d162, gao-104000, fbi-custodial, naca-19930081614, us6811268 and
+  gao-077234 by 243,672 to 1,343,318 B (14.5% to 41.6%). Scans take longer
+  to optimize: each image is encoded up to 14 times. The bitonal pass
+  also reads `/DecodeParms` given as a one-element array or as a reference.
 - **Flate images get the best PNG row filter.** In a file picamatl
   rewrites, every 8-bit `/FlateDecode` image and soft mask is decoded to its
   samples and stored again under plain rows or the best of the four uniform
