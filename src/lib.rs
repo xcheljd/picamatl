@@ -65,6 +65,7 @@ mod deflate;
 mod encodings;
 mod fonts;
 mod forms;
+mod jbig2;
 mod jpeghuff;
 mod legacy;
 mod lzw;
@@ -108,6 +109,61 @@ pub mod fuzz_api {
             3 => crate::legacy::ascii_hex_decode(d, limit),
             _ => crate::legacy::run_length_decode(d, limit),
         }
+    }
+    /// The JBIG2 decode-back gate on arbitrary bytes: parses picamatl's
+    /// two-segment embedded shape and decodes exactly `w × h` pixels.
+    pub fn jbig2_decode(d: &[u8], w: u32, h: u32) -> Option<Vec<u8>> {
+        crate::jbig2::decode_embedded(d, w, h).map(|b| b.data)
+    }
+    /// JBIG2 encoder: `d` as packed rows of a `width`-pixel bitmap
+    /// (padding bits cleared, partial last row dropped), coded with
+    /// template `sel & 3`, TPGD `sel & 4`, and the first AT pixel at `at`.
+    /// Returns the embedded stream and its height; `None` when the input
+    /// makes no bitmap or `at` is not a causal pixel.
+    pub fn jbig2_encode(width: usize, d: &[u8], sel: u8, at: (i8, i8)) -> Option<(Vec<u8>, u32)> {
+        let bm = fuzz_bitmap(width, d)?;
+        jbig2_encode_bitmap(bm, sel, at).map(|(s, _, h)| (s, h))
+    }
+    /// [`jbig2_encode`], then decode back: `Some(true)` when the decode
+    /// reproduced the bitmap (always expected), `None` as for the encoder.
+    pub fn jbig2_round_trip(width: usize, d: &[u8], sel: u8, at: (i8, i8)) -> Option<bool> {
+        let (s, bm, h) = jbig2_encode_bitmap(fuzz_bitmap(width, d)?, sel, at)?;
+        Some(crate::jbig2::decode_embedded(&s, width as u32, h).as_ref() == Some(&bm))
+    }
+    fn fuzz_bitmap(width: usize, d: &[u8]) -> Option<crate::jbig2::Bitmap> {
+        let stride = width.div_ceil(8);
+        if width == 0 || d.len() < stride {
+            return None;
+        }
+        let height = d.len() / stride;
+        let mut data = d[..stride * height].to_vec();
+        if !width.is_multiple_of(8) {
+            let mask = 0xFFu8 << (8 - width % 8);
+            for row in data.chunks_exact_mut(stride) {
+                row[stride - 1] &= mask;
+            }
+        }
+        Some(crate::jbig2::Bitmap {
+            width,
+            height,
+            stride,
+            data,
+        })
+    }
+    fn jbig2_encode_bitmap(
+        mut bm: crate::jbig2::Bitmap,
+        sel: u8,
+        at: (i8, i8),
+    ) -> Option<(Vec<u8>, crate::jbig2::Bitmap, u32)> {
+        let (w, h) = (
+            u32::try_from(bm.width).ok()?,
+            u32::try_from(bm.height).ok()?,
+        );
+        let mut p = crate::jbig2::GenericParams::nominal(sel & 3, sel & 4 != 0);
+        p.at[0] = at;
+        let mq = crate::jbig2::encode_generic(&mut bm, &p)?;
+        let s = crate::jbig2::embed(w, h, &p, &mq)?;
+        Some((s, bm, h))
     }
     pub fn number_tokens(d: &[u8]) -> Option<Vec<std::ops::Range<usize>>> {
         crate::content_number_tokens(d)
@@ -396,6 +452,21 @@ pub struct OptimizeOptions {
     /// release cycle).
     pub recompress_bitonal_images: bool,
 
+    /// Losslessly re-store CCITT-encoded bitonal images as JBIG2
+    /// (`/JBIG2Decode`, PDF 1.4): one arithmetic-coded generic region per
+    /// image, written by picamatl's own encoder (src/jbig2.rs). The image's
+    /// samples are decoded with the strict CCITT decoder and re-encoded
+    /// unchanged — `/Width`, `/Height`, `/ColorSpace`, `/Decode` and every
+    /// other key keep their meaning, so the page renders pixel-identically.
+    /// A stream is replaced only when the JBIG2 stream is strictly smaller
+    /// AND picamatl's decoder reproduces the source samples exactly; images
+    /// already stored as JBIG2 are never touched. Declined on documents
+    /// claiming PDF/A and on encrypted ones, like every other re-encoding
+    /// pass. When [`recompress_bitonal_images`](Self::recompress_bitonal_images)
+    /// is also on, Flate 1-bit images get the JBIG2 candidate too and the
+    /// smaller of G4 and JBIG2 wins. Default: `true`.
+    pub jbig2_bitonal_images: bool,
+
     /// Allow LOSSY re-encoding of lossless (FlateDecode) raster images to
     /// JPEG (`/DCTDecode`) — an encoding-class change, which the library
     /// contract otherwise forbids, so this is strictly opt-in consent
@@ -562,6 +633,7 @@ impl Default for OptimizeOptions {
             convert_type1: false,
             strip_hinting: false,
             recompress_bitonal_images: false,
+            jbig2_bitonal_images: true,
             allow_lossy_reencode: false,
             collapse_gray_images: false,
             flatten_forms: false,
@@ -677,6 +749,14 @@ impl OptimizeOptions {
     #[must_use]
     pub fn with_recompress_bitonal_images(mut self, recompress: bool) -> Self {
         self.recompress_bitonal_images = recompress;
+        self
+    }
+
+    /// Enable/disable lossless JBIG2 re-storage of CCITT bitonal images
+    /// (on by default). See [`OptimizeOptions::jbig2_bitonal_images`].
+    #[must_use]
+    pub fn with_jbig2_bitonal_images(mut self, jbig2: bool) -> Self {
+        self.jbig2_bitonal_images = jbig2;
         self
     }
 
@@ -4323,15 +4403,19 @@ fn try_optimize(input: &[u8], options: OptimizeOptions) -> Result<OptimizeOutcom
         Vec::new()
     };
 
-    // Plan lossless bitonal→G4 recompression (read-only; empty when the
-    // option is off or nothing qualified). No overlap with `replacements`:
-    // the downsample paths require 8-bit samples or DCT payloads, the bitonal
-    // pass requires 1-bit ones.
-    let bitonal_plans = if options.recompress_bitonal_images {
-        bitonal::plan_bitonal_recompressions(&doc)
-    } else {
-        Vec::new()
-    };
+    // Plan lossless bitonal re-encodes — opt-in G4, default-on JBIG2
+    // (read-only; empty when nothing qualified). No overlap with
+    // `replacements`: the downsample paths require 8-bit samples or DCT
+    // payloads, the bitonal pass requires 1-bit ones. JBIG2 follows the
+    // re-encoding passes' posture: declined on PDF/A claims (`pdfa`, decided
+    // once above) and on encrypted documents.
+    let bitonal_plans = bitonal::plan_bitonal_recompressions(
+        &doc,
+        bitonal::BitonalTargets {
+            g4: options.recompress_bitonal_images,
+            jbig2: options.jbig2_bitonal_images && !pdfa && !doc.is_encrypted(),
+        },
+    );
 
     // Plan JPX (JPEG2000) → JPEG conversions; empty unless --allow-lossy
     // consented to encoding-class changes. Read-only planning, applied below.
@@ -4471,24 +4555,42 @@ fn try_optimize(input: &[u8], options: OptimizeOptions) -> Result<OptimizeOutcom
         }
     }
 
-    // Apply bitonal replacements: new G4 payload plus normalized filter and
-    // parms. `/Width`/`/Height` are untouched — the transform never resamples.
+    // Apply bitonal replacements: new payload plus its filter — G4 with
+    // normalized parms, or JBIG2, which needs none. `/Width`/`/Height` are
+    // untouched — neither transform resamples.
+    let mut wrote_jbig2 = false;
     for r in bitonal_plans {
         if let Ok(Object::Stream(stream)) = doc.get_object_mut(r.id) {
             stream.set_content(r.content);
-            stream
-                .dict
-                .set("Filter", Object::Name(b"CCITTFaxDecode".to_vec()));
-            stream.dict.set(
-                "DecodeParms",
-                Object::Dictionary(dictionary! {
-                    "K" => -1_i64,
-                    "Columns" => r.columns,
-                    "Rows" => r.rows,
-                    "BlackIs1" => false,
-                }),
-            );
+            match r.encoding {
+                bitonal::BitonalEncoding::G4 { columns, rows } => {
+                    stream
+                        .dict
+                        .set("Filter", Object::Name(b"CCITTFaxDecode".to_vec()));
+                    stream.dict.set(
+                        "DecodeParms",
+                        Object::Dictionary(dictionary! {
+                            "K" => -1_i64,
+                            "Columns" => columns,
+                            "Rows" => rows,
+                            "BlackIs1" => false,
+                        }),
+                    );
+                }
+                bitonal::BitonalEncoding::Jbig2 => {
+                    stream
+                        .dict
+                        .set("Filter", Object::Name(b"JBIG2Decode".to_vec()));
+                    stream.dict.remove(b"DecodeParms");
+                    wrote_jbig2 = true;
+                }
+            }
         }
+    }
+    // `/JBIG2Decode` is PDF 1.4. The object-stream save path raises the
+    // header to 1.5 on its own; the classic path writes `doc.version` as is.
+    if wrote_jbig2 && doc.version.as_str() < "1.4" {
+        doc.version = "1.4".to_string();
     }
 
     // Apply JPX→JPEG conversions: raw JPEG payload, explicit /ColorSpace

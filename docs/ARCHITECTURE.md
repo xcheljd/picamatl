@@ -70,7 +70,25 @@ Executed in this order; each pass reports whether it did work.
 - Font subsets: plan per `/FontDescriptor` (read-only). Type0/CIDFontType2
   Identity-H/V + simple TrueType; Type1C merges. Never rewrites content-stream
   text bytes.
-- Bitonal → CCITT G4 (opt-in `--recompress-bitonal-images`).
+- Bitonal re-encodes (`src/bitonal.rs`): CCITT → JBIG2 generic region
+  (default on; `--no-jbig2-bitonal-images` opts out) and → CCITT G4 (opt-in
+  `--recompress-bitonal-images`). One planner decodes each 1-bit image with
+  the strict CCITT (or Flate) decoder and builds every enabled candidate;
+  the cheapest that is strictly smaller than the stored stream ships, decode-
+  back verified. JBIG2 (`src/jbig2.rs`, in-house MQ coder + generic-region
+  codec from T.88, no dependency) tries all four templates × TPGD plus three
+  moved AT pixels per image, writes a page-information + one immediate
+  generic-region segment (embedded organization, no `/JBIG2Globals`), drops
+  `/DecodeParms`, and leaves every other key (`/Decode`, `/ColorSpace`,
+  `/ImageMask`) as is: the samples are identical, so they paint identically.
+  JBIG2 sources are CCITT images — plus Flate 1-bit images only when G4 is
+  also on, because a G4 output is a CCITT source on the next run (the
+  idempotence reason; the G4-vs-JBIG2 tie-break charges G4 its 80 B parms
+  overhead on both runs). Declined on PDF/A claims (`pdfa`) and encrypted
+  documents; existing `/JBIG2Decode` images are never touched. Raises a
+  pre-1.4 header to 1.4 when it writes JBIG2 (the object-stream path's 1.5
+  floor already covers the default save). Memory: planned in
+  `budget_batches` of 1 GiB at 4x each image's packed sample size.
 - JPX→DCT conversion (opt-in `--allow-lossy`).
 - Gray-collapse detection (`--collapse-gray-images`).
 
@@ -130,7 +148,8 @@ Everything from `pack_object_streams` down is `save_document` in
 | `src/reals.rs` | ~1K | Real-literal splice-back |
 | `src/encodings.rs` | ~0.9K | Font encoding tables, generated mechanically from ISO 32000-1 Annex D.1/D.2 plus Adobe's BSD-3-Clause Adobe Glyph List, cross-checked against Python's `cp1252`/`mac_roman` (provenance in the module header) |
 | `src/cffmerge.rs` | ~0.8K | Type1C same-family union merges |
-| `src/bitonal.rs` | ~0.8K | CCITT G4 recompression |
+| `src/bitonal.rs` | ~1.3K | Bitonal re-encodes: strict CCITT/Flate 1-bit decode, G4 and JBIG2 candidates, the never-larger choice |
+| `src/jbig2.rs` | ~0.9K | JBIG2 generic region: T.88 MQ arithmetic encoder/decoder, templates 0-3, TPGD, AT pixels, PDF embedded-stream framing and its strict decode-back parser |
 | `src/truetype.rs` | ~0.7K | TrueType subset cmap synthesis |
 | `src/serialize.rs` | ~0.6K | `save_document`: both save paths + the xref-stream / `ObjStm` byte-level post-passes |
 | `src/classify.rs` | ~0.5K | Line-art guard and the `--figure-dpi` figure classifier, with their tuning constants |
@@ -178,7 +197,7 @@ they are one pipeline, and the pass ordering above is the reason.
 
 | Level | Flag | What it allows |
 |---|---|---|
-| Lossless defaults | — | dedup, re-deflate, Huffman re-table, subset fonts, ObjStm packing, JPEG/Flate downsample-at-target (encoding class preserved) |
+| Lossless defaults | — | dedup, re-deflate, Huffman re-table, subset fonts, ObjStm packing, JPEG/Flate downsample-at-target (encoding class preserved), CCITT → lossless JBIG2 (samples preserved; opt out with `--no-jbig2-bitonal-images` for readers without JBIG2) |
 | Quality knob | `--figure-dpi` | higher target for figure-like images (never lossier) |
 | Lossy | `--allow-lossy` | Flate photos → JPEG (line-art auto-declined), JPX → DCT, CMYK requant |
 | Strips | `--strip-*` | accessibility, metadata (breaks PDF/A+UA), private data, hinting |

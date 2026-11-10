@@ -45,6 +45,8 @@ for pair in lzw_lzw:0 lzw_lzw:1 lzw_a85:2 lzw_ahx:3 lzw_rl:4; do
     done
 done
 cp ../fixtures/jpeg/*.jpg corpus/jpeghuff/ 2>/dev/null || true
+# jbig2: synthetic seeds (round-trip bitmaps and picamatl-shaped streams).
+cargo run --quiet --release --bin jbig2_seeds -- corpus/jbig2
 # Whole-pipeline seeds must be SMALL: libFuzzer runs every seed once before it
 # mutates anything, and under the sanitizer a multi-megabyte PDF takes many
 # seconds, so big seeds eat the whole campaign. Keep inputs under SEED_MAX

@@ -50,6 +50,7 @@ summary. Reproduce a finding with
 | `deflate` | capped inflate + PNG predictor decoding | same |
 | `content` | content-stream number lexer and re-planner | same |
 | `lzw` | the legacy-filter decoders (LZW, ASCII85, ASCIIHex, RunLength) | same, and decoded output never exceeds the cap |
+| `jbig2` | the JBIG2 decode-back gate on arbitrary bytes; the generic-region encoder round trip on arbitrary bitmaps, templates, TPGD and AT pixels | no panic; decode output is exactly the declared size; every valid round trip reproduces its bitmap |
 
 The focused targets reach internals through the `fuzzing` cargo feature
 (`picamatl::fuzz_api`). It is off by default, hidden from the docs, and not a

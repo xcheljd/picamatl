@@ -44,7 +44,7 @@ fn defaults_blurb() -> String {
          pack-object-streams {},\n  \
          downsample-flate-images {}, subset-fonts {},\n  \
          convert-type1 {}, strip-hinting {}, recompress-bitonal-images {},\n  \
-         allow-lossy {}, collapse-gray-images {},\n  \
+         jbig2-bitonal-images {}, allow-lossy {}, collapse-gray-images {},\n  \
          flatten-forms {}",
         on_off(d.strip_accessibility),
         on_off(d.strip_metadata),
@@ -55,6 +55,7 @@ fn defaults_blurb() -> String {
         on_off(d.convert_type1),
         on_off(d.strip_hinting),
         on_off(d.recompress_bitonal_images),
+        on_off(d.jbig2_bitonal_images),
         on_off(d.allow_lossy_reencode),
         on_off(d.collapse_gray_images),
         on_off(d.flatten_forms),
@@ -186,6 +187,13 @@ struct Cli {
     /// Do not recompress bitonal images
     #[arg(long)]
     no_recompress_bitonal_images: bool,
+
+    /// Losslessly re-store CCITT bitonal images as JBIG2 when smaller
+    #[arg(long, overrides_with = "no_jbig2_bitonal_images")]
+    jbig2_bitonal_images: bool,
+    /// Keep CCITT bitonal images as stored (no JBIG2 re-encoding)
+    #[arg(long)]
+    no_jbig2_bitonal_images: bool,
 
     /// Allow LOSSY re-encoding of lossless FlateDecode images to JPEG
     /// (encoding-class change; strictly opt-in)
@@ -321,6 +329,11 @@ fn options_from(cli: &Cli) -> OptimizeOptions {
             cli.recompress_bitonal_images,
             cli.no_recompress_bitonal_images,
             d.recompress_bitonal_images,
+        ))
+        .with_jbig2_bitonal_images(resolve(
+            cli.jbig2_bitonal_images,
+            cli.no_jbig2_bitonal_images,
+            d.jbig2_bitonal_images,
         ))
         .with_allow_lossy_reencode(resolve(
             cli.allow_lossy,

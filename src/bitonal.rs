@@ -27,6 +27,7 @@ use lopdf::{Document, Object, ObjectId};
 use rayon::prelude::*;
 
 use crate::deflate::inflate_capped;
+use crate::jbig2;
 use crate::{classify_filter, num, resolve, FilterClass};
 
 /// Pixel-count ceiling for the bitonal pass: 2^28 ≈ 268M pixels (32 MiB of
@@ -41,22 +42,53 @@ const MAX_BITONAL_PIXELS: u64 = 1 << 28;
 /// `PARMS_OVERHEAD` accounting.
 const CCITT_PARMS_OVERHEAD: usize = 80;
 
+/// What a planned bitonal replacement writes: a CCITT G4 payload with the
+/// normalized `/DecodeParms` (`columns`/`rows` echo the unchanged
+/// `/Width`/`/Height`), or a JBIG2 generic-region payload, which carries
+/// its own geometry and needs no parameters.
+pub(crate) enum BitonalEncoding {
+    G4 { columns: i64, rows: i64 },
+    Jbig2,
+}
+
 /// A planned bitonal replacement, computed read-only before mutating the doc.
-/// `columns`/`rows` echo the unchanged `/Width`/`/Height` for the new
-/// `/DecodeParms`.
 pub(crate) struct BitonalReplacement {
     pub id: ObjectId,
     pub content: Vec<u8>,
-    pub columns: i64,
-    pub rows: i64,
+    pub encoding: BitonalEncoding,
 }
 
-/// Plan G4 recompression for every eligible bitonal image XObject. Runs over
-/// all image streams, not just painted ones: the transform is lossless, so
+/// Which re-encodings the bitonal planner may produce this run.
+#[derive(Clone, Copy)]
+pub(crate) struct BitonalTargets {
+    /// Opt-in G4 recompression (`--recompress-bitonal-images`): CCITT and
+    /// Flate 1-bit sources, DeviceGray / ImageMask, identity `/Decode`.
+    pub g4: bool,
+    /// JBIG2 generic region (default on): CCITT sources, plus Flate sources
+    /// whenever `g4` is on (see [`plan_one`] for why).
+    pub jbig2: bool,
+}
+
+/// Memory budget for concurrent bitonal planning, mirroring
+/// `JPEG_REWRITE_BUDGET`: each image holds its samples, the JBIG2 bitmap
+/// and a decode-back buffer at once (~4x the packed sample size, up to 32
+/// MiB each), so the work runs in parallel batches whose summed estimate
+/// stays under 1 GiB. Nothing is skipped; an image over budget alone runs
+/// in a batch by itself.
+const BITONAL_PLAN_BUDGET: usize = 1 << 30;
+
+/// Plan bitonal re-encodes for every eligible image XObject. Runs over all
+/// image streams, not just painted ones: the transforms are lossless, so
 /// placement (and `/SMask`/`/Mask` presence) is irrelevant — the sample data
 /// is preserved bit-for-bit under any use.
-pub(crate) fn plan_bitonal_recompressions(doc: &Document) -> Vec<BitonalReplacement> {
-    let ids: Vec<ObjectId> = doc
+pub(crate) fn plan_bitonal_recompressions(
+    doc: &Document,
+    targets: BitonalTargets,
+) -> Vec<BitonalReplacement> {
+    if !targets.g4 && !targets.jbig2 {
+        return Vec::new();
+    }
+    let ids: Vec<(ObjectId, usize)> = doc
         .objects
         .iter()
         .filter_map(|(&id, obj)| {
@@ -65,15 +97,79 @@ pub(crate) fn plan_bitonal_recompressions(doc: &Document) -> Vec<BitonalReplacem
                 stream.dict.get(b"Subtype").map(|s| resolve(doc, s)),
                 Ok(Object::Name(n)) if n == b"Image"
             )
-            .then_some(id)
+            .then(|| (id, memory_estimate(doc, &stream.dict)))
         })
         .collect();
-    ids.par_iter().filter_map(|&id| plan_one(doc, id)).collect()
+    crate::budget_batches(ids, BITONAL_PLAN_BUDGET, |&(_, cost)| cost)
+        .into_iter()
+        .flat_map(|batch| {
+            batch
+                .par_iter()
+                .filter_map(|&(id, _)| plan_one(doc, id, targets))
+                .collect::<Vec<_>>()
+        })
+        .collect()
 }
 
-/// Decode one bitonal image to packed samples, re-encode as G4, and return a
-/// replacement if it is strictly smaller and verified. `None` = untouched.
-fn plan_one(doc: &Document, id: ObjectId) -> Option<BitonalReplacement> {
+/// Peak-memory estimate for planning one image, from its dictionary alone:
+/// 4x the packed 1-bit sample buffer (0 for anything `plan_one` will
+/// decline before allocating).
+fn memory_estimate(doc: &Document, dict: &lopdf::Dictionary) -> usize {
+    let dim = |k: &[u8]| {
+        dict.get(k)
+            .ok()
+            .map(|o| resolve(doc, o))
+            .and_then(|o| o.as_i64().ok())
+            .filter(|&v| v > 0)
+    };
+    match (dim(b"Width"), dim(b"Height")) {
+        (Some(w), Some(h)) if (w as u64).saturating_mul(h as u64) <= MAX_BITONAL_PIXELS => {
+            (w as usize).div_ceil(8) * h as usize * 4
+        }
+        _ => 0,
+    }
+}
+
+/// JBIG2 generic-region candidates tried per image; the smallest verified
+/// stream is kept. All four fixed templates with typical prediction off and
+/// on (nominal AT pixels), plus template 0 with its first AT pixel moved to
+/// the three positions that won on some images. Measured in-pipeline over
+/// the 7 non-PDF/A CCITT scans that decode (default output bytes):
+/// template 0 alone 20,956,319 B; best of the eight nominal 20,430,935 B
+/// (the smaller templates win on low-resolution scans, where fewer
+/// contexts adapt faster); with the six AT variants 20,419,539 B, a further
+/// 11,396 B at about twice the encode time — kept, compression outranks
+/// speed. Every other AT position tried lost.
+const JBIG2_CANDIDATES: [jbig2::GenericParams; 14] = [
+    jbig2::GenericParams::nominal(0, false),
+    jbig2::GenericParams::nominal(0, true),
+    jbig2::GenericParams::nominal(1, false),
+    jbig2::GenericParams::nominal(1, true),
+    jbig2::GenericParams::nominal(2, false),
+    jbig2::GenericParams::nominal(2, true),
+    jbig2::GenericParams::nominal(3, false),
+    jbig2::GenericParams::nominal(3, true),
+    jbig2::GenericParams::nominal(0, false).with_a1(4, -1),
+    jbig2::GenericParams::nominal(0, true).with_a1(4, -1),
+    jbig2::GenericParams::nominal(0, false).with_a1(-1, -2),
+    jbig2::GenericParams::nominal(0, true).with_a1(-1, -2),
+    jbig2::GenericParams::nominal(0, false).with_a1(5, -1),
+    jbig2::GenericParams::nominal(0, true).with_a1(5, -1),
+];
+
+/// Decode one bitonal image to packed samples, re-encode it under every
+/// enabled target, and return the smallest replacement that is strictly
+/// smaller than the stored stream and decodes back bit-for-bit. `None` =
+/// untouched.
+///
+/// Idempotence when both targets are on: the costs compared are the ones
+/// the next run would compare. A G4 result ships only when strictly cheaper
+/// than the JBIG2 one (payload + `CCITT_PARMS_OVERHEAD` vs payload), so on
+/// the next run the JBIG2 candidate — the same bytes, since the samples are
+/// the same — cannot beat that G4 stream either. That is also why Flate
+/// sources get a JBIG2 candidate whenever G4 is on: an image this run turns
+/// into G4 is a CCITT source on the next run.
+fn plan_one(doc: &Document, id: ObjectId, targets: BitonalTargets) -> Option<BitonalReplacement> {
     let stream = doc.get_object(id).ok()?.as_stream().ok()?;
     let dict = &stream.dict;
 
@@ -94,30 +190,6 @@ fn plan_one(doc: &Document, id: ObjectId) -> Option<BitonalReplacement> {
         _ => return None,
     }
 
-    // DeviceGray or the implicit ImageMask colorspace only. Indexed and
-    // friends remap samples; out of scope.
-    match dict.get(b"ColorSpace") {
-        Err(_) if image_mask => {}
-        Ok(cs) => {
-            if !matches!(resolve(doc, cs), Object::Name(n) if n == b"DeviceGray") {
-                return None;
-            }
-        }
-        Err(_) => return None,
-    }
-
-    // `/Decode` remaps sample values; only the identity [0 1] (a no-op) is
-    // accepted. `[1 0]` could be normalized by inversion, but that changes a
-    // dictionary the rest of the toolchain may key on — out of M1 scope.
-    if let Ok(decode) = dict.get(b"Decode") {
-        let Object::Array(items) = resolve(doc, decode) else {
-            return None;
-        };
-        if items.len() != 2 || num(&items[0]) != 0.0 || num(&items[1]) != 1.0 {
-            return None;
-        }
-    }
-
     let width = dict
         .get(b"Width")
         .ok()
@@ -136,45 +208,125 @@ fn plan_one(doc: &Document, id: ObjectId) -> Option<BitonalReplacement> {
     }
     let (w, h) = (width as u32, height as usize);
 
-    let filter = dict.get(b"Filter").ok()?;
-    let samples = match classify_filter(doc, filter) {
-        FilterClass::CcittOnly => decode_ccitt_source(stream, w, h)?,
+    let class = classify_filter(doc, dict.get(b"Filter").ok()?);
+    let g4_ok = targets.g4 && g4_dictionary_ok(doc, dict, image_mask);
+    // JBIG2 preserves the samples exactly, so `/ColorSpace` and `/Decode`
+    // apply to the same values afterwards and need no gate.
+    let jbig2_ok = targets.jbig2
+        && match class {
+            FilterClass::CcittOnly => true,
+            FilterClass::FlateOnly => g4_ok,
+            _ => false,
+        };
+    if !g4_ok && !jbig2_ok {
+        return None;
+    }
+
+    let samples = match class {
+        FilterClass::CcittOnly => decode_ccitt_source(doc, stream, w, h)?,
         FilterClass::FlateOnly => decode_flate_bitonal(stream, w, h)?,
         _ => return None,
     };
+    let stored = stream.content.len();
 
-    let g4 = encode_g4_from_samples(&samples, w, h);
+    let g4 = g4_ok
+        .then(|| encode_g4_from_samples(&samples, w, h))
+        // Never-larger guard: the new payload plus its forced dictionary
+        // edits must be strictly smaller than the bytes it replaces.
+        .filter(|g4| g4.len() + CCITT_PARMS_OVERHEAD < stored);
 
-    // Never-larger guard: the new payload plus its forced dictionary edits
-    // must be strictly smaller than the bytes it replaces.
-    if g4.len() + CCITT_PARMS_OVERHEAD >= stream.content.len() {
-        return None;
+    // The JBIG2 dictionary only shrinks: `/Filter /JBIG2Decode` is no
+    // longer than either source filter name (and replaces any array form),
+    // and `/DecodeParms` is dropped. A strictly smaller payload is
+    // therefore a strictly smaller object.
+    let jb2 = jbig2_ok
+        .then(|| {
+            let mut bm = jbig2::samples_to_bitmap(&samples, w as usize, h)?;
+            // `encode_best` decodes every candidate back through the
+            // in-house decoder and keeps only exact reproductions.
+            jbig2::encode_best(&mut bm, &JBIG2_CANDIDATES)
+        })
+        .flatten()
+        .filter(|jb2| jb2.len() < stored);
+
+    let pick_g4 = match (&g4, &jb2) {
+        (Some(g), Some(j)) => g.len() + CCITT_PARMS_OVERHEAD < j.len(),
+        (Some(_), None) => true,
+        _ => false,
+    };
+    if pick_g4 {
+        let g4 = g4?;
+        // Decode-back verification: the replacement ships only if decoding it
+        // under the exact `/DecodeParms` we will write reproduces the source
+        // samples bit-for-bit. Turns any encoder defect into a skip, never a
+        // corrupt image.
+        if decode_g4_strict_to_samples(&g4, w, h, false)? != samples {
+            return None;
+        }
+        return Some(BitonalReplacement {
+            id,
+            content: g4,
+            encoding: BitonalEncoding::G4 {
+                columns: width,
+                rows: height,
+            },
+        });
     }
-
-    // Decode-back verification: the replacement ships only if decoding it
-    // under the exact `/DecodeParms` we will write reproduces the source
-    // samples bit-for-bit. Turns any encoder defect into a skip, never a
-    // corrupt image.
-    if decode_g4_strict_to_samples(&g4, w, h, false)? != samples {
-        return None;
-    }
-
     Some(BitonalReplacement {
         id,
-        content: g4,
-        columns: width,
-        rows: height,
+        content: jb2?,
+        encoding: BitonalEncoding::Jbig2,
     })
+}
+
+/// The G4 target's extra dictionary gates: DeviceGray or the implicit
+/// ImageMask colorspace, and an identity `/Decode`.
+fn g4_dictionary_ok(doc: &Document, dict: &lopdf::Dictionary, image_mask: bool) -> bool {
+    // DeviceGray or the implicit ImageMask colorspace only. Indexed and
+    // friends remap samples; out of scope.
+    match dict.get(b"ColorSpace") {
+        Err(_) if image_mask => {}
+        Ok(cs) => {
+            if !matches!(resolve(doc, cs), Object::Name(n) if n == b"DeviceGray") {
+                return false;
+            }
+        }
+        Err(_) => return false,
+    }
+
+    // `/Decode` remaps sample values; only the identity [0 1] (a no-op) is
+    // accepted. `[1 0]` could be normalized by inversion, but that changes a
+    // dictionary the rest of the toolchain may key on — out of M1 scope.
+    if let Ok(decode) = dict.get(b"Decode") {
+        let Object::Array(items) = resolve(doc, decode) else {
+            return false;
+        };
+        if items.len() != 2 || num(&items[0]) != 0.0 || num(&items[1]) != 1.0 {
+            return false;
+        }
+    }
+    true
 }
 
 /// Decode a CCITT-stored source stream to packed samples, honoring its
 /// `/DecodeParms`. Every unsupported parameter is a gate-skip, not an error.
-fn decode_ccitt_source(stream: &lopdf::Stream, w: u32, h: usize) -> Option<Vec<u8>> {
-    // Direct-dictionary `/DecodeParms` only, mirroring `flate_encoding`'s
-    // posture (array and indirect-reference forms are out of scope).
-    let parms = match stream.dict.get(b"DecodeParms") {
+fn decode_ccitt_source(
+    doc: &Document,
+    stream: &lopdf::Stream,
+    w: u32,
+    h: usize,
+) -> Option<Vec<u8>> {
+    // `/DecodeParms` as a dictionary, a reference to one, or the
+    // one-element array matching a one-element `/Filter` array (`[null]`
+    // = defaults). Anything else is a gate-skip.
+    let parms = match stream.dict.get(b"DecodeParms").map(|o| resolve(doc, o)) {
         Err(_) => None,
         Ok(Object::Dictionary(d)) => Some(d),
+        Ok(Object::Array(a)) if a.len() == 1 => match resolve(doc, &a[0]) {
+            Object::Dictionary(d) => Some(d),
+            Object::Null => None,
+            _ => return None,
+        },
         Ok(_) => return None,
     };
     let get_i = |key: &[u8], default: i64| {
@@ -366,8 +518,12 @@ mod tests {
     use fax::BitWriter;
     use lopdf::{dictionary, Dictionary, Document, Stream};
 
+    /// The G4 target alone: these tests pin G4 behavior, so the default-on
+    /// JBIG2 competitor is switched off (it has its own tests below).
     fn opts() -> OptimizeOptions {
-        OptimizeOptions::default().with_recompress_bitonal_images(true)
+        OptimizeOptions::default()
+            .with_recompress_bitonal_images(true)
+            .with_jbig2_bitonal_images(false)
     }
 
     /// Deterministic LCG so failures reproduce (same as tests/ccitt_vendor_contract.rs).
@@ -496,7 +652,11 @@ mod tests {
 
     /// One-page PDF around a single image XObject built from the given dict.
     fn bitonal_pdf(image_dict: Dictionary, content: Vec<u8>) -> Vec<u8> {
-        let mut doc = Document::with_version("1.5");
+        bitonal_pdf_version(image_dict, content, "1.5")
+    }
+
+    fn bitonal_pdf_version(image_dict: Dictionary, content: Vec<u8>, version: &str) -> Vec<u8> {
+        let mut doc = Document::with_version(version);
         let img_id = doc.add_object(Stream::new(image_dict, content));
         let page_content = b"q 200 0 0 200 0 0 cm /Im0 Do Q".to_vec();
         let content_id = doc.add_object(Stream::new(dictionary! {}, page_content));
@@ -522,6 +682,11 @@ mod tests {
             "Type" => "Catalog",
             "Pages" => pages_id,
         });
+        if version < "1.5" {
+            // A classic table keeps lopdf's plain save at the given version
+            // (its default xref stream would raise the header to 1.5).
+            doc.reference_table.cross_reference_type = lopdf::xref::XrefType::CrossReferenceTable;
+        }
         doc.trailer.set("Root", catalog_id);
         let mut out = Vec::new();
         doc.save_to(&mut out).unwrap();
@@ -806,5 +971,282 @@ mod tests {
             pdf,
             "a non-identity /Decode remap must gate the image out"
         );
+    }
+
+    // ---- JBIG2 target -------------------------------------------------
+
+    fn g4_parms(w: usize, h: usize) -> Dictionary {
+        dictionary! { "K" => -1, "Columns" => w as i64, "Rows" => h as i64 }
+    }
+
+    /// Assert the image was re-stored as JBIG2 (no `/DecodeParms`) and that
+    /// its stream decodes back to the PDF samples `want`.
+    fn assert_jbig2_with_samples(pdf: &[u8], w: usize, h: usize, want: &[u8]) -> lopdf::Stream {
+        let img = image_stream(pdf);
+        assert_eq!(
+            img.dict.get(b"Filter").unwrap().as_name().unwrap(),
+            b"JBIG2Decode"
+        );
+        assert!(
+            img.dict.get(b"DecodeParms").is_err(),
+            "JBIG2 needs no parms"
+        );
+        assert_eq!(img.dict.get(b"Width").unwrap().as_i64().unwrap(), w as i64);
+        assert_eq!(img.dict.get(b"Height").unwrap().as_i64().unwrap(), h as i64);
+        let got = jbig2::decode_embedded(&img.content, w as u32, h as u32)
+            .expect("output stream decodes");
+        assert_eq!(
+            Some(got),
+            jbig2::samples_to_bitmap(want, w, h),
+            "samples changed by the JBIG2 re-store"
+        );
+        img
+    }
+
+    #[test]
+    fn ccitt_g4_is_restored_as_jbig2_by_default() {
+        let rows = doc_rows(W, H);
+        let pdf = bitonal_pdf(
+            image_dict(W, H, "CCITTFaxDecode", Some(g4_parms(W, H))),
+            g4_of(&rows),
+        );
+        let out = optimize_with_options(&pdf, OptimizeOptions::default());
+        assert!(out.len() < pdf.len(), "output must be smaller");
+        assert_jbig2_with_samples(&out, W, H, &pack_samples(&rows, false));
+    }
+
+    #[test]
+    fn jbig2_opt_out_leaves_ccitt_untouched() {
+        let rows = doc_rows(W, H);
+        let pdf = bitonal_pdf(
+            image_dict(W, H, "CCITTFaxDecode", Some(g4_parms(W, H))),
+            g4_of(&rows),
+        );
+        let out = optimize_with_options(
+            &pdf,
+            OptimizeOptions::default().with_jbig2_bitonal_images(false),
+        );
+        assert_eq!(out, pdf, "opt-out must leave the CCITT image alone");
+    }
+
+    #[test]
+    fn jbig2_preserves_samples_under_both_blackis1_polarities() {
+        // Same bitstream, opposite /BlackIs1: different samples, and the
+        // JBIG2 stream must carry each one exactly (G3 and G4 sources).
+        let rows = doc_rows(W, 128);
+        for black_is_1 in [false, true] {
+            let want = pack_samples(&rows, black_is_1);
+            for (data, mut parms) in [
+                (g4_of(&rows), g4_parms(W, 128)),
+                (g3_of(&rows), g3_parms(W, 128)),
+            ] {
+                parms.set("BlackIs1", black_is_1);
+                let pdf = bitonal_pdf(image_dict(W, 128, "CCITTFaxDecode", Some(parms)), data);
+                let out = optimize_with_options(&pdf, OptimizeOptions::default());
+                assert_jbig2_with_samples(&out, W, 128, &want);
+            }
+        }
+    }
+
+    #[test]
+    fn jbig2_keeps_decode_colorspace_and_image_mask_keys() {
+        // JBIG2 preserves samples, so /Decode, a non-DeviceGray /ColorSpace
+        // and /ImageMask stay exactly as they were (they apply to the same
+        // values afterwards).
+        let rows = doc_rows(W, 256);
+        let samples = pack_samples(&rows, false);
+        let mut d = image_dict(W, 256, "CCITTFaxDecode", Some(g4_parms(W, 256)));
+        d.set("Decode", vec![1.into(), 0.into()]);
+        d.set(
+            "ColorSpace",
+            vec![
+                Object::Name(b"CalGray".to_vec()),
+                Object::Dictionary(
+                    dictionary! { "WhitePoint" => vec![0.9505.into(), 1.into(), 1.089.into()] },
+                ),
+            ],
+        );
+        let out = optimize_with_options(&bitonal_pdf(d, g4_of(&rows)), OptimizeOptions::default());
+        let img = assert_jbig2_with_samples(&out, W, 256, &samples);
+        let dec = img.dict.get(b"Decode").unwrap().as_array().unwrap();
+        assert_eq!((num(&dec[0]), num(&dec[1])), (1.0, 0.0));
+        assert!(img.dict.get(b"ColorSpace").unwrap().as_array().is_ok());
+
+        let mask = dictionary! {
+            "Type" => "XObject",
+            "Subtype" => "Image",
+            "Width" => W as i64,
+            "Height" => 256,
+            "ImageMask" => true,
+            "Filter" => "CCITTFaxDecode",
+            "DecodeParms" => g4_parms(W, 256),
+        };
+        let out =
+            optimize_with_options(&bitonal_pdf(mask, g4_of(&rows)), OptimizeOptions::default());
+        let img = assert_jbig2_with_samples(&out, W, 256, &samples);
+        assert_eq!(img.dict.get(b"ImageMask").unwrap(), &Object::Boolean(true));
+    }
+
+    #[test]
+    fn jbig2_accepts_array_and_reference_decode_parms() {
+        let rows = doc_rows(W, 200);
+        let samples = pack_samples(&rows, false);
+        // `/Filter [/CCITTFaxDecode] /DecodeParms [<< ... >>]`.
+        let mut d = image_dict(W, 200, "CCITTFaxDecode", None);
+        d.set("Filter", vec![Object::Name(b"CCITTFaxDecode".to_vec())]);
+        d.set("DecodeParms", vec![Object::Dictionary(g4_parms(W, 200))]);
+        let out = optimize_with_options(&bitonal_pdf(d, g4_of(&rows)), OptimizeOptions::default());
+        assert_jbig2_with_samples(&out, W, 200, &samples);
+        // `/DecodeParms` as an indirect reference.
+        let mut doc = Document::load_mem(&bitonal_pdf(
+            image_dict(W, 200, "CCITTFaxDecode", None),
+            g4_of(&rows),
+        ))
+        .unwrap();
+        let parms_id = doc.add_object(g4_parms(W, 200));
+        for obj in doc.objects.values_mut() {
+            if let Object::Stream(s) = obj {
+                if s.dict.has(b"Width") {
+                    s.dict.set("DecodeParms", parms_id);
+                }
+            }
+        }
+        let mut pdf = Vec::new();
+        doc.save_to(&mut pdf).unwrap();
+        let out = optimize_with_options(&pdf, OptimizeOptions::default());
+        assert_jbig2_with_samples(&out, W, 200, &samples);
+    }
+
+    #[test]
+    fn jbig2_is_idempotent() {
+        let rows = doc_rows(W, H);
+        let pdf = bitonal_pdf(
+            image_dict(W, H, "CCITTFaxDecode", Some(g4_parms(W, H))),
+            g4_of(&rows),
+        );
+        let once = optimize_with_options(&pdf, OptimizeOptions::default());
+        assert_ne!(once, pdf);
+        let twice = optimize_with_options(&once, OptimizeOptions::default());
+        assert_eq!(once, twice, "a JBIG2 image is never touched again");
+    }
+
+    #[test]
+    fn jbig2_never_replaces_with_a_larger_stream() {
+        // A tiny G4 image is a handful of bytes; the JBIG2 framing alone is
+        // ~70. Strictly-smaller fails, so the image stays as stored.
+        let rows = doc_rows(64, 16);
+        let pdf = bitonal_pdf(
+            image_dict(64, 16, "CCITTFaxDecode", Some(g4_parms(64, 16))),
+            g4_of(&rows),
+        );
+        assert_eq!(optimize_with_options(&pdf, OptimizeOptions::default()), pdf);
+    }
+
+    #[test]
+    fn existing_jbig2_images_are_never_touched() {
+        let rows = doc_rows(W, H);
+        let mut bm = jbig2::samples_to_bitmap(&pack_samples(&rows, false), W, H).unwrap();
+        let stream =
+            jbig2::encode_best(&mut bm, &[jbig2::GenericParams::nominal(3, false)]).unwrap();
+        let mut d = image_dict(W, H, "JBIG2Decode", None);
+        d.set("Filter", "JBIG2Decode");
+        let pdf = bitonal_pdf(d, stream);
+        let out = optimize_with_options(
+            &pdf,
+            OptimizeOptions::default().with_recompress_bitonal_images(true),
+        );
+        assert_eq!(
+            out, pdf,
+            "JBIG2 sources are out of every bitonal target's scope"
+        );
+    }
+
+    #[test]
+    fn jbig2_declines_documents_claiming_pdfa() {
+        let rows = doc_rows(W, H);
+        let mut doc = Document::load_mem(&bitonal_pdf(
+            image_dict(W, H, "CCITTFaxDecode", Some(g4_parms(W, H))),
+            g4_of(&rows),
+        ))
+        .unwrap();
+        let xmp = doc.add_object(Stream::new(
+            dictionary! { "Type" => "Metadata", "Subtype" => "XML" },
+            b"<x:xmpmeta><rdf:Description xmlns:pdfaid=\"http://www.aiim.org/pdfa/ns/id/\"><pdfaid:part>1</pdfaid:part></rdf:Description></x:xmpmeta>".to_vec(),
+        ));
+        doc.catalog_mut().unwrap().set("Metadata", xmp);
+        let mut pdf = Vec::new();
+        doc.save_to(&mut pdf).unwrap();
+        let out = optimize_with_options(&pdf, OptimizeOptions::default());
+        let img = image_stream(&out);
+        assert_eq!(
+            img.dict.get(b"Filter").unwrap().as_name().unwrap(),
+            b"CCITTFaxDecode",
+            "PDF/A claims decline the JBIG2 re-store"
+        );
+    }
+
+    #[test]
+    fn jbig2_raises_a_pre_1_4_header_on_the_classic_save_path() {
+        let rows = doc_rows(W, H);
+        let pdf = bitonal_pdf_version(
+            image_dict(W, H, "CCITTFaxDecode", Some(g4_parms(W, H))),
+            g4_of(&rows),
+            "1.3",
+        );
+        assert!(pdf.starts_with(b"%PDF-1.3"));
+        let out = optimize_with_options(
+            &pdf,
+            OptimizeOptions::default().with_pack_object_streams(false),
+        );
+        assert!(out.starts_with(b"%PDF-1.4"), "JBIG2Decode needs PDF 1.4");
+        assert_jbig2_with_samples(&out, W, H, &pack_samples(&rows, false));
+        let packed = optimize_with_options(&pdf, OptimizeOptions::default());
+        assert!(packed.starts_with(b"%PDF-1.5"));
+    }
+
+    #[test]
+    fn g4_and_jbig2_together_pick_the_smaller_and_stay_idempotent() {
+        // With both targets on, a Flate source gets both candidates; text
+        // compresses better as JBIG2, and a second pass changes nothing.
+        let rows = doc_rows(W, H);
+        let samples = pack_samples(&rows, false);
+        let flate = deflate_level9(&samples).unwrap();
+        let pdf = bitonal_pdf(image_dict(W, H, "FlateDecode", None), flate);
+        let both = OptimizeOptions::default().with_recompress_bitonal_images(true);
+        let once = optimize_with_options(&pdf, both);
+        assert_jbig2_with_samples(&once, W, H, &samples);
+        assert_eq!(optimize_with_options(&once, both), once);
+        // And a G4 source already smaller than its JBIG2 form stays G4: the
+        // next run compares the same two candidates and declines again.
+        let g4_only = optimize_with_options(&pdf, opts());
+        assert!(optimize_with_options(&g4_only, both).len() <= g4_only.len());
+        let again = optimize_with_options(&g4_only, both);
+        assert_eq!(optimize_with_options(&again, both), again);
+    }
+
+    #[test]
+    fn flate_bitonal_is_not_a_jbig2_source_without_the_g4_opt_in() {
+        let samples = pack_samples(&doc_rows(W, H), false);
+        let flate = deflate_level9(&samples).unwrap();
+        let pdf = bitonal_pdf(image_dict(W, H, "FlateDecode", None), flate);
+        assert_eq!(optimize_with_options(&pdf, OptimizeOptions::default()), pdf);
+    }
+
+    #[test]
+    fn hostile_dimensions_are_declined_before_allocating() {
+        let garbage: Vec<u8> = (0..4096u32).map(|i| (i * 37 + 13) as u8).collect();
+        for (w, h) in [
+            (1_i64 << 20, 1_i64 << 20),
+            (-5, 100),
+            (100, 0),
+            (i64::MAX, 2),
+        ] {
+            let mut d = image_dict(1, 1, "CCITTFaxDecode", None);
+            d.set("Width", w);
+            d.set("Height", h);
+            d.set("DecodeParms", dictionary! { "K" => -1, "Columns" => w });
+            let pdf = bitonal_pdf(d, garbage.clone());
+            assert_eq!(optimize_with_options(&pdf, OptimizeOptions::default()), pdf);
+        }
     }
 }
