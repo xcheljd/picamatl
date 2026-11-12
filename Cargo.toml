@@ -18,17 +18,15 @@ edition = "2021"
 # rust-version 1.88, edition 2024) and current image releases need 1.88.
 rust-version = "1.88.0"
 # Development scaffolding stays in the repository and out of the tarball:
-# hunt probe scripts and their notes, the Phase 7 spike examples (whose own
-# headers say "not shipped"), and the corpus manifest, whose only consumers
-# are scripts/fetch-corpus.sh and scripts/verify-corpus.sh. Everything a
-# consumer or reviewer needs — src, tests, fixtures, README, CHANGELOG, the
-# architecture and design docs, licenses, NOTICE — still ships.
+# hunt probe scripts and their notes, and the corpus manifest, whose only
+# consumers are scripts/fetch-corpus.sh and scripts/verify-corpus.sh.
+# Everything a consumer or reviewer needs — src, tests, fixtures, README,
+# CHANGELOG, the architecture and design docs, licenses, NOTICE — still ships.
 exclude = [
     "/fuzz",
     "/scripts",
     "/docs/hunts",
     "/corpus.sha256",
-    "/examples/spike_*",
     "/fixtures/jpeg/generate*.py",
 ]
 
@@ -93,9 +91,6 @@ path = "src/main.rs"
 # outline + advance equality between the original and subset font programs.
 # Never a runtime dependency.
 ttf-parser = "0.25.1"
-# PNG support for the Phase 7 spike tooling (examples/spike_*.rs, repo-only —
-# excluded from the package above); the library keeps its jpeg-only image build.
-image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 
 # The profile that 'dist' will build with. `lto = "thin"` is dist's generated
 # default and is kept deliberately: the hot loops are libjpeg-turbo's, inside a
