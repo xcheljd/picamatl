@@ -55,9 +55,10 @@ pub(crate) fn save_document(
 
 /// Deflate the cross-reference stream of a just-serialized document.
 ///
-/// lopdf hardcodes `XRefStreamFilter::None` in
-/// `writer.rs::write_cross_reference_stream` — there is no `SaveOptions` knob
-/// for it, and `doc.compress()` cannot reach the object because it does not
+/// lopdf writes it unfiltered (`XRefStreamFilter::None` in
+/// `writer.rs::write_cross_reference_stream`) — its one `SaveOptions` knob
+/// there, `ascii`, picks ASCIIHexDecode, never Flate — and
+/// `doc.compress()` cannot reach the object because it does not
 /// exist in `Document::objects`: the writer synthesizes it during save, after
 /// every document-level pass has run. So picamatl's output shipped a raw
 /// 7-bytes-per-entry xref stream (17,479 B on the 2,497-object NASA reference,

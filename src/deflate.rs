@@ -40,10 +40,11 @@ pub(crate) fn paeth_predict(left: u8, up: u8, upper_left: u8) -> u8 {
 
 /// Spec-correct inversion of PNG row filters over a whole frame of
 /// `[tag][filtered row]` records. Hand-rolled rather than lopdf's
-/// `filters::png::decode_frame` because lopdf 0.42 mis-computes the Avg
+/// `filters::png::decode_frame` because lopdf up to 0.44 mis-computed the Avg
 /// filter (`left + up/2` instead of `(left + up)/2`, verified by round-trip
 /// test) — silently wrong pixels with the correct length, which the outer
-/// length check cannot catch. Returns `None` on any malformed shape.
+/// length check cannot catch. lopdf 0.45 fixed it. Returns `None` on any
+/// malformed shape.
 pub(crate) fn png_defilter(
     data: &[u8],
     bytes_per_pixel: usize,
@@ -109,7 +110,8 @@ pub(crate) const PNG_FILTERS: [u8; 5] = [0, 1, 2, 3, 4];
 /// leading filter-type byte (`tag`, 0-4) followed by the filtered row bytes.
 /// Spec-correct forward filtering (PNG spec §9) against the UNFILTERED prior
 /// row; [`png_defilter`] is its exact inverse for every tag. Hand-rolled for
-/// the same reason the inverse is: lopdf's `encode_row` mis-computes Avg.
+/// the same reason the inverse is: lopdf's `encode_row` mis-computed Avg up
+/// to 0.44 (`(left wrapping+ up)/2` overflows; 0.45 sums in `u16`).
 ///
 /// `bytes_per_pixel` is the predictor's left distance (the PDF `/Colors`
 /// value for 8-bit samples). A trailing partial row is dropped, and a zero

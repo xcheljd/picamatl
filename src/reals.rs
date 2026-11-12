@@ -1,10 +1,11 @@
 //! Exact restoration of PDF real literals that lopdf's `f32` object model
 //! cannot round-trip.
 //!
-//! `Object::Real` holds an `f32` (lopdf 0.44 `src/object.rs:42`) and the writer
-//! prints it with `{}` (`src/writer.rs:594`), i.e. Rust's shortest decimal that
-//! round-trips *as an `f32`*. A literal needing more than ~7 significant digits
-//! is therefore a different number after a load/save:
+//! `Object::Real` holds an `f32` (lopdf 0.47 `src/object.rs:83`) and the writer
+//! prints it with `{}` (`src/writer.rs:653`, adding `.0` to a whole number),
+//! i.e. Rust's shortest decimal that round-trips *as an `f32`*. A literal
+//! needing more than ~7 significant digits is therefore a different number
+//! after a load/save:
 //!
 //! ```text
 //!   841.91998  ->  f32 841.9199829101562  ->  written back as "841.92"
@@ -74,13 +75,14 @@ impl RealLiterals {
     /// lopdf's shortest `f32` print of a captured value and differs from the
     /// input's own text for it.
     fn replacement(&self, printed: &[u8]) -> Option<&[u8]> {
-        // Integer-valued reals print without a fraction — lopdf writes
-        // `Real(1.0)` as `1`, indistinguishable from `Integer(1)`. Restoring
-        // there would rewrite every `/Length 1`, `/Count 1` and `/Size 1` in
-        // the file into a real, so a literal that rounds to a whole number
-        // (`0.999999999` -> `1`) is simply left rounded. The value it would
-        // move is a billionth of a unit; the damage would be a broken
-        // document.
+        // Integer-valued reals print without a fraction under `{}` — `1` for
+        // `1.0`, indistinguishable from `Integer(1)` (lopdf 0.47's writer itself
+        // prints `Real(1.0)` as `1.0`, which the `{}` check below never
+        // matches). Restoring a `1` would rewrite every `/Length 1`,
+        // `/Count 1` and `/Size 1` in the file into a real, so a literal that
+        // rounds to a whole number (`0.999999999` -> `1`) is simply left
+        // rounded. The value it would move is a billionth of a unit; the
+        // damage would be a broken document.
         if !printed.contains(&b'.') {
             return None;
         }
@@ -1061,9 +1063,10 @@ mod tests {
         assert_eq!(captured(&out), captured(&input));
     }
 
-    /// `0.999999999` is a real that lopdf prints back as `1`. Restoring it
-    /// would turn every integer `1` in the output — `/Length`, `/Count`,
-    /// `/Size` — into a real, for a billionth of a unit of accuracy.
+    /// `0.999999999` is a real lopdf holds as the `f32` `1.0`, whose `{}`
+    /// print is `1`. Restoring it would turn every integer `1` in the output —
+    /// `/Length`, `/Count`, `/Size` — into a real, for a billionth of a unit
+    /// of accuracy.
     #[test]
     fn never_turns_an_integer_back_into_a_real() {
         let literals = capture(b"<</A 0.999999999>>");

@@ -2730,13 +2730,16 @@ const MAX_FLATE_PIXEL_BYTES: u64 = 256 * 1024 * 1024;
 ///
 /// Every eligibility gate returns `None` (image untouched) on doubt. Decoding
 /// is done with our own capped inflate + spec-correct predictor inversion
-/// instead of lopdf's `Stream::decompressed_content`, for three verified
-/// lopdf 0.42 reasons: its `decode_row` mis-computes the PNG Avg filter
+/// instead of lopdf's `Stream::decompressed_content`, for three reasons
+/// verified on lopdf 0.42: its `decode_row` mis-computed the PNG Avg filter
 /// (`left + up/2` instead of `(left + up)/2` — silently wrong pixels with the
-/// right length), it swallows corrupt-zlib errors and returns partial data as
-/// `Ok`, and it has no decompressed-size cap. The predictor-VALUE gates still
-/// exist because lopdf also ignores TIFF Predictor 2 and the array form of
-/// `/DecodeParms`; we keep both out of M1 scope entirely.
+/// right length; fixed in 0.45), it swallows corrupt-zlib errors and returns
+/// partial data as `Ok` (still so in 0.47), and `decompressed_content` has no
+/// decompressed-size cap (`decompressed_content_with_limit` is a separate
+/// call). The predictor-VALUE gates exist because our own decoder handles
+/// only PNG predictors on a direct-dictionary `/DecodeParms`: TIFF Predictor 2
+/// and the array form (which lopdf ignored up to 0.44 and 0.45 respectively)
+/// stay out of M1 scope entirely.
 fn plan_flate(
     doc: &Document,
     stream: &lopdf::Stream,
@@ -3185,12 +3188,13 @@ enum FlateEncoding {
 
 /// Classify the stream's `/DecodeParms` (if any) into a layout the M1 path
 /// decodes, or `None` (skip). Only the direct-dictionary form is accepted
-/// (arrays and indirect references are out of scope — lopdf ignores them too,
-/// so such streams have never been reliably decodable here), the predictor
-/// must be 1 (none) or PNG 10-15 (TIFF Predictor 2 is out of scope), and for
-/// PNG predictors the declared Colors/Columns/BitsPerComponent must match the
-/// image dictionary or the row stride would be wrong. Defaults mirror the PDF
-/// spec (Predictor 1, Colors 1, Columns 1, BitsPerComponent 8).
+/// (arrays and indirect references are out of scope — lopdf ignored arrays up
+/// to 0.45 and still ignores a reference in 0.47, so such streams were never
+/// reliably decodable here), the predictor must be 1 (none) or PNG 10-15
+/// (TIFF Predictor 2 is out of scope), and for PNG predictors the declared
+/// Colors/Columns/BitsPerComponent must match the image dictionary or the row
+/// stride would be wrong. Defaults mirror the PDF spec (Predictor 1, Colors 1,
+/// Columns 1, BitsPerComponent 8).
 fn flate_encoding(dict: &lopdf::Dictionary, channels: usize, px_w: u32) -> Option<FlateEncoding> {
     let parms = match dict.get(b"DecodeParms") {
         Err(_) => return Some(FlateEncoding::Plain), // no parms: plain deflate
@@ -3469,7 +3473,8 @@ fn serialize_object(obj: &Object) -> Option<Vec<u8>> {
     if matches!(obj, Object::Stream(_)) {
         return None;
     }
-    // lopdf's Writer is private, but Object has a deterministic Debug impl:
+    // lopdf's Writer was private before 0.47 (0.47 exports
+    // `Writer::write_object`); dedup keys on Object's deterministic Debug impl:
     // structurally identical objects produce identical output, which is exactly
     // the equivalence we need for dedup. (Conservative: differing key order or
     // formatting simply means two objects aren't merged — never a false merge.)
@@ -5459,9 +5464,10 @@ mod tests {
 
     /// Apply one PNG row filter to every row, producing the tagged row stream
     /// (`[tag][filtered row]...`) that FlateDecode + PNG predictors expect.
-    /// Spec-correct forward filtering (PNG spec §9), hand-rolled: lopdf 0.42's
-    /// `encode_row` mis-computes Avg (`(left wrapping+ up)/2` overflows), so
-    /// fixtures built with it would not exercise the real-world byte shape.
+    /// Spec-correct forward filtering (PNG spec §9), hand-rolled: lopdf's
+    /// `encode_row` mis-computed Avg up to 0.44 (`(left wrapping+ up)/2`
+    /// overflows), so fixtures built with it would not have exercised the
+    /// real-world byte shape.
     fn png_filter_rows(raw: &[u8], px_w: u32, channels: usize, tag: u8) -> Vec<u8> {
         let bpr = px_w as usize * channels;
         let bpp = channels;
@@ -5665,10 +5671,11 @@ mod tests {
 
     #[test]
     fn flate_decode_parms_array_form_is_skipped() {
-        // Day-1 probe result: lopdf 0.42 only reads the direct-dict form of
-        // /DecodeParms — the array form is silently NOT applied, which would
-        // hand us predictor-filtered rows as if they were pixels. The gate
-        // must skip such images entirely (original bytes returned).
+        // Day-1 probe result: lopdf 0.42 only read the direct-dict form of
+        // /DecodeParms — the array form was silently NOT applied, which would
+        // hand us predictor-filtered rows as if they were pixels. The M1
+        // decoder reads only the dict form too (lopdf 0.47 reads both), so the
+        // gate must skip such images entirely (original bytes returned).
         let pdf = build_pdf_flate_ext(400, 100, 3, Some(2), false, true);
         let out = optimize(&pdf);
         assert_eq!(
@@ -5679,9 +5686,10 @@ mod tests {
 
     #[test]
     fn flate_tiff_predictor_2_is_skipped() {
-        // Day-1 probe result: lopdf silently IGNORES TIFF Predictor 2 — the
-        // decoded bytes are wrong but the length is right, so the length check
-        // alone cannot catch it. The explicit predictor-value gate must skip.
+        // Day-1 probe result: lopdf up to 0.44 silently IGNORED TIFF
+        // Predictor 2 — the decoded bytes are wrong but the length is right, so
+        // the length check alone cannot catch it. The M1 decoder does not undo
+        // Predictor 2 either, so the explicit predictor-value gate must skip.
         let px = 400u32;
         let mut raw = flate_pixels(px, px, 3);
         let bpr = px as usize * 3;
