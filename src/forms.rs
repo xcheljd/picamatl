@@ -915,15 +915,11 @@ fn burn_operators(plan: &PagePlan) -> Vec<u8> {
     out
 }
 
-/// Rust's `{}` for `f64` is the shortest representation that round-trips, but
-/// it can print an exponent, which PDF numbers must not have.
+/// Rust's `{}` for `f64` is the shortest representation that round-trips, and
+/// it never prints an exponent (only `{:?}` and `{:e}` do), so it is already a
+/// valid PDF number for every finite value. The test below pins that.
 fn format_number(value: f64) -> String {
-    let text = format!("{value}");
-    if text.contains(['e', 'E']) {
-        format!("{value:.6}")
-    } else {
-        text
-    }
+    format!("{value}")
 }
 
 // -- applying ---------------------------------------------------------------
@@ -1240,5 +1236,44 @@ fn prune_objr(object: &mut Object, removed: &HashSet<ObjectId>, dead: &HashSet<O
             }
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_number;
+
+    /// `{}` for `f64` never switches to exponent notation, even at the ends of
+    /// the range where `{:?}` would, so `format_number` needs no fallback.
+    #[test]
+    fn format_number_never_prints_an_exponent() {
+        let extremes = [
+            f64::MAX,
+            f64::MIN,
+            f64::MIN_POSITIVE,
+            f64::EPSILON,
+            5e-324,
+            -5e-324,
+            1e16,
+            1e21,
+            1e-7,
+            1e300,
+            -1e-300,
+            f64::from(f32::MAX),
+            f64::from(f32::MIN_POSITIVE),
+        ];
+        for value in extremes {
+            let text = format_number(value);
+            assert!(!text.contains(['e', 'E']), "{value:?} printed as {text}");
+            assert_eq!(
+                text.parse::<f64>().unwrap(),
+                value,
+                "{text} does not round-trip"
+            );
+        }
+        assert_eq!(format_number(1e21), "1000000000000000000000");
+        assert_eq!(format_number(1e-7), "0.0000001");
+        assert_eq!(format_number(0.5), "0.5");
+        assert_eq!(format_number(-12.0), "-12");
     }
 }
