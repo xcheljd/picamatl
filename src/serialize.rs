@@ -6,7 +6,8 @@
 //! (xref-stream deflate, `ObjStm` zopfli re-compression, real-literal splicing)
 //! that each re-parse their own output before returning it.
 
-use lopdf::Document;
+use lopdf::xref::XrefType;
+use lopdf::{Document, Object};
 
 use crate::deflate::{
     deflate_backend, deflate_zopfli, inflate_capped, png_defilter, png_filter, PNG_UP,
@@ -20,14 +21,36 @@ use crate::{reals, DeflateBackend, OptimizeOptions, MAX_REDEFLATE_BYTES};
 ///
 /// Either path finishes by splicing the input's own real literals back in (see
 /// [`reals`]), so f32 parsing never changes a number's printed value.
+///
+/// `pdfa1` (the run's `fonts::pdfa1_kept` decision: the output keeps a
+/// PDF/A-1 claim) forces the classic path AND a classic cross-reference
+/// table, whatever `pack_object_streams` says and whatever xref form the
+/// input used: ISO 19005-1 6.1.4 forbids cross-reference streams, and
+/// object streams cannot exist without one. lopdf's plain save otherwise
+/// keeps the input's xref form, so a PDF/A-1-labelled input that arrived
+/// with an xref stream would keep it. The post-passes below are no-ops on
+/// such output (no `ObjStm` to re-zopfli, no xref stream to deflate).
 pub(crate) fn save_document(
     doc: &mut Document,
     options: OptimizeOptions,
     literals: &reals::RealLiterals,
+    pdfa1: bool,
 ) -> Result<Vec<u8>, lopdf::Error> {
-    let out = if options.pack_object_streams {
+    let out = if options.pack_object_streams && !pdfa1 {
         pack_and_save(doc)?
     } else {
+        if pdfa1 {
+            doc.reference_table.cross_reference_type = XrefType::CrossReferenceTable;
+            // An input that ended in an xref STREAM seeded `doc.trailer` with
+            // that stream's dictionary. The stream writer overwrites `/Type`,
+            // `/W` and `/Index`; the classic trailer would carry them as-is,
+            // describing a stream that no longer exists.
+            if matches!(doc.trailer.get(b"Type"), Ok(Object::Name(n)) if n == b"XRef") {
+                doc.trailer.remove(b"Type");
+            }
+            doc.trailer.remove(b"W");
+            doc.trailer.remove(b"Index");
+        }
         let mut out: Vec<u8> = Vec::new();
         doc.save_to(&mut out)?;
         out
@@ -848,5 +871,342 @@ mod tests {
                 "malformed input must pass through untouched"
             );
         }
+    }
+}
+
+/// The PDF/A-1 save layout (`save_document`'s `pdfa1`): classic xref table,
+/// no object streams, catalog XMP left unfiltered — and ONLY for a claim of
+/// part 1 that the output keeps.
+#[cfg(test)]
+mod pdfa1_tests {
+    use lopdf::xref::XrefType;
+    use lopdf::{dictionary, Document, Object, Stream};
+
+    use super::find_sub;
+    use crate::{optimize, optimize_with_options, try_optimize, OptimizeOptions};
+
+    /// An XMP packet claiming PDF/A part `part`, conformance B, with the
+    /// trailing whitespace padding XMP writers leave for in-place edits (so
+    /// `doc.compress()` would deflate it if allowed to).
+    fn xmp_packet(part: &str) -> Vec<u8> {
+        format!(
+            "<?xpacket begin=\"\u{feff}\" id=\"W5M0MpCehiHzreSzNTczkc9d\"?>\n\
+             <x:xmpmeta xmlns:x=\"adobe:ns:meta/\">\
+             <rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">\
+             <rdf:Description rdf:about=\"\" xmlns:pdfaid=\"http://www.aiim.org/pdfa/ns/id/\">\
+             <pdfaid:part>{part}</pdfaid:part><pdfaid:conformance>B</pdfaid:conformance>\
+             </rdf:Description></rdf:RDF></x:xmpmeta>\n{}\n<?xpacket end=\"w\"?>",
+            " ".repeat(2_000)
+        )
+        .into_bytes()
+    }
+
+    /// Deterministic, poorly compressible bytes (an LCG), so an image payload
+    /// costs real bytes and merging two copies of it is a real size win.
+    fn noise(len: usize) -> Vec<u8> {
+        let mut x: u32 = 0x1234_5678;
+        (0..len)
+            .map(|_| {
+                x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (x >> 24) as u8
+            })
+            .collect()
+    }
+
+    /// A one-page PDF 1.4 document whose catalog XMP (unfiltered) claims PDF/A
+    /// part `part`. The only work the default pipeline takes on a PDF/A input
+    /// here is real: two byte-identical image XObjects that `dedup_streams`
+    /// merges. 300 small distinct dictionaries make object-stream packing a
+    /// clear win, so the packed layout is what main would ship. `xref` picks
+    /// the input's own cross-reference form. Returns (pdf, xmp).
+    fn pdfa_fixture(part: &str, xref: XrefType) -> (Vec<u8>, Vec<u8>) {
+        let mut doc = Document::with_version("1.4");
+        doc.reference_table.cross_reference_type = xref;
+        let image = || {
+            let mut enc =
+                flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+            std::io::Write::write_all(&mut enc, &noise(64 * 64)).unwrap();
+            Stream::new(
+                dictionary! {
+                    "Type" => "XObject", "Subtype" => "Image", "Width" => 64,
+                    "Height" => 64, "ColorSpace" => "DeviceGray",
+                    "BitsPerComponent" => 8, "Filter" => "FlateDecode",
+                },
+                enc.finish().unwrap(),
+            )
+        };
+        let im1 = doc.add_object(image());
+        let im2 = doc.add_object(image());
+        let fillers: Vec<Object> = (0..300)
+            .map(|i| doc.add_object(dictionary! { "Filler" => i }).into())
+            .collect();
+        let pages_id = doc.new_object_id();
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Resources" => dictionary! {
+                "XObject" => dictionary! { "Im1" => im1, "Im2" => im2 },
+            },
+        });
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages", "Kids" => vec![page_id.into()], "Count" => 1,
+            }),
+        );
+        let xmp = xmp_packet(part);
+        let meta = doc.add_object(Stream::new(
+            dictionary! { "Type" => "Metadata", "Subtype" => "XML" },
+            xmp.clone(),
+        ));
+        let catalog_id = doc.add_object(dictionary! {
+            "Type" => "Catalog", "Pages" => pages_id, "Metadata" => meta,
+            "Fillers" => fillers,
+        });
+        doc.trailer.set("Root", catalog_id);
+        let mut pdf = Vec::new();
+        doc.save_to(&mut pdf).unwrap();
+        (pdf, xmp)
+    }
+
+    /// The bytes `startxref` points at.
+    fn xref_section(out: &[u8]) -> &[u8] {
+        let sx = out.windows(9).rposition(|w| w == b"startxref").unwrap();
+        let digits: Vec<u8> = out[sx + 9..]
+            .iter()
+            .copied()
+            .skip_while(u8::is_ascii_whitespace)
+            .take_while(u8::is_ascii_digit)
+            .collect();
+        let at: usize = std::str::from_utf8(&digits).unwrap().parse().unwrap();
+        &out[at..]
+    }
+
+    fn has(out: &[u8], needle: &[u8]) -> bool {
+        find_sub(out, needle, 0).is_some()
+    }
+
+    fn assert_classic_layout(out: &[u8], what: &str) {
+        assert!(
+            xref_section(out).starts_with(b"xref"),
+            "{what}: startxref must point at a classic xref table"
+        );
+        assert!(!has(out, b"/ObjStm"), "{what}: no object streams");
+        assert!(!has(out, b"/XRef"), "{what}: no xref stream");
+    }
+
+    fn assert_packed_layout(out: &[u8], what: &str) {
+        assert!(has(out, b"/ObjStm"), "{what}: object streams expected");
+        assert!(
+            !xref_section(out).starts_with(b"xref"),
+            "{what}: an xref stream expected"
+        );
+    }
+
+    /// The catalog /Metadata stream of `out`, if any.
+    fn catalog_metadata(out: &[u8]) -> Option<Stream> {
+        let doc = Document::load_mem(out).unwrap();
+        let id = doc
+            .catalog()
+            .unwrap()
+            .get(b"Metadata")
+            .ok()?
+            .as_reference()
+            .unwrap();
+        doc.get_object(id).unwrap().as_stream().ok().cloned()
+    }
+
+    #[test]
+    fn pdfa1_output_has_a_classic_xref_and_no_object_streams() {
+        // Both input xref forms: lopdf's plain save keeps the input's form,
+        // so an xref-stream input proves the table is forced, not inherited.
+        for xref in [
+            XrefType::CrossReferenceTable,
+            XrefType::CrossReferenceStream,
+        ] {
+            let (pdf, _) = pdfa_fixture("1", xref);
+            let out = optimize(&pdf);
+            let what = format!("PDF/A-1, input xref {xref:?}");
+            assert!(out.len() < pdf.len(), "{what}: must be a real rewrite");
+            assert_classic_layout(&out, &what);
+            let doc = Document::load_mem(&out).unwrap();
+            assert_eq!(doc.get_pages().len(), 1, "{what}");
+            for key in [b"Type".as_slice(), b"W", b"Index"] {
+                assert!(doc.trailer.get(key).is_err(), "{what}: stale trailer key");
+            }
+            if matches!(xref, XrefType::CrossReferenceTable) {
+                assert!(out.starts_with(b"%PDF-1.4\n"), "{what}: header kept");
+            }
+            // The fixed layout is its own fixpoint.
+            assert_eq!(optimize(&out), out, "{what}: second pass");
+        }
+    }
+
+    #[test]
+    fn pdfa1_catalog_metadata_stays_unfiltered_and_byte_identical() {
+        let (pdf, xmp) = pdfa_fixture("1", XrefType::CrossReferenceTable);
+        let out = optimize(&pdf);
+        assert!(out.len() < pdf.len(), "must be a real rewrite");
+        let meta = catalog_metadata(&out).expect("catalog XMP must survive");
+        assert!(
+            meta.dict.get(b"Filter").is_err(),
+            "no /Filter on catalog XMP"
+        );
+        assert!(meta.dict.get(b"DecodeParms").is_err());
+        assert_eq!(meta.content, xmp, "XMP bytes preserved");
+        // Findable by a raw byte scan, which is what 6.7.2 is for.
+        assert!(has(&out, &xmp));
+    }
+
+    #[test]
+    fn pdfa2_output_keeps_the_packed_layout() {
+        // Policy: only PDF/A-1 changes. A part-2 claim keeps today's output:
+        // packed, and the catalog XMP deflated like any other stream.
+        for part in ["2", "3"] {
+            let (pdf, xmp) = pdfa_fixture(part, XrefType::CrossReferenceTable);
+            let out = optimize(&pdf);
+            let what = format!("PDF/A-{part}");
+            assert!(out.len() < pdf.len(), "{what}: must be a real rewrite");
+            assert_packed_layout(&out, &what);
+            let meta = catalog_metadata(&out).expect("catalog XMP must survive");
+            assert!(meta.dict.get(b"Filter").is_ok(), "{what}: XMP deflated");
+            assert!(!has(&out, &xmp), "{what}");
+        }
+    }
+
+    #[test]
+    fn pdfa1_with_strip_metadata_keeps_the_packed_layout() {
+        // `--strip-metadata` removes the claim, so the output is no longer
+        // labelled PDF/A-1 and the ordinary (packed) layout applies, on both
+        // passes.
+        let (pdf, _) = pdfa_fixture("1", XrefType::CrossReferenceTable);
+        let opts = OptimizeOptions::default().with_strip_metadata(true);
+        let out = optimize_with_options(&pdf, opts);
+        assert!(out.len() < pdf.len(), "must be a real rewrite");
+        assert_packed_layout(&out, "PDF/A-1 + --strip-metadata");
+        assert!(catalog_metadata(&out).is_none(), "XMP stripped");
+        assert_eq!(optimize_with_options(&out, opts), out, "second pass");
+    }
+
+    /// A PDF/A-1 file written more compactly than lopdf writes (`N 0 obj<<…>>
+    /// endobj` with no line breaks inside the frame: 2 B per object less than
+    /// the writer's framing) whose only work is merging two small identical
+    /// images. Packing 400 objects would still shrink it; the classic PDF/A-1
+    /// rewrite cannot, because the framing it adds outweighs the merge.
+    fn compact_pdfa_pdf(part: &str) -> Vec<u8> {
+        let mut bodies: Vec<Vec<u8>> = Vec::new();
+        // Push one object body; returns its (1-based) object number.
+        let add = |bodies: &mut Vec<Vec<u8>>, obj: Object| {
+            let mut body = Vec::new();
+            lopdf::Writer::write_object(&mut body, &obj).unwrap();
+            bodies.push(body);
+            bodies.len() as u32
+        };
+        let image = || {
+            Object::Stream(Stream::new(
+                dictionary! {
+                    "Type" => "XObject", "Subtype" => "Image", "Width" => 4,
+                    "Height" => 4, "ColorSpace" => "DeviceGray",
+                    "BitsPerComponent" => 8,
+                },
+                (0u8..16).collect(),
+            ))
+        };
+        let im1 = add(&mut bodies, image());
+        let im2 = add(&mut bodies, image());
+        let fillers: Vec<Object> = (0..400)
+            .map(|i| Object::Reference((add(&mut bodies, dictionary! { "F" => i }.into()), 0)))
+            .collect();
+        let xmp = format!(
+            "<x:xmpmeta><rdf:Description xmlns:pdfaid=\"http://www.aiim.org/pdfa/ns/id/\">\
+             <pdfaid:part>{part}</pdfaid:part></rdf:Description></x:xmpmeta>"
+        );
+        let meta = add(
+            &mut bodies,
+            Object::Stream(Stream::new(
+                dictionary! { "Type" => "Metadata", "Subtype" => "XML" },
+                xmp.into_bytes(),
+            )),
+        );
+        // Ids are assigned in push order: page, pages, catalog follow.
+        let page = bodies.len() as u32 + 1;
+        let pages = page + 1;
+        add(
+            &mut bodies,
+            dictionary! {
+                "Type" => "Page", "Parent" => (pages, 0),
+                "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+                "Resources" => dictionary! {
+                    "XObject" => dictionary! { "Im1" => (im1, 0), "Im2" => (im2, 0) },
+                },
+            }
+            .into(),
+        );
+        add(
+            &mut bodies,
+            dictionary! {
+                "Type" => "Pages", "Kids" => vec![Object::Reference((page, 0))], "Count" => 1,
+            }
+            .into(),
+        );
+        let catalog = add(
+            &mut bodies,
+            dictionary! {
+                "Type" => "Catalog", "Pages" => (pages, 0), "Metadata" => (meta, 0),
+                "Fillers" => fillers,
+            }
+            .into(),
+        );
+
+        let mut pdf = b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n".to_vec();
+        let mut offsets = Vec::new();
+        for (i, body) in bodies.iter().enumerate() {
+            offsets.push(pdf.len());
+            pdf.extend_from_slice(format!("{} 0 obj", i + 1).as_bytes());
+            pdf.extend_from_slice(body);
+            pdf.extend_from_slice(b"endobj\n");
+        }
+        let xref_at = pdf.len();
+        pdf.extend_from_slice(
+            format!("xref\n0 {}\n0000000000 65535 f \n", bodies.len() + 1).as_bytes(),
+        );
+        for off in offsets {
+            pdf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+        }
+        pdf.extend_from_slice(
+            format!(
+                "trailer\n<</Root {catalog} 0 R/Size {}>>\nstartxref\n{xref_at}\n%%EOF",
+                bodies.len() + 1
+            )
+            .as_bytes(),
+        );
+        pdf
+    }
+
+    #[test]
+    fn pdfa1_rewrite_that_would_grow_falls_back_to_the_input() {
+        let pdf = compact_pdfa_pdf("1");
+        Document::load_mem(&pdf).expect("fixture must load");
+        // The compliant rewrite exists but is not smaller than the input ...
+        let (rewrite, _) = try_optimize(&pdf, OptimizeOptions::default()).unwrap();
+        let rewrite = rewrite.expect("the image merge is real work");
+        assert_classic_layout(&rewrite, "PDF/A-1 rewrite");
+        assert!(
+            rewrite.len() >= pdf.len(),
+            "fixture must make the compliant rewrite grow: {} -> {}",
+            pdf.len(),
+            rewrite.len()
+        );
+        // ... so the never-larger guard hands back the exact input bytes.
+        assert_eq!(optimize(&pdf), pdf, "must fall back to the input");
+
+        // Control: the same file labelled PDF/A-2 takes the packed layout,
+        // which does shrink it — so the fallback above is the PDF/A-1 layout
+        // meeting the guard, not a file nothing could shrink.
+        let pdf2 = compact_pdfa_pdf("2");
+        let out2 = optimize(&pdf2);
+        assert!(out2.len() < pdf2.len(), "{} -> {}", pdf2.len(), out2.len());
+        assert_packed_layout(&out2, "PDF/A-2 control");
     }
 }

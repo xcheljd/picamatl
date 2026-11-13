@@ -713,6 +713,148 @@ pub(crate) fn pdfa_blocked(doc: &Document) -> bool {
     }
 }
 
+/// True when the OUTPUT of this run will carry a PDF/A-1 claim: the catalog
+/// XMP declares `pdfaid:part` = 1 and `--strip-metadata` is off. Decided ONCE
+/// on the input in `try_optimize`, next to [`pdfa_declined`], and handed to
+/// the two sites that keep PDF/A-1 rules the default output would otherwise
+/// break: the catalog `/Metadata` stream stays unfiltered (ISO 19005-1
+/// 6.7.2: "shall not contain a Filter key") and the file is saved with a
+/// classic cross-reference table and no object streams (6.1.4: no xref
+/// streams; PDF 1.4 has no object streams either).
+///
+/// With `metadata_stripped` the output carries no XMP, so no claim survives
+/// and the answer is false — the same "follow the claim the output carries"
+/// rule as [`pdfa_declined`], for the same idempotence reason. Metadata that
+/// cannot be read strictly yields false too: no PDF/A-1 claim can be
+/// established, so the run keeps the ordinary layout (it still declines
+/// every structural pass through [`pdfa_declined`]).
+pub(crate) fn pdfa1_kept(doc: &Document, metadata_stripped: bool) -> bool {
+    if metadata_stripped {
+        return false;
+    }
+    let Ok(catalog) = doc.catalog() else {
+        return false;
+    };
+    let Ok(meta) = catalog.get(b"Metadata") else {
+        return false;
+    };
+    let (_, Object::Stream(stream)) = resolve_ref(doc, meta) else {
+        return false;
+    };
+    strict_stream_bytes(doc, stream).is_some_and(|xmp| xmp_claims_pdfa_part(&xmp, b"1"))
+}
+
+/// The PDF/A identification namespace (ISO 19005-1 6.7.11).
+const PDFAID_NS: &[u8] = b"http://www.aiim.org/pdfa/ns/id/";
+
+/// True when the XMP packet declares PDF/A part `part`, in either RDF
+/// spelling: element (`<pdfaid:part>1</pdfaid:part>`) or attribute
+/// (`pdfaid:part="1"`). The prefix is whatever the packet binds to the
+/// PDF/A id namespace (`xmlns:<p>="http://www.aiim.org/pdfa/ns/id/"`), plus
+/// the conventional `pdfaid`. Values are compared after trimming ASCII
+/// whitespace. A byte scan, not an XML parser: it only has to recognise the
+/// two shapes XMP writers emit, and an unrecognised spelling falls back to
+/// the ordinary (non-PDF/A-1) layout.
+fn xmp_claims_pdfa_part(xmp: &[u8], part: &[u8]) -> bool {
+    let mut prefixes: Vec<&[u8]> = vec![b"pdfaid"];
+    let mut at = 0;
+    while let Some(i) = find_from(xmp, b"xmlns:", at) {
+        at = i + 6;
+        let name_end = at
+            + xmp[at..]
+                .iter()
+                .take_while(|b| is_xml_name_byte(**b))
+                .count();
+        let name = &xmp[at..name_end];
+        let mut p = skip_xml_ws(xmp, name_end);
+        if xmp.get(p) != Some(&b'=') {
+            continue;
+        }
+        p = skip_xml_ws(xmp, p + 1);
+        let Some(&quote) = xmp.get(p).filter(|q| **q == b'"' || **q == b'\'') else {
+            continue;
+        };
+        let Some(len) = xmp[p + 1..].iter().position(|b| *b == quote) else {
+            continue;
+        };
+        if &xmp[p + 1..p + 1 + len] == PDFAID_NS && !name.is_empty() {
+            prefixes.push(name);
+        }
+    }
+    prefixes
+        .iter()
+        .any(|prefix| prefixed_part_values(xmp, prefix).any(|v| v.trim_ascii() == part))
+}
+
+/// Every value written for `<prefix>:part` in the packet, element or
+/// attribute form.
+fn prefixed_part_values<'a>(xmp: &'a [u8], prefix: &[u8]) -> impl Iterator<Item = &'a [u8]> {
+    let mut qname = prefix.to_vec();
+    qname.extend_from_slice(b":part");
+    let mut at = 0;
+    std::iter::from_fn(move || {
+        while let Some(i) = find_from(xmp, &qname, at) {
+            at = i + qname.len();
+            // A whole name: not the tail of a longer one, not a closing tag.
+            let before = i.checked_sub(1).map(|j| xmp[j]);
+            let after = xmp.get(at).copied();
+            if after.is_some_and(is_xml_name_byte) {
+                continue;
+            }
+            match before {
+                Some(b'<') => {
+                    // Element: skip any attributes to the end of the start
+                    // tag; a self-closing tag carries no value.
+                    let gt = at + xmp[at..].iter().position(|b| *b == b'>')?;
+                    if xmp[gt - 1] == b'/' {
+                        continue;
+                    }
+                    let text_end = gt + 1 + xmp[gt + 1..].iter().position(|b| *b == b'<')?;
+                    return Some(&xmp[gt + 1..text_end]);
+                }
+                Some(b) if is_xml_ws(b) => {
+                    // Attribute: `= "value"`.
+                    let mut p = skip_xml_ws(xmp, at);
+                    if xmp.get(p) != Some(&b'=') {
+                        continue;
+                    }
+                    p = skip_xml_ws(xmp, p + 1);
+                    let Some(&quote) = xmp.get(p).filter(|q| **q == b'"' || **q == b'\'') else {
+                        continue;
+                    };
+                    let len = xmp[p + 1..].iter().position(|b| *b == quote)?;
+                    return Some(&xmp[p + 1..p + 1 + len]);
+                }
+                _ => continue,
+            }
+        }
+        None
+    })
+}
+
+fn find_from(haystack: &[u8], needle: &[u8], from: usize) -> Option<usize> {
+    haystack
+        .get(from..)?
+        .windows(needle.len())
+        .position(|w| w == needle)
+        .map(|i| from + i)
+}
+
+fn is_xml_ws(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\r' | b'\n')
+}
+
+fn is_xml_name_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.') || b >= 0x80
+}
+
+fn skip_xml_ws(bytes: &[u8], mut p: usize) -> usize {
+    while bytes.get(p).copied().is_some_and(is_xml_ws) {
+        p += 1;
+    }
+    p
+}
+
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.windows(needle.len()).any(|w| w == needle)
 }
@@ -3439,6 +3581,72 @@ mod tests {
 
         let out = optimize_with_options(&pdf, subset_opts());
         assert_eq!(out, pdf, "unused font must be untouched");
+    }
+
+    #[test]
+    fn xmp_part_claim_is_read_in_both_rdf_spellings() {
+        let ns = r#"xmlns:pdfaid="http://www.aiim.org/pdfa/ns/id/""#;
+        let yes = [
+            format!("<rdf:Description {ns}><pdfaid:part>1</pdfaid:part></rdf:Description>"),
+            format!("<rdf:Description {ns}><pdfaid:part>\n 1 \n</pdfaid:part></rdf:Description>"),
+            format!("<rdf:Description {ns} pdfaid:part=\"1\" pdfaid:conformance=\"B\"/>"),
+            format!("<rdf:Description {ns}\n  pdfaid:part = '1'/>"),
+            // A renamed prefix bound to the PDF/A id namespace.
+            r#"<rdf:Description xmlns:a="http://www.aiim.org/pdfa/ns/id/"><a:part>1</a:part></rdf:Description>"#.to_string(),
+            r#"<rdf:Description xmlns:a = "http://www.aiim.org/pdfa/ns/id/" a:part="1"/>"#.to_string(),
+        ];
+        for xmp in &yes {
+            assert!(xmp_claims_pdfa_part(xmp.as_bytes(), b"1"), "{xmp}");
+        }
+        let no = [
+            format!("<rdf:Description {ns}><pdfaid:part>2</pdfaid:part></rdf:Description>"),
+            format!("<rdf:Description {ns} pdfaid:part=\"3\"/>"),
+            format!("<rdf:Description {ns}><pdfaid:part>10</pdfaid:part></rdf:Description>"),
+            // Not the part property, or not a value.
+            format!("<rdf:Description {ns}><pdfaid:partx>1</pdfaid:partx></rdf:Description>"),
+            format!("<rdf:Description {ns}><pdfaid:conformance>1</pdfaid:conformance></rdf:Description>"),
+            format!("<rdf:Description {ns}><pdfaid:part/>1</rdf:Description>"),
+            // A prefix NOT bound to the PDF/A id namespace.
+            r#"<rdf:Description xmlns:a="http://example.com/"><a:part>1</a:part></rdf:Description>"#.to_string(),
+            // Truncated packets.
+            format!("<rdf:Description {ns}><pdfaid:part>1"),
+            format!("<rdf:Description {ns} pdfaid:part=\"1"),
+            String::new(),
+        ];
+        for xmp in &no {
+            assert!(!xmp_claims_pdfa_part(xmp.as_bytes(), b"1"), "{xmp}");
+        }
+        // Part 2 is still recognised as part 2 (the scan is part-generic).
+        assert!(xmp_claims_pdfa_part(no[0].as_bytes(), b"2"));
+    }
+
+    #[test]
+    fn pdfa1_kept_follows_the_claim_the_output_carries() {
+        let mut doc = Document::with_version("1.4");
+        let pages_id =
+            doc.add_object(dictionary! { "Type" => "Pages", "Kids" => vec![], "Count" => 0 });
+        let xmp = doc.add_object(Stream::new(
+            dictionary! { "Type" => "Metadata", "Subtype" => "XML" },
+            br#"<x:xmpmeta><rdf:Description xmlns:pdfaid="http://www.aiim.org/pdfa/ns/id/" pdfaid:part="1"/></x:xmpmeta>"#.to_vec(),
+        ));
+        let catalog = doc.add_object(dictionary! {
+            "Type" => "Catalog", "Pages" => pages_id, "Metadata" => xmp,
+        });
+        doc.trailer.set("Root", catalog);
+        assert!(pdfa1_kept(&doc, false));
+        assert!(
+            !pdfa1_kept(&doc, true),
+            "--strip-metadata removes the claim"
+        );
+        // Metadata that cannot be read strictly establishes no claim.
+        if let Ok(Object::Stream(s)) = doc.get_object_mut(xmp) {
+            s.dict.set("Filter", "LZWDecode");
+        }
+        assert!(!pdfa1_kept(&doc, false));
+        assert!(
+            pdfa_blocked(&doc),
+            "but the structural passes still decline"
+        );
     }
 
     #[test]

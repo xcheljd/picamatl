@@ -4316,6 +4316,13 @@ fn try_optimize(input: &[u8], options: OptimizeOptions) -> Result<OptimizeOutcom
     // pass over our own output ran what the first had declined (the content
     // minifier on PDF/A scans) — not idempotent. See `fonts::pdfa_declined`.
     let pdfa = fonts::pdfa_declined(&doc, options.strip_metadata);
+    // PDF/A-1 (ISO 19005-1) forbids two things the default output would
+    // otherwise introduce: cross-reference/object streams (6.1.4) and a
+    // filtered catalog /Metadata stream (6.7.2). When the output keeps a
+    // PDF/A-1 claim, the catalog XMP stays as it arrived and the file is
+    // saved with a classic xref table. Decided here, once, for the same
+    // reason as `pdfa`: the claim must not be re-read mid-run.
+    let pdfa1 = fonts::pdfa1_kept(&doc, options.strip_metadata);
 
     // Legacy-filter transcode (LZW / ASCII85 / ASCIIHex / RunLength chains →
     // one FlateDecode, src/legacy.rs), lossless. Non-image streams are
@@ -4730,6 +4737,9 @@ fn try_optimize(input: &[u8], options: OptimizeOptions) -> Result<OptimizeOutcom
     // streams (DCTDecode images are skipped — Stream::compress only touches
     // streams without a /Filter).
     doc.prune_objects();
+    if pdfa1 {
+        keep_catalog_metadata_unfiltered(&mut doc);
+    }
     doc.compress();
 
     // Rebuild the Huffman tables of every JPEG payload from its own symbol
@@ -4774,7 +4784,35 @@ fn try_optimize(input: &[u8], options: OptimizeOptions) -> Result<OptimizeOutcom
 
     strip_stale_xref_trailer_keys(&mut doc);
 
-    save_document(&mut doc, options, &literals).map(|out| (Some(out), signatures))
+    save_document(&mut doc, options, &literals, pdfa1).map(|out| (Some(out), signatures))
+}
+
+/// Exempt the catalog `/Metadata` stream from `doc.compress()`, so a PDF/A-1
+/// file keeps the unfiltered XMP packet ISO 19005-1 6.7.2 requires (the rule
+/// exists so non-PDF tools can find the packet by scanning the raw bytes).
+/// The stream keeps the exact bytes it arrived with: it is never decoded
+/// here, and the passes that rewrite filtered streams already decline a
+/// PDF/A document (`pdfa`), so an input whose XMP was filtered keeps that
+/// filter too. Called only when `fonts::pdfa1_kept` said yes on the input.
+fn keep_catalog_metadata_unfiltered(doc: &mut Document) {
+    let Some(mut id) = doc
+        .catalog()
+        .ok()
+        .and_then(|catalog| catalog.get(b"Metadata").ok())
+        .and_then(|meta| meta.as_reference().ok())
+    else {
+        return;
+    };
+    // Follow a reference chain the same 8 links `fonts::pdfa1_kept` does.
+    for _ in 0..8 {
+        match doc.get_object(id) {
+            Ok(Object::Reference(next)) => id = *next,
+            _ => break,
+        }
+    }
+    if let Ok(Object::Stream(stream)) = doc.get_object_mut(id) {
+        stream.allows_compression = false;
+    }
 }
 
 /// Drop trailer entries that describe the *input's* cross-reference section.
