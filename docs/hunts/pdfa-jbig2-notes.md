@@ -52,3 +52,31 @@ Then the (c) output with only its catalog XMP stream rewritten unfiltered
 PDF/A-1b file and raises nothing about the PDF version (PDF/A-1 is based on
 PDF 1.4; the JBIG2 path raises pre-1.4 headers to 1.4, which bul1000
 already has).
+
+The same table, re-run on the final build (291fe8a + docs): identical to
+the one above, rule for rule and count for count.
+
+## Sizes, 32-file set, main e615168 vs this change
+
+- defaults: 31 files byte-identical; usgs-bul1000 4,226,153 B ->
+  3,225,145 B (-1,001,008 B, -23.7%). Total 98,615,606 B -> 97,614,598 B.
+- kitchen (all options incl. `--strip-metadata`): 32 files byte-identical
+  (the strip removes the claim, so JBIG2 already ran there). Total
+  85,868,502 B.
+- all options without `--strip-metadata`: 31 byte-identical; usgs-bul1000
+  4,225,489 B -> 3,224,480 B (-1,001,009 B). Total 88,268,158 B ->
+  87,267,149 B.
+
+Changed files: second pass byte-identical; all 55 JBIG2 images decode
+bit-identical through jbig2dec (padding bits masked); all 55 pages render
+identical at 100 dpi against the original; gs nullpage clean; pdftotext
+identical. The catalog XMP decodes byte-identical to the original.
+
+## What /EncodedByteAlign CCITT still leaves (out of scope)
+
+usgs-bul1100 (PDF/A-1b) stores 120 page images as CCITT G4 with
+`/EncodedByteAlign true`, which the strict decoder declines. Probe: every
+one re-stored as plain G4 with the same samples (Pillow/libtiff; 124/124
+pages render identical, 251/251 bitonal images pixel-identical), then run
+through this build: all 120 ship as JBIG2, 1,542,752 B smaller than the
+byte-aligned G4 they replace in the default output (6,511,029 B).
