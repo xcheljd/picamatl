@@ -4418,14 +4418,17 @@ fn try_optimize(input: &[u8], options: OptimizeOptions) -> Result<OptimizeOutcom
     // Plan lossless bitonal re-encodes — opt-in G4, default-on JBIG2
     // (read-only; empty when nothing qualified). No overlap with
     // `replacements`: the downsample paths require 8-bit samples or DCT
-    // payloads, the bitonal pass requires 1-bit ones. JBIG2 follows the
-    // re-encoding passes' posture: declined on PDF/A claims (`pdfa`, decided
-    // once above) and on encrypted documents.
+    // payloads, the bitonal pass requires 1-bit ones. JBIG2 is declined on
+    // encrypted documents but, unlike every other `pdfa`-gated pass, runs on
+    // PDF/A claims: it re-stores the same samples under a filter PDF/A-1 and
+    // PDF/A-2 both allow, and veraPDF raises no new rule on the PDF/A scans
+    // it rewrites (docs/hunts/pdfa-jbig2-notes.md). The G4 opt-in was never
+    // PDF/A-gated.
     let bitonal_plans = bitonal::plan_bitonal_recompressions(
         &doc,
         bitonal::BitonalTargets {
             g4: options.recompress_bitonal_images,
-            jbig2: options.jbig2_bitonal_images && !pdfa && !doc.is_encrypted(),
+            jbig2: options.jbig2_bitonal_images && !doc.is_encrypted(),
         },
     );
 

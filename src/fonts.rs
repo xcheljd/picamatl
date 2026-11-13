@@ -2497,7 +2497,7 @@ fn is_number(token: &[u8]) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::{optimize, optimize_with_options, OptimizeOptions};
     use lopdf::content::Operation;
@@ -2517,7 +2517,7 @@ mod tests {
 
     /// GID of each char in the fixture font. Under `/CIDToGIDMap /Identity`,
     /// these double as the CIDs used in show strings.
-    fn gids_for(text: &str) -> Vec<u16> {
+    pub(crate) fn gids_for(text: &str) -> Vec<u16> {
         let data = noto_bytes();
         let face = ttf_parser::Face::parse(&data, 0).unwrap();
         text.chars()
@@ -2566,7 +2566,7 @@ mod tests {
         cmap.into_bytes()
     }
 
-    struct FontSpec {
+    pub(crate) struct FontSpec {
         /// `None` => `/CIDToGIDMap /Identity`; `Some(table)` => a stream
         /// mapping CID i -> table[i].
         cid_table: Option<Vec<u16>>,
@@ -2576,7 +2576,7 @@ mod tests {
     }
 
     impl FontSpec {
-        fn identity(to_unicode: Vec<(u16, char)>) -> Self {
+        pub(crate) fn identity(to_unicode: Vec<(u16, char)>) -> Self {
             FontSpec {
                 cid_table: None,
                 base_font: "NotoSans-Regular",
@@ -2717,7 +2717,7 @@ mod tests {
     }
 
     /// One-page-per-entry text PDF over a single shared font.
-    fn build_text_pdf(spec: &FontSpec, pages: &[Vec<u16>]) -> Vec<u8> {
+    pub(crate) fn build_text_pdf(spec: &FontSpec, pages: &[Vec<u16>]) -> Vec<u8> {
         let mut doc = Document::with_version("1.7");
         let pages_id = doc.new_object_id();
         let font_id = add_type0_font(&mut doc, spec);
