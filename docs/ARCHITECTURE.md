@@ -87,8 +87,12 @@ Executed in this order; each pass reports whether it did work.
   JBIG2 sources are CCITT images — plus Flate 1-bit images only when G4 is
   also on, because a G4 output is a CCITT source on the next run (the
   idempotence reason; the G4-vs-JBIG2 tie-break charges G4 its 80 B parms
-  overhead on both runs). Declined on PDF/A claims (`pdfa`) and encrypted
-  documents; existing `/JBIG2Decode` images are never touched. Raises a
+  overhead on both runs). Declined on encrypted documents. It is the one
+  re-encoding pass that runs on PDF/A claims (it ignores `pdfa`; every
+  other `pdfa`-gated pass still declines): the samples are identical, and
+  veraPDF finds no new failed rule on the PDF/A-1b and PDF/A-2b scans it
+  rewrites (docs/hunts/pdfa-jbig2-notes.md). Existing `/JBIG2Decode`
+  images are never touched. Raises a
   pre-1.4 header to 1.4 when it writes JBIG2 (the object-stream path's 1.5
   floor already covers the default save). Memory: planned in
   `budget_batches` of 1 GiB at 4x each image's packed sample size.

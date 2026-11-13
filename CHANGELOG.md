@@ -122,13 +122,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `/ImageMask` and masks are untouched; `/DecodeParms` is dropped. On by
   default; `--no-jbig2-bitonal-images` (library:
   `with_jbig2_bitonal_images(false)`) keeps CCITT for readers without JBIG2
-  support. Documents claiming PDF/A and encrypted documents are declined,
-  existing JBIG2 images are never touched, and a pre-1.4 header is raised to
-  1.4. Over the 17-file corpus and 15 scans, default outputs shrink by
-  16,459,255 B (14.3%), all on nine scans: us10522188 by 5,470,937 B
-  (74.7%), us20120251502 and us10174323 by about 3.2 MB each (48%),
-  nasa-tn-d162, gao-104000, fbi-custodial, naca-19930081614, us6811268 and
-  gao-077234 by 243,672 to 1,343,318 B (14.5% to 41.6%). Scans take longer
+  support. Encrypted documents are declined, existing JBIG2 images are
+  never touched, and a pre-1.4 header is raised to 1.4. Documents claiming
+  PDF/A are re-stored too (every other PDF/A-gated pass still declines
+  them): PDF/A-1 and PDF/A-2 both allow JBIG2Decode, and the veraPDF
+  validator finds no new failed rule on the rewritten PDF/A scans; on
+  usgs-bul1000 (PDF/A-1b) that is a further 1,001,008 B (23.7% of its
+  default output). Before that exemption, over the 17-file corpus and 15
+  scans, default outputs shrank by 16,459,255 B (14.3%), all on nine
+  scans: us10522188 by 5,470,937 B (74.7%), us20120251502 and us10174323
+  by about 3.2 MB each (48%), nasa-tn-d162, gao-104000, fbi-custodial,
+  naca-19930081614, us6811268 and gao-077234 by 243,672 to 1,343,318 B
+  (14.5% to 41.6%). Scans take longer
   to optimize: each image is encoded up to 14 times. The bitonal pass
   also reads `/DecodeParms` given as a one-element array or as a reference.
 - **Flate images get the best PNG row filter.** In a file picamatl
