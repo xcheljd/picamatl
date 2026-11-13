@@ -125,7 +125,7 @@ Executed in this order; each pass reports whether it did work.
 - `reoptimize_jpeg_streams` — rebuild Huffman tables on untouched JPEGs
   (jpegtran-equivalent), strictly lossless, verified by decode-back.
 - `pack_object_streams` (default ON) → puts a PDF 1.5 floor on output;
-  opt out for pre-Acrobat-6 readers.
+  opt out for pre-Acrobat-6 readers. Overridden for PDF/A-1 (below).
 - `renumber_objects`, `strip_stale_xref_trailer_keys`, compressed xref stream
   (PNG-Up-predicted when strictly smaller; applied last, after the passes
   that rewrite raw xref rows).
@@ -135,6 +135,24 @@ Executed in this order; each pass reports whether it did work.
 
 Everything from `pack_object_streams` down is `save_document` in
 `src/serialize.rs`, the single exit every optimized document takes.
+
+**PDF/A decisions (both made once, on the input, at the top of
+`try_optimize`).** `pdfa` (`fonts::pdfa_declined`): any PDF/A claim the
+output will carry makes every structural and re-encoding pass decline.
+`pdfa1` (`fonts::pdfa1_kept`): the catalog XMP claims `pdfaid:part` = 1
+(element or attribute spelling, any prefix bound to the PDF/A id
+namespace) and `--strip-metadata` is off. It changes two things and
+nothing else: the catalog `/Metadata` stream is exempted from
+`doc.compress()` (ISO 19005-1 6.7.2: no `/Filter`; its bytes are never
+re-encoded), and `save_document` takes the classic path with a forced
+classic xref table whatever `pack_object_streams` says (6.1.4: no xref
+streams, so no object streams either), dropping the xref-stream-only
+trailer keys an xref-stream input left behind. Both answers follow the
+claim the OUTPUT carries, so a second pass sees the same answer — re-reading
+a property a later pass removes is an idempotence bug class. An unreadable
+catalog XMP establishes no PDF/A-1 claim (ordinary layout; `pdfa` still
+declines). The never-larger guard in `optimize_with_report` applies
+unchanged: a PDF/A-1 rewrite that is not strictly smaller ships the input.
 
 ## Source layout
 

@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **PDF/A-1 files stay valid PDF/A-1.** ISO 19005-1 forbids cross-reference
+  streams (6.1.4) and a filtered catalog `/Metadata` stream (6.7.2). The
+  default output packed objects into object streams behind an xref stream
+  and deflated the catalog XMP, so a file that passed veraPDF's PDF/A-1b
+  profile before optimization failed it after (three USGS scans). When the
+  catalog XMP claims PDF/A part 1 and the run keeps it (no
+  `--strip-metadata`), the output now uses a classic xref table with no
+  object streams, and the catalog XMP keeps the exact bytes it arrived
+  with. All three scans now pass. The cost is 142,242 bytes over those
+  three files (0.5% of their output); they still shrink by 0.2% to 29.8%
+  (7,529 to 7,416,115 bytes each). PDF/A-2 and PDF/A-3 files, files
+  with no claim, and `--strip-metadata` runs are unchanged. As always, a
+  rewrite that would not be smaller than the input returns the input
+  unchanged.
 - **`--strip-metadata` runs on PDF/A files are idempotent.** Each pass
   checked for a PDF/A claim on its own, and the passes that run before the
   metadata strip still saw it. So on a PDF/A file the content-stream
