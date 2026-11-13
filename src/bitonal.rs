@@ -1167,28 +1167,236 @@ mod tests {
         );
     }
 
-    #[test]
-    fn jbig2_declines_documents_claiming_pdfa() {
-        let rows = doc_rows(W, H);
-        let mut doc = Document::load_mem(&bitonal_pdf(
-            image_dict(W, H, "CCITTFaxDecode", Some(g4_parms(W, H))),
-            g4_of(&rows),
-        ))
-        .unwrap();
+    /// PDF/A-1B identification packet, as a real XMP would carry it.
+    const PDFA_XMP: &[u8] = b"<x:xmpmeta><rdf:Description xmlns:pdfaid=\"http://www.aiim.org/pdfa/ns/id/\"><pdfaid:part>1</pdfaid:part><pdfaid:conformance>B</pdfaid:conformance></rdf:Description></x:xmpmeta>";
+
+    /// Attach [`PDFA_XMP`] as the catalog `/Metadata` and save.
+    fn with_pdfa_claim(mut doc: Document) -> Vec<u8> {
         let xmp = doc.add_object(Stream::new(
             dictionary! { "Type" => "Metadata", "Subtype" => "XML" },
-            b"<x:xmpmeta><rdf:Description xmlns:pdfaid=\"http://www.aiim.org/pdfa/ns/id/\"><pdfaid:part>1</pdfaid:part></rdf:Description></x:xmpmeta>".to_vec(),
+            PDFA_XMP.to_vec(),
         ));
         doc.catalog_mut().unwrap().set("Metadata", xmp);
         let mut pdf = Vec::new();
         doc.save_to(&mut pdf).unwrap();
+        pdf
+    }
+
+    /// The decoded catalog XMP packet of `pdf`.
+    fn catalog_xmp(pdf: &[u8]) -> Vec<u8> {
+        let doc = Document::load_mem(pdf).unwrap();
+        let id = doc
+            .catalog()
+            .unwrap()
+            .get(b"Metadata")
+            .unwrap()
+            .as_reference()
+            .unwrap();
+        let stream = doc.get_object(id).unwrap().as_stream().unwrap();
+        stream
+            .decompressed_content()
+            .unwrap_or_else(|_| stream.content.clone())
+    }
+
+    #[test]
+    fn jbig2_restores_ccitt_in_documents_claiming_pdfa() {
+        // The lossless re-store is the one PDF/A exemption: veraPDF accepts a
+        // JBIG2Decode image XObject in PDF/A-1b and PDF/A-2b files (see
+        // docs/hunts/pdfa-jbig2-notes.md), and the samples are bit-identical.
+        let rows = doc_rows(W, H);
+        let doc = Document::load_mem(&bitonal_pdf(
+            image_dict(W, H, "CCITTFaxDecode", Some(g4_parms(W, H))),
+            g4_of(&rows),
+        ))
+        .unwrap();
+        let pdf = with_pdfa_claim(doc);
         let out = optimize_with_options(&pdf, OptimizeOptions::default());
-        let img = image_stream(&out);
+        assert!(out.len() < pdf.len());
+        assert_jbig2_with_samples(&out, W, H, &pack_samples(&rows, false));
+        assert_eq!(catalog_xmp(&out), PDFA_XMP, "the PDF/A label must survive");
         assert_eq!(
-            img.dict.get(b"Filter").unwrap().as_name().unwrap(),
-            b"CCITTFaxDecode",
-            "PDF/A claims decline the JBIG2 re-store"
+            optimize_with_options(&out, OptimizeOptions::default()),
+            out,
+            "a second pass changes nothing"
         );
+    }
+
+    /// Streams the PDF/A-declining passes would rewrite in a document without
+    /// a claim: a subsettable embedded TrueType program (font subsetting),
+    /// an ASCIIHex data stream (legacy transcode), a padded, weakly
+    /// deflated content stream (content minifier + re-deflate), a JPEG with
+    /// the fixed Annex K tables (Huffman re-optimization), and an unfiltered
+    /// row ramp deflated without a predictor (row-filter choice). Plus one
+    /// CCITT G4 image for the JBIG2 re-store. Returns the document and the
+    /// ids of those five target streams.
+    fn every_pass_fixture() -> (Document, Vec<lopdf::ObjectId>) {
+        use crate::fonts::tests::{build_text_pdf, gids_for, FontSpec};
+        use lopdf::Object;
+        use std::io::Write;
+
+        let cids = gids_for("Hello");
+        let pairs = cids.iter().copied().zip("Hello".chars()).collect();
+        let mut doc =
+            Document::load_mem(&build_text_pdf(&FontSpec::identity(pairs), &[cids])).unwrap();
+        let page_id = *doc.get_pages().values().next().unwrap();
+        let font_file = doc
+            .objects
+            .iter()
+            .find(|(_, o)| o.as_stream().is_ok_and(|s| s.dict.get(b"Length1").is_ok()))
+            .map(|(&id, _)| id)
+            .unwrap();
+
+        let rows = doc_rows(W, H);
+        let g4 = doc.add_object(Stream::new(
+            image_dict(W, H, "CCITTFaxDecode", Some(g4_parms(W, H))),
+            g4_of(&rows),
+        ));
+
+        let mut ramp = image::RgbImage::new(256, 256);
+        for (x, y, px) in ramp.enumerate_pixels_mut() {
+            *px = image::Rgb([x as u8, y as u8, 128]);
+        }
+        let mut jpeg = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 70)
+            .encode_image(&ramp)
+            .unwrap();
+        let mut jpeg_dict = image_dict(256, 256, "DCTDecode", None);
+        jpeg_dict.set("ColorSpace", "DeviceRGB");
+        jpeg_dict.set("BitsPerComponent", 8);
+        let jpeg = doc.add_object(Stream::new(jpeg_dict, jpeg).with_compression(false));
+
+        // The smooth field the row-filter tests use: a PNG predictor wins.
+        let gray: Vec<u8> = (0..160 * 160)
+            .map(|i| {
+                let (x, y) = (i % 160, i / 160);
+                ((x * x / 97 + y * y / 131 + x * y / 211) % 256) as u8
+            })
+            .collect();
+        let mut gray_dict = image_dict(160, 160, "FlateDecode", None);
+        gray_dict.set("BitsPerComponent", 8);
+        let gray = doc.add_object(
+            Stream::new(gray_dict, deflate_level9(&gray).unwrap()).with_compression(false),
+        );
+
+        let hex_content: String = b"legacy-filtered payload, "
+            .repeat(8)
+            .iter()
+            .map(|b| format!("{b:02X}"))
+            .collect::<String>()
+            + ">";
+        let hex = doc.add_object(
+            Stream::new(
+                dictionary! { "Filter" => "ASCIIHexDecode" },
+                hex_content.into_bytes(),
+            )
+            .with_compression(false),
+        );
+
+        let padded = b"q   600.000000  0  0  178.000000  0.000000  0.000000  cm  /Im0  Do  Q\n\
+                       q   200.000000  0  0  200.000000  300.000000  50.000000  cm  /ImF  Do  Q\n\
+                       q   400.000000  0  0  400.000000  100.000000  300.000000  cm  /ImJ  Do  Q\n";
+        let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::new(1));
+        enc.write_all(padded).unwrap();
+        let weak = doc.add_object(
+            Stream::new(
+                dictionary! { "Filter" => "FlateDecode" },
+                enc.finish().unwrap(),
+            )
+            .with_compression(false),
+        );
+
+        let page = doc.get_object_mut(page_id).unwrap().as_dict_mut().unwrap();
+        let first = page.get(b"Contents").unwrap().clone();
+        page.set("Contents", vec![first, Object::Reference(weak)]);
+        let resources = page.get_mut(b"Resources").unwrap().as_dict_mut().unwrap();
+        resources.set(
+            "XObject",
+            dictionary! { "Im0" => g4, "ImJ" => jpeg, "ImF" => gray },
+        );
+        // The ASCIIHex stream is not page content: a page the minifier or
+        // the font usage walker cannot decode is skipped whole, which would
+        // hide those passes' gates behind the legacy transcode's.
+        doc.catalog_mut().unwrap().set("FixtureData", hex);
+        (doc, vec![font_file, hex, weak, jpeg, gray])
+    }
+
+    /// Ids of the `targets` streams of `input` that `out` still carries with
+    /// identical dictionary (bar `/Length`) and identical stored bytes.
+    fn untouched(
+        input: &Document,
+        targets: &[lopdf::ObjectId],
+        out: &[u8],
+    ) -> Vec<lopdf::ObjectId> {
+        let strip = |s: &Stream| {
+            let mut d = s.dict.clone();
+            d.remove(b"Length");
+            (d, s.content.clone())
+        };
+        let out = Document::load_mem(out).unwrap();
+        let shipped: Vec<_> = out
+            .objects
+            .values()
+            .filter_map(|o| o.as_stream().ok())
+            .map(strip)
+            .collect();
+        targets
+            .iter()
+            .copied()
+            .filter(|&id| {
+                let want = strip(input.get_object(id).unwrap().as_stream().unwrap());
+                shipped.contains(&want)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn pdfa_claims_still_decline_every_pass_but_the_jbig2_restore() {
+        // Quality 100 keeps the JPEG requantizer (a resampling-family path,
+        // which PDF/A claims do not gate) from winning, so only the Huffman
+        // re-optimization can reach the JPEG target.
+        let defaults = OptimizeOptions::default().with_jpeg_quality(100);
+        let all = defaults
+            .with_subset_fonts(true)
+            .with_convert_type1(true)
+            .with_strip_hinting(true)
+            .with_flatten_forms(true);
+
+        // Control: without a claim, every target stream is rewritten — the
+        // fixture really reaches each PDF/A-gated pass.
+        let (doc, targets) = every_pass_fixture();
+        let mut plain = Vec::new();
+        doc.clone().save_to(&mut plain).unwrap();
+        let out = optimize_with_options(&plain, all);
+        assert!(out.len() < plain.len());
+        assert_eq!(untouched(&doc, &targets, &out), Vec::new());
+
+        // With the claim, only the CCITT image changes (to JBIG2); every
+        // other target ships byte-for-byte, and the label survives.
+        let pdf = with_pdfa_claim(doc.clone());
+        let claimed = Document::load_mem(&pdf).unwrap();
+        for opts in [defaults, all] {
+            let out = optimize_with_options(&pdf, opts);
+            assert!(out.len() < pdf.len());
+            assert_eq!(untouched(&claimed, &targets, &out), targets);
+            let filters: Vec<_> = Document::load_mem(&out)
+                .unwrap()
+                .objects
+                .values()
+                .filter_map(|o| o.as_stream().ok())
+                .filter_map(|s| {
+                    s.dict
+                        .get(b"Filter")
+                        .ok()?
+                        .as_name()
+                        .ok()
+                        .map(<[u8]>::to_vec)
+                })
+                .collect();
+            assert!(filters.iter().any(|f| f == b"JBIG2Decode"));
+            assert!(!filters.iter().any(|f| f == b"CCITTFaxDecode"));
+            assert_eq!(catalog_xmp(&out), PDFA_XMP);
+            assert_eq!(optimize_with_options(&out, opts), out);
+        }
     }
 
     #[test]
