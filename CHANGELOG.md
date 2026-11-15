@@ -150,6 +150,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (14.5% to 41.6%). Scans take longer
   to optimize: each image is encoded up to 14 times. The bitonal pass
   also reads `/DecodeParms` given as a one-element array or as a reference.
+- **Byte-aligned CCITT G4 images reach the JBIG2 re-store.** G4 streams
+  stored with `/EncodedByteAlign true` (fill bits before every coding line)
+  were skipped, because the `fax` crate's decoder cannot skip fill bits.
+  picamatl now decodes them with its own strict T.6 decoder (`src/ccitt.rs`,
+  using only `fax`'s code tables): the fill bits must be zero, the stream
+  must code exactly `/Height` lines followed by a byte-aligned EOFB with
+  nothing after it, and every coding step must move right along the line
+  (no uncompressed mode, no backward or zero-length steps); anything else
+  leaves the image untouched. The decoded samples
+  then go through the existing JBIG2 (and opt-in G4) candidates unchanged.
+  Over the 17-file corpus and 15 scans only two files hold such images:
+  usgs-bul1100 (PDF/A-1b, 120 page scans) shrinks by a further
+  1,554,770 B (23.7% of its default output) and still passes veraPDF's
+  PDF/A-1b profile; adobe-spec (four masks) by 61,613 B. Every other file's
+  output is byte-identical. Byte-aligned `/K >= 0` (G3) streams are still
+  skipped; none occur in those files.
 - **Flate images get the best PNG row filter.** In a file picamatl
   rewrites, every 8-bit `/FlateDecode` image and soft mask is decoded to its
   samples and stored again under plain rows or the best of the four uniform

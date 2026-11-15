@@ -74,6 +74,11 @@ Executed in this order; each pass reports whether it did work.
   (default on; `--no-jbig2-bitonal-images` opts out) and → CCITT G4 (opt-in
   `--recompress-bitonal-images`). One planner decodes each 1-bit image with
   the strict CCITT (or Flate) decoder and builds every enabled candidate;
+  `/EncodedByteAlign true` G4 goes through the in-house strict T.6 decoder
+  (`src/ccitt.rs`: own reference-line coding over the `fax` crate's code
+  tables, zero fill bits, exactly `/Height` lines, a byte-aligned EOFB and
+  nothing after it), because fax's `Group4Decoder` cannot skip fill bits;
+  byte-aligned `/K >= 0` stays declined;
   the cheapest that is strictly smaller than the stored stream ships, decode-
   back verified. JBIG2 (`src/jbig2.rs`, in-house MQ coder + generic-region
   codec from T.88, no dependency) tries all four templates × TPGD plus three
@@ -175,6 +180,7 @@ unchanged: a PDF/A-1 rewrite that is not strictly smaller ships the input.
 | `src/cffmerge.rs` | ~0.8K | Type1C same-family union merges |
 | `src/bitonal.rs` | ~1.3K | Bitonal re-encodes: strict CCITT/Flate 1-bit decode, G4 and JBIG2 candidates, the never-larger choice |
 | `src/jbig2.rs` | ~0.9K | JBIG2 generic region: T.88 MQ arithmetic encoder/decoder, templates 0-3, TPGD, AT pixels, PDF embedded-stream framing and its strict decode-back parser |
+| `src/ccitt.rs` | ~0.6K | Strict CCITT G4 (T.6) decoder with `/EncodedByteAlign` support: own 2D line coding and bit positioning over the `fax` code tables (plus a fuzzing/test-only byte-aligned encoder) |
 | `src/truetype.rs` | ~0.7K | TrueType subset cmap synthesis |
 | `src/serialize.rs` | ~0.6K | `save_document`: both save paths + the xref-stream / `ObjStm` byte-level post-passes |
 | `src/classify.rs` | ~0.5K | Line-art guard and the `--figure-dpi` figure classifier, with their tuning constants |

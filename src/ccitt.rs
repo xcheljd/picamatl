@@ -10,8 +10,11 @@
 //! `BitReader` trait).
 //!
 //! The decoder is deliberately stricter than a viewer's, because its output
-//! replaces the original: anything a conforming encoder never writes makes
-//! it return `None`, and the caller leaves the image untouched. Rejected:
+//! replaces the original: the constructs below, which a conforming encoder
+//! never writes and on which decoders may disagree, make it return `None`,
+//! and the caller leaves the image untouched. (Valid but non-canonical
+//! sequences, such as a vertical code where pass mode was due, are decoded:
+//! T.4 defines their pixels.) Rejected:
 //! - nonzero fill bits (the PDF spec calls them "extra 0 bits");
 //! - an uncompressed-mode (extension) code, or an EOL / EOFB code inside a
 //!   coding line;

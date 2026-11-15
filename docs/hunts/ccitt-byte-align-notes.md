@@ -38,4 +38,9 @@ re-measures it in-pipeline.
   EOFB right after them; nothing after the EOFB; no uncompressed
   (extension) mode; every coding step must move a0 strictly right (the
   T.4 constraints a conforming encoder obeys). Anything else is untouched.
+  Valid but non-canonical sequences (a vertical code where pass mode was
+  due) are decoded: T.4 defines their pixels. A unit test first assumed
+  any flipped bit would be caught and found one that turned
+  `Pass Pass VR1` into `Pass VR3` with identical pixels; the test now
+  flips the recorded fill bits only.
 - K=0 and K>0 byte-aligned streams stay declined (none in the corpus).
