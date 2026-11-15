@@ -32,6 +32,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   decision is now made once per run, from the claim the output will carry.
   With `--strip-metadata` no claim survives, so those passes run on the
   first run. Without it, PDF/A files are treated exactly as before.
+- **A classic trailer no longer carries the input's xref-stream keys.**
+  Some producers end a file in a classic xref table whose trailer still
+  lists `/Type /XRef`, `/W` and `/Index` (the PDF 1.7 specification file
+  does). With `--no-pack-object-streams` the output kept those three keys,
+  describing a cross-reference stream it does not contain; only PDF/A-1
+  output dropped them. Every classic trailer now drops them. The generic
+  stream keys `/F`, `/FFilter`, `/FDecodeParms` and `/DL` are dropped from
+  every trailer too: an input whose xref stream carried them passed them on
+  to the output's xref stream, where `/F` would point a reader at an
+  external file. No tested reader (libqpdf, Ghostscript, poppler, pypdf)
+  complained about either; output with packing on (the default) is
+  unchanged on the test corpus.
 - **Font subsetting now tracks the text font through `q`/`Q`.** The font is
   part of the graphics state, so text shown after a `Q` is drawn in the font
   that was current at the matching `q`. The glyph walk credited it to the

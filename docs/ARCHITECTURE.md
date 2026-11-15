@@ -135,7 +135,9 @@ Executed in this order; each pass reports whether it did work.
   (jpegtran-equivalent), strictly lossless, verified by decode-back.
 - `pack_object_streams` (default ON) → puts a PDF 1.5 floor on output;
   opt out for pre-Acrobat-6 readers. Overridden for PDF/A-1 (below).
-- `renumber_objects`, `strip_stale_xref_trailer_keys`, compressed xref stream
+- `renumber_objects`, `strip_stale_xref_trailer_keys` (the input's xref keys
+  and the generic stream keys, every path; a classic trailer also drops
+  `/Type /XRef`, `/W`, `/Index` in `save_document`), compressed xref stream
   (PNG-Up-predicted when strictly smaller; applied last, after the passes
   that rewrite raw xref rows).
 - The real-literal restoration pass (`src/reals.rs`) splices the input's own
@@ -155,8 +157,8 @@ nothing else: the catalog `/Metadata` stream is exempted from
 `doc.compress()` (ISO 19005-1 6.7.2: no `/Filter`; its bytes are never
 re-encoded), and `save_document` takes the classic path with a forced
 classic xref table whatever `pack_object_streams` says (6.1.4: no xref
-streams, so no object streams either), dropping the xref-stream-only
-trailer keys an xref-stream input left behind. Both answers follow the
+streams, so no object streams either); like every classic trailer, its
+trailer drops the xref-stream-only keys. Both answers follow the
 claim the OUTPUT carries, so a second pass sees the same answer — re-reading
 a property a later pass removes is an idempotence bug class. An unreadable
 catalog XMP establishes no PDF/A-1 claim (ordinary layout; `pdfa` still

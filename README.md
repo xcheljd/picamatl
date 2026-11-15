@@ -211,12 +211,37 @@ documented opt-in for callers who know their audience (it buys roughly 18
 percentage points of additional reduction on structure-heavy documents, and
 degrades the file from tagged to untagged).
 
-**The declared PDF version is never altered.** Picamatl preserves the input's
-declared PDF version and every document property byte-identically: no version
-downgrades, no color-space conversions, no page auto-rotation, nothing
-rewritten that the document did not already say. If your workflow needs output
-targeted at an older viewer generation, that is a decision you make per
-pipeline — not something an optimizer does to your files on the way through.
+**The declared PDF version only goes up, and only for a feature the output
+uses.** Picamatl never lowers the `%PDF-` header and never touches the
+catalog `/Version`. Two things raise the header:
+
+- A cross-reference stream or object streams (both PDF 1.5) raise a header
+  below 1.5 to `%PDF-1.5`. Packing (on by default) writes both. With
+  `--no-pack-object-streams` the output keeps the input's cross-reference
+  form, so only an input that already had a cross-reference stream gets one.
+- A JBIG2 image (PDF 1.4) raises a header below 1.4 to `%PDF-1.4`. By
+  default the lossless bitonal re-store writes one in place of a CCITT image
+  wherever that is smaller; `--recompress-bitonal-images` also lets it
+  replace 1-bit Flate images. With packing on, the 1.5 raise already covers
+  it.
+
+So with `--no-pack-object-streams`, an input with a classic cross-reference
+table keeps its header unless a JBIG2 image was written. A file whose catalog
+XMP claims PDF/A-1 gets a classic cross-reference table and no object streams
+even with packing on, because PDF/A-1 forbids both stream forms, so only the
+JBIG2 rule can change its header. `--strip-metadata` removes that claim, and
+the file is then packed like any other. A file picamatl cannot make smaller
+comes back byte for byte, header included.
+
+Other document properties keep their values: `/Info` entries, the trailer
+`/ID`, every page's boxes and `/Rotate` (no page auto-rotation). There is no
+color-model conversion: CMYK stays CMYK, RGB stays RGB, ICC-based stays
+ICC-based. Three paths write an image's `/ColorSpace`. A downsampled
+`/Indexed` image with a soft mask is stored in its palette's base space.
+Opt-in `--collapse-gray-images` stores RGB images whose three channels are
+equal as DeviceGray. A JPEG 2000 image converted to JPEG under
+`--allow-lossy` gets an explicit DeviceGray or DeviceRGB, the color space its
+codestream declares.
 
 **Metadata is kept by default.** Some producers stamp a full XMP packet on
 every page and XObject — the PDF 1.7 specification file carries 134 of them,
