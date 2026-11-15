@@ -108,6 +108,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "ccitt"
+path = "fuzz_targets/ccitt.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "jbig2_seeds"
 path = "tools/jbig2_seeds.rs"
 test = false

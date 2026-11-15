@@ -117,6 +117,11 @@ pub mod fuzz_api {
     pub fn ccitt_g4_decode(d: &[u8], w: u32, h: usize, byte_align: bool) -> Option<Vec<u8>> {
         crate::ccitt::decode_g4(d, w, h, false, byte_align)
     }
+    /// Byte-aligned G4 encoding of packed sample rows (`/BlackIs1 false`),
+    /// for round trips through [`ccitt_g4_decode`] and for seed building.
+    pub fn ccitt_g4_encode_aligned(samples: &[u8], w: u32, h: usize) -> Vec<u8> {
+        crate::ccitt::encode_g4_aligned(samples, w, h).0
+    }
     /// The `fax`-based strict G4 decoder the non-aligned bitonal path uses
     /// (exactly `h` rows then EOFB), as the differential oracle for
     /// [`ccitt_g4_decode`].

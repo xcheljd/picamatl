@@ -45,6 +45,13 @@ for pair in lzw_lzw:0 lzw_lzw:1 lzw_a85:2 lzw_ahx:3 lzw_rl:4; do
     done
 done
 cp ../fixtures/jpeg/*.jpg corpus/jpeghuff/ 2>/dev/null || true
+# ccitt: stored G4 streams (continuous and /EncodedByteAlign) and small
+# byte-aligned bands re-encoded from them; each seed carries its own
+# 5-byte mode + geometry header.
+mkdir -p corpus/ccitt
+for k in ccitt_g4 ccitt_eba ccitt_band ccitt_rt; do
+    [ -d "$raw/$k" ] && cp "$raw/$k/"* corpus/ccitt/
+done
 # jbig2: synthetic seeds (round-trip bitmaps and picamatl-shaped streams).
 cargo run --quiet --release --bin jbig2_seeds -- corpus/jbig2
 # Whole-pipeline seeds must be SMALL: libFuzzer runs every seed once before it

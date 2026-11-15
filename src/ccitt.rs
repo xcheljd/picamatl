@@ -281,17 +281,18 @@ pub(crate) fn decode_g4(
     (reader.pos + 24 <= reader.bit_len() && eol(&reader, 0) && eol(&reader, 12)).then_some(out)
 }
 
-#[cfg(test)]
-pub(crate) mod tests {
-    use super::*;
+/// Byte-aligned G4 encoder for the tests and the fuzz harness (never used
+/// by the pipeline, which only decodes byte-aligned streams): fax's own G4
+/// encoder writing through a bit writer that zero-fills to a byte boundary
+/// before each line after the first and before the EOFB.
+#[cfg(any(test, feature = "fuzzing"))]
+mod aligned_encoder {
+    use super::Infallible;
     use fax::encoder::Encoder;
-    use fax::{BitWriter, Bits, Color, VecWriter};
+    use fax::{BitWriter, Bits, Color};
     use std::cell::Cell;
     use std::rc::Rc;
 
-    /// Bit writer that pads to a byte boundary (zero fill) before the next
-    /// write whenever `pad` is raised: the test-side byte-aligned encoder,
-    /// built on fax's own G4 encoder.
     struct AlignWriter {
         bits: Vec<bool>,
         pad: Rc<Cell<bool>>,
@@ -313,6 +314,54 @@ pub(crate) mod tests {
             Ok(())
         }
     }
+
+    /// Encode packed sample rows (`/BlackIs1 false`: sample 0 = black) as
+    /// byte-aligned G4. Returns the stream and the bit positions of all
+    /// its fill bits.
+    pub(crate) fn encode(samples: &[u8], width: u32, height: usize) -> (Vec<u8>, Vec<usize>) {
+        let stride = (width as usize).div_ceil(8);
+        let pad = Rc::new(Cell::new(false));
+        let mut enc = Encoder::new(AlignWriter {
+            bits: Vec::new(),
+            pad: pad.clone(),
+            fill: Vec::new(),
+        });
+        for row in samples.chunks_exact(stride).take(height) {
+            let pels = (0..width as usize).map(|x| {
+                if row[x / 8] >> (7 - x % 8) & 1 == 0 {
+                    Color::Black
+                } else {
+                    Color::White
+                }
+            });
+            let Ok(()) = enc.encode_line(pels, width);
+            pad.set(true);
+        }
+        let Ok(w) = enc.finish();
+        // finish() wrote the EOFB after a pad, so it ends on a byte.
+        debug_assert!(w.bits.len().is_multiple_of(8));
+        let bytes = w
+            .bits
+            .chunks(8)
+            .map(|c| {
+                c.iter()
+                    .enumerate()
+                    .fold(0u8, |acc, (i, &b)| acc | (u8::from(b) << (7 - i)))
+            })
+            .collect();
+        (bytes, w.fill)
+    }
+}
+
+#[cfg(feature = "fuzzing")]
+pub(crate) use aligned_encoder::encode as encode_g4_aligned;
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use fax::encoder::Encoder;
+    use fax::{Color, VecWriter};
+
     fn to_bytes(bits: &[bool]) -> Vec<u8> {
         bits.chunks(8)
             .map(|c| {
@@ -342,24 +391,10 @@ pub(crate) mod tests {
     /// Byte-aligned G4 (fill before every line and before the EOFB), plus
     /// the bit positions of all fill bits.
     pub(crate) fn g4_encode_aligned(rows: &[Vec<bool>]) -> (Vec<u8>, Vec<usize>) {
-        let width = rows[0].len() as u32;
-        let pad = Rc::new(Cell::new(false));
-        let mut enc = Encoder::new(AlignWriter {
-            bits: Vec::new(),
-            pad: pad.clone(),
-            fill: Vec::new(),
-        });
-        for r in rows {
-            let pels = r
-                .iter()
-                .map(|&b| if b { Color::Black } else { Color::White });
-            enc.encode_line(pels, width).unwrap();
-            pad.set(true);
-        }
-        let w = enc.finish().unwrap();
-        // finish() wrote the EOFB after a pad, so it ends on a byte.
-        assert_eq!(w.bits.len() % 8, 0);
-        (to_bytes(&w.bits), w.fill)
+        let (data, fill) =
+            aligned_encoder::encode(&samples(rows, false), rows[0].len() as u32, rows.len());
+        assert!(data.ends_with(&EOFB));
+        (data, fill)
     }
 
     fn samples(rows: &[Vec<bool>], black_is_1: bool) -> Vec<u8> {
