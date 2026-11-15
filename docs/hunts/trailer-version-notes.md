@@ -67,6 +67,34 @@ survives onto the output's xref stream (test
 "classic input, pack=true: /DL leaked into the output trailer"). On an xref
 stream `/F` would declare the table's data to live in an external file.
 
+### The fix and what it changed
+
+`save_document` now drops `/Type /XRef`, `/W` and `/Index` whenever the
+document is about to be written with a classic table (any lane, PDF/A-1 or
+not), and `strip_stale_xref_trailer_keys` also drops `/F /FFilter
+/FDecodeParms /DL`. Fixed binary vs main, same 5 lanes x 32 files:
+
+- Defaults and kitchen sink: 32/32 byte-identical to main.
+- The three no-pack lanes: 31/32 byte-identical; adobe-spec is 37 bytes
+  smaller (`/Index[124332 848]/W[1 3 1]/Type/XRef` gone; 19,316,114 ->
+  19,316,077 B with `--no-pack-object-streams`).
+- Stale-key check: 160/160 clean (main: 157/160).
+- Second pass on its own output, same flags: 160/160 byte-identical.
+- adobe-spec in the three no-pack lanes: all 756 pages render identical to
+  main's output at 100 dpi; pdftotext identical; libqpdf 0 problems; gs
+  nullpage exit 0 and silent; pypdf strict 0 warnings. Against the original,
+  19 pages differ at the default 130 dpi target (downsampled figures, shared
+  with main); with `--target-dpi 0 --no-pack-object-streams` 0 of 756 differ.
+- Header census: identical to main's in all 5 lanes.
+- veraPDF 1.30.4 on the five PDF/A files: defaults byte-identical to main,
+  all compliant (3 x 1b 129/0, 2 x 2b 144/0); the no-pack outputs too.
+- On the six constructed trailer seeds (`make_trailer_seeds.py`), main's
+  default output leaks `/DL /F /FDecodeParms /FFilter` on all 4 seeds that
+  carry them (classic and xref-stream inputs, PDF/A-1 or not), and with
+  packing off it also leaks `/Index /Type /W` on the non-PDF/A classic
+  stream-keys seed; the fix leaks nothing on any of the 12 outputs.
+  libqpdf, gs, poppler and pypdf accept main's leaked outputs silently.
+
 ## 2. When the header version changes
 
 Only two things ever write the header: lopdf raises it to 1.5 whenever it
