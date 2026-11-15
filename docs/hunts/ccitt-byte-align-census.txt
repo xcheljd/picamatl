@@ -1,0 +1,18 @@
+adobe-spec.pdf: K=-1 EncodedByteAlign=True ImageMask EndOfLine=False EndOfBlock=True BlackIs1=False filters=1: 4 images, 82,115 B
+adobe-spec.pdf: EncodedByteAlign subtotal 4 images, 82,115 B
+fbi-custodial.pdf: K=-1 EncodedByteAlign=False Image EndOfLine=False EndOfBlock=True BlackIs1=False filters=1: 702 images, 3,962,304 B
+gao-077234.pdf: K=-1 EncodedByteAlign=False Image EndOfLine=False EndOfBlock=True BlackIs1=False filters=1: 866 images, 1,361,298 B
+gao-104000.pdf: K=-1 EncodedByteAlign=False Image EndOfLine=False EndOfBlock=True BlackIs1=False filters=1: 1969 images, 3,924,576 B
+naca-19930081614.pdf: K=-1 EncodedByteAlign=False Image EndOfLine=False EndOfBlock=True BlackIs1=False filters=1: 32 images, 2,292,624 B
+nasa-tn-d162.pdf: K=-1 EncodedByteAlign=False Image EndOfLine=False EndOfBlock=True BlackIs1=False filters=1: 172 images, 5,711,432 B
+us10174323.pdf: K=-1 EncodedByteAlign=False Image EndOfLine=False EndOfBlock=True BlackIs1=False filters=1: 60 images, 6,048,714 B
+us10522188.pdf: K=-1 EncodedByteAlign=False Image EndOfLine=False EndOfBlock=True BlackIs1=False filters=1: 34 images, 7,033,324 B
+us20120251502.pdf: K=-1 EncodedByteAlign=False Image EndOfLine=False EndOfBlock=True BlackIs1=False filters=1: 117 images, 6,707,318 B
+us6811268.pdf: K=-1 EncodedByteAlign=False Image EndOfLine=False EndOfBlock=True BlackIs1=False filters=1: 13 images, 542,835 B
+usgs-bul1000.pdf: K=-1 EncodedByteAlign=False Image EndOfLine=False EndOfBlock=True BlackIs1=False filters=1: 55 images, 3,911,240 B
+usgs-bul1100.pdf: K=-1 EncodedByteAlign=True Image EndOfLine=False EndOfBlock=True BlackIs1=False filters=1: 120 images, 5,704,952 B
+usgs-bul1100.pdf: EncodedByteAlign subtotal 120 images, 5,704,952 B
+TOTALS
+  K=-1 EncodedByteAlign=False Image: 4020 images, 41,495,665 B
+  K=-1 EncodedByteAlign=True Image: 120 images, 5,704,952 B
+  K=-1 EncodedByteAlign=True ImageMask: 4 images, 82,115 B
