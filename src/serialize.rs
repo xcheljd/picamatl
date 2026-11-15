@@ -41,15 +41,12 @@ pub(crate) fn save_document(
     } else {
         if pdfa1 {
             doc.reference_table.cross_reference_type = XrefType::CrossReferenceTable;
-            // An input that ended in an xref STREAM seeded `doc.trailer` with
-            // that stream's dictionary. The stream writer overwrites `/Type`,
-            // `/W` and `/Index`; the classic trailer would carry them as-is,
-            // describing a stream that no longer exists.
-            if matches!(doc.trailer.get(b"Type"), Ok(Object::Name(n)) if n == b"XRef") {
-                doc.trailer.remove(b"Type");
-            }
-            doc.trailer.remove(b"W");
-            doc.trailer.remove(b"Index");
+        }
+        if matches!(
+            doc.reference_table.cross_reference_type,
+            XrefType::CrossReferenceTable
+        ) {
+            strip_xref_stream_keys_from_classic_trailer(doc);
         }
         let mut out: Vec<u8> = Vec::new();
         doc.save_to(&mut out)?;
@@ -74,6 +71,32 @@ pub(crate) fn save_document(
     // decline any xref stream that already carries a `/Filter`, so neither may
     // ever see the compressed or predicted form.
     Ok(compress_xref_stream(out, options.deflate_backend))
+}
+
+/// Drop the keys only a cross-reference STREAM dictionary has (`/Type /XRef`,
+/// `/W`, `/Index`) from a trailer that is about to be written as a classic
+/// `trailer` dictionary.
+///
+/// `doc.trailer` is seeded from the input's last trailer or xref-stream
+/// dictionary. lopdf's stream writer overwrites these three keys, but its
+/// classic writer sets only `/Size` and copies the rest, so they would reach
+/// the output describing a stream that does not exist. Two inputs hit this:
+/// a PDF/A-1 file that arrived with an xref stream (the table is forced), and
+/// a file that ends in a classic table whose trailer nonetheless carries a
+/// stream key set — `corpus/adobe-spec.pdf` (Distiller 8.1.0) ships
+/// `/Type/XRef/W[1 3 1]/Index[124332 848]` there, and with
+/// `--no-pack-object-streams` main wrote all three into its output, the
+/// `/Index` naming object numbers past the output's `/Size`.
+///
+/// `/Type` goes only when it says `/XRef`; nothing else is a stream key.
+/// The keys every xref form can inherit (`/Prev`, `/XRefStm`, the stream
+/// keys) are `strip_stale_xref_trailer_keys`'s job, which runs first.
+fn strip_xref_stream_keys_from_classic_trailer(doc: &mut Document) {
+    if matches!(doc.trailer.get(b"Type"), Ok(Object::Name(n)) if n == b"XRef") {
+        doc.trailer.remove(b"Type");
+    }
+    doc.trailer.remove(b"W");
+    doc.trailer.remove(b"Index");
 }
 
 /// Deflate the cross-reference stream of a just-serialized document.
@@ -600,6 +623,149 @@ mod tests {
                 "pack={pack}: pages must survive"
             );
         }
+    }
+
+    /// `build_pdf_duplicate_images(6, 400)` re-saved with a classic xref table
+    /// and the given extra trailer entries, so the input's own trailer carries
+    /// whatever the test needs to see dropped.
+    fn classic_input_with_trailer(extra: &[(&str, Object)]) -> Vec<u8> {
+        let mut doc = Document::load_mem(&build_pdf_duplicate_images(6, 400)).unwrap();
+        doc.reference_table.cross_reference_type = XrefType::CrossReferenceTable;
+        for (key, value) in extra {
+            doc.trailer.set(*key, value.clone());
+        }
+        let mut pdf = Vec::new();
+        doc.save_to(&mut pdf).unwrap();
+        pdf
+    }
+
+    /// The bytes `startxref` points at.
+    fn last_xref_section(out: &[u8]) -> &[u8] {
+        let sx = out.windows(9).rposition(|w| w == b"startxref").unwrap();
+        let digits: Vec<u8> = out[sx + 9..]
+            .iter()
+            .copied()
+            .skip_while(u8::is_ascii_whitespace)
+            .take_while(u8::is_ascii_digit)
+            .collect();
+        &out[std::str::from_utf8(&digits)
+            .unwrap()
+            .parse::<usize>()
+            .unwrap()..]
+    }
+
+    /// `corpus/adobe-spec.pdf` ends in a classic `trailer` that carries an
+    /// xref-stream key set. With packing off the output keeps a classic
+    /// table, and lopdf's classic writer copies the trailer as it is, so
+    /// `/Type/XRef`, `/W` and an `/Index` naming objects the output does not
+    /// have reached the output. Only the PDF/A-1 path used to drop them.
+    #[test]
+    fn classic_output_trailer_carries_no_xref_stream_keys() {
+        let pdf = classic_input_with_trailer(&[
+            ("Type", Object::Name(b"XRef".to_vec())),
+            ("W", vec![1.into(), 3.into(), 1.into()].into()),
+            ("Index", vec![124_332.into(), 848.into()].into()),
+        ]);
+        assert!(
+            last_xref_section(&pdf).starts_with(b"xref"),
+            "premise: the input ends in a classic table"
+        );
+        assert!(
+            find_sub(&pdf, b"/Index[124332 848]", 0).is_some(),
+            "premise: the input trailer carries the stale /Index"
+        );
+        for pack in [false, true] {
+            let opts = OptimizeOptions::default().with_pack_object_streams(pack);
+            let out = optimize_with_options(&pdf, opts);
+            assert!(out.len() < pdf.len(), "pack={pack}: must be a real rewrite");
+            let doc = Document::load_mem(&out)
+                .unwrap_or_else(|e| panic!("pack={pack}: output must load: {e}"));
+            assert!(!doc.get_pages().is_empty(), "pack={pack}: pages survive");
+            assert!(
+                find_sub(&out, b"/Index[124332 848]", 0).is_none(),
+                "pack={pack}: the input's /Index must not reach the output"
+            );
+            if pack {
+                // The writer's own xref stream dictionary owns these keys.
+                assert!(!last_xref_section(&out).starts_with(b"xref"));
+                continue;
+            }
+            assert!(
+                last_xref_section(&out).starts_with(b"xref"),
+                "premise: packing off keeps the classic table"
+            );
+            for key in [b"Type".as_slice(), b"W", b"Index"] {
+                assert!(
+                    doc.trailer.get(key).is_err(),
+                    "pack=false: stale /{} in the classic trailer",
+                    String::from_utf8_lossy(key)
+                );
+            }
+            // A classic trailer that is already clean is its own fixpoint.
+            assert_eq!(optimize_with_options(&out, opts), out, "second pass");
+        }
+    }
+
+    /// The generic stream keys (ISO 32000-1 Table 5: `/F`, `/FFilter`,
+    /// `/FDecodeParms`, `/DL`) are never trailer keys. An input that ended in
+    /// an xref stream carrying them seeds `doc.trailer` with them, and lopdf's
+    /// stream writer copies them onto the xref stream it writes, where `/F`
+    /// would declare the table's data to live in an external file. Every
+    /// lane, both input xref forms.
+    #[test]
+    fn stream_only_keys_never_reach_the_output_trailer() {
+        let extra: Vec<(&str, Object)> = vec![
+            ("DL", 999_999.into()),
+            ("F", Object::string_literal("external.dat")),
+            ("FFilter", Object::Name(b"FlateDecode".to_vec())),
+            ("FDecodeParms", Object::Dictionary(dictionary! {})),
+        ];
+        let mut inputs = vec![("classic", classic_input_with_trailer(&extra))];
+        let mut doc = Document::load_mem(&build_pdf_duplicate_images(6, 400)).unwrap();
+        doc.reference_table.cross_reference_type = XrefType::CrossReferenceStream;
+        for (key, value) in &extra {
+            doc.trailer.set(*key, value.clone());
+        }
+        let mut stream_input = Vec::new();
+        doc.save_to(&mut stream_input).unwrap();
+        inputs.push(("stream", stream_input));
+
+        for (form, pdf) in &inputs {
+            assert!(
+                find_sub(pdf, b"/FFilter", 0).is_some(),
+                "premise: the {form} input carries the keys"
+            );
+            for pack in [true, false] {
+                let opts = OptimizeOptions::default().with_pack_object_streams(pack);
+                let out = optimize_with_options(pdf, opts);
+                let what = format!("{form} input, pack={pack}");
+                assert!(out.len() < pdf.len(), "{what}: must be a real rewrite");
+                let doc = Document::load_mem(&out)
+                    .unwrap_or_else(|e| panic!("{what}: output must load: {e}"));
+                for (key, _) in &extra {
+                    assert!(
+                        doc.trailer.get(key.as_bytes()).is_err(),
+                        "{what}: /{key} leaked into the output trailer"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A trailer `/Type` that is not `/XRef` is not a stream key; the classic
+    /// strip leaves it (and every real trailer key) where it is.
+    #[test]
+    fn classic_trailer_strip_keeps_real_trailer_keys() {
+        let mut doc = Document::load_mem(&classic_input_with_trailer(&[(
+            "Type",
+            Object::Name(b"Other".to_vec()),
+        )]))
+        .unwrap();
+        let before: Vec<Vec<u8>> = doc.trailer.iter().map(|(k, _)| k.clone()).collect();
+        assert!(before.iter().any(|k| k == b"Root"), "premise: /Root");
+        strip_xref_stream_keys_from_classic_trailer(&mut doc);
+        let after: Vec<Vec<u8>> = doc.trailer.iter().map(|(k, _)| k.clone()).collect();
+        assert_eq!(before, after);
     }
 
     /// The patch must decline anything that is not exactly the object shape it

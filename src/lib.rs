@@ -4835,8 +4835,14 @@ fn keep_catalog_metadata_unfiltered(doc: &mut Document) {
 /// (Ghostscript: "The /Prev entry in an XrefStm dictionary did not point to an
 /// XrefStm" / "xref table was repaired").
 ///
+/// The generic stream keys `/F`, `/FFilter`, `/FDecodeParms` and `/DL`
+/// (ISO 32000-1 Table 5) go too: they are never trailer keys, and copied onto
+/// the output's xref stream `/F` would declare its data external.
+///
 /// The writer owns the cross-reference section; nothing the reader saw about
-/// the old one may survive into the new one.
+/// the old one may survive into the new one. The stream-only keys a CLASSIC
+/// trailer must not carry (`/Type /XRef`, `/W`, `/Index`) are dropped at save
+/// time, once the xref form is known (`serialize::save_document`).
 fn strip_stale_xref_trailer_keys(doc: &mut Document) {
     for key in [
         b"DecodeParms".as_slice(),
@@ -4844,6 +4850,10 @@ fn strip_stale_xref_trailer_keys(doc: &mut Document) {
         b"Prev",
         b"XRefStm",
         b"Length",
+        b"F",
+        b"FFilter",
+        b"FDecodeParms",
+        b"DL",
     ] {
         doc.trailer.remove(key);
     }
