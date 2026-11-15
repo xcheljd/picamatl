@@ -44,3 +44,51 @@ re-measures it in-pipeline.
   `Pass Pass VR1` into `Pass VR3` with identical pixels; the test now
   flips the recorded fill bits only.
 - K=0 and K>0 byte-aligned streams stay declined (none in the corpus).
+
+## Results (branch head, against main 7b8a288 built from ~/Labs/picamatl)
+
+Decoder checks (all 124 byte-aligned images):
+- picamatl's decode vs poppler (`pdfimages` of the original) and vs
+  Ghostscript (each original stream alone on a w x h pt page at 72 dpi):
+  0 differing pixels on all 124, padding masked, /Decode handled. Controls:
+  one flipped pixel = 1 diff, one flipped padding bit = 0. pdfimages writes
+  /ImageMask stencils as their raw sample bits (PBM 1 = sample 1) and
+  DeviceGray images as 1 = black; gs paints both black where sample = 0.
+- Continuous mode vs fax's strict path on all 4,020 non-aligned G4 images
+  in the 32 files: 4,020 identical, 0 differ, 0 one-sided.
+- jbig2dec on every JBIG2 stream in the new outputs (defaults and
+  kitchen): 124 of 124 match picamatl's decode (controls pass).
+
+Sizes, 32 files (main defaults total 97,756,865 B, as on the card):
+- defaults: 96,140,482 B (-1,616,383 B); kitchen: 85,868,502 B ->
+  84,252,108 B (-1,616,394 B). 30 files byte-identical in both lanes; the
+  two changed files are the two with byte-aligned images. Second pass
+  byte-identical on 32 of 32 in both lanes.
+- usgs-bul1100 defaults 6,557,236 B -> 5,002,466 B (-23.71%), kitchen
+  6,445,944 B -> 4,891,145 B (-24.12%).
+- adobe-spec defaults 6,921,719 B -> 6,860,106 B (-0.89%), kitchen
+  4,311,367 B -> 4,249,772 B (-1.43%).
+
+Renders (pdftoppm, every page): new == main output on 124/124 (bul1100)
+and 756/756 (adobe-spec) pages at 100 and 300 dpi. Against the original,
+new differs only where main also differs: bul1100 pages 1, 2, 59, 60
+(downsampled JPEGs); adobe-spec 19 pages (9 with downsampled images; the
+other 10 are main's existing changes on pages 211, 311-315, 543-545, 548,
+e.g. the 33 x 33 JPEG thumbnails of 311-315, max channel diff 3). Main
+stores all 124 byte-aligned streams unchanged, so in their areas new ==
+main == original. Text identical, gs nullpage clean, no new poppler
+syntax errors.
+
+veraPDF default outputs: usgs-bul1000, usgs-bul1100, usgs-pp150 (1b) and
+usgs-pp250, nbs-circ539v1 (2b) all compliant, 0 failed rules.
+
+Worst case (17 KB PDF declaring a 16384 x 16384 near-blank byte-aligned
+image, one black pel per 64 lines): 11.35 s, 102 MB peak RSS; the same
+pixels as continuous G4 already take 11.33 s on main, so the cost is the
+JBIG2 search, not the decoder. Blank: 3.5 s (continuous on main 2.9 s).
+268M x 1: 0.01 s, 70 MB. 16385 x 16384 (over the pixel cap): declined.
+
+Fuzz: MINUTES=10 campaign, 12 targets incl. the new `ccitt` (72,691
+runs); optimize 10,706 and optimize_all 12,632 runs on 100 seeds each
+under 100 ms (30 byte-aligned one-image PDFs, 29 of which convert);
+0 oom/timeout/crash, 0 findings.
