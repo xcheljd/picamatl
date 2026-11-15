@@ -57,6 +57,7 @@
 //!   - Any failure (parse, decode, save) falls back to the original bytes.
 
 mod bitonal;
+mod ccitt;
 mod cffhint;
 mod cffmerge;
 mod classify;
@@ -109,6 +110,18 @@ pub mod fuzz_api {
             3 => crate::legacy::ascii_hex_decode(d, limit),
             _ => crate::legacy::run_length_decode(d, limit),
         }
+    }
+    /// The in-house strict G4 decoder (`byte_align` = `/EncodedByteAlign
+    /// true`) on arbitrary bytes, packed sample rows under `/BlackIs1
+    /// false`. The caller bounds `w * h`.
+    pub fn ccitt_g4_decode(d: &[u8], w: u32, h: usize, byte_align: bool) -> Option<Vec<u8>> {
+        crate::ccitt::decode_g4(d, w, h, false, byte_align)
+    }
+    /// The `fax`-based strict G4 decoder the non-aligned bitonal path uses
+    /// (exactly `h` rows then EOFB), as the differential oracle for
+    /// [`ccitt_g4_decode`].
+    pub fn fax_g4_decode(d: &[u8], w: u32, h: usize) -> Option<Vec<u8>> {
+        crate::bitonal::fuzz_g4_strict(d, w, h)
     }
     /// The JBIG2 decode-back gate on arbitrary bytes: parses picamatl's
     /// two-segment embedded shape and decodes exactly `w × h` pixels.

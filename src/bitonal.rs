@@ -14,9 +14,11 @@
 //! image is left byte-identical. Gates encode the `fax` 0.3.0 decoder contract
 //! verified in the vetting spike (§B.3.1): `decode_g3` is 1D-only and
 //! EOL-framed, so `/K > 0` and EOL-less `/K 0` streams are skipped; the G4
-//! decoder has no fill-bit handling, so `/EncodedByteAlign true` is skipped;
-//! `decode_g4`'s lenient tail handling is bypassed by driving `Group4Decoder`
-//! directly and demanding exactly `/Height` rows followed by a clean EOFB.
+//! decoder has no fill-bit handling, so `/EncodedByteAlign true` G4 streams
+//! go through the in-house strict decoder in `crate::ccitt` instead (and
+//! byte-aligned `/K >= 0` streams are skipped); `decode_g4`'s lenient tail
+//! handling is bypassed by driving `Group4Decoder` directly and demanding
+//! exactly `/Height` rows followed by a clean EOFB.
 
 use std::convert::Infallible;
 
@@ -352,11 +354,11 @@ fn decode_ccitt_source(
         return None;
     }
     // fax's G4 decoder reads a continuous bitstream — it has no fill-bit
-    // handling between coding lines — so byte-aligned streams are undecodable
-    // by it. Fail-safe skip (§B.3.1).
-    if get_b(b"EncodedByteAlign", false) {
-        return None;
-    }
+    // handling between coding lines (§B.3.1) — so byte-aligned G4 goes
+    // through the in-house strict decoder instead. Byte-aligned K >= 0
+    // streams stay a skip: none occur in the corpus, and fax's G3 decoder
+    // would accept their fill bits without checking the alignment.
+    let byte_align = get_b(b"EncodedByteAlign", false);
     // Our strict decoders demand proper termination (EOFB / RTC); a stream
     // declaring `/EndOfBlock false` promises neither. Skip.
     if !get_b(b"EndOfBlock", true) {
@@ -369,8 +371,12 @@ fn decode_ccitt_source(
     let black_is_1 = get_b(b"BlackIs1", false);
 
     let k = get_i(b"K", 0);
-    if k < 0 {
+    if k < 0 && byte_align {
+        crate::ccitt::decode_g4(&stream.content, w, h, black_is_1, true)
+    } else if k < 0 {
         decode_g4_strict_to_samples(&stream.content, w, h, black_is_1)
+    } else if byte_align {
+        None
     } else if k == 0 {
         // `decode_g3` requires EOL framing (mandatory initial EOL, RTC
         // terminator); `/K 0` streams without `/EndOfLine true` are misframed
@@ -447,6 +453,13 @@ fn decode_g4_strict_to_samples(
         DecodeStatus::End => Some(out),
         DecodeStatus::Incomplete => None, // stream codes more rows than /Height
     }
+}
+
+/// [`decode_g4_strict_to_samples`] under `/BlackIs1 false`, for the fuzz
+/// harness's differential check of `crate::ccitt::decode_g4`.
+#[cfg(feature = "fuzzing")]
+pub(crate) fn fuzz_g4_strict(data: &[u8], width: u32, height: usize) -> Option<Vec<u8>> {
+    decode_g4_strict_to_samples(data, width, height, false)
 }
 
 /// Strict G3 1D decode to packed samples: exactly `height` rows, each coding
@@ -859,17 +872,135 @@ mod tests {
     }
 
     #[test]
-    fn encoded_byte_align_is_skipped() {
-        // Otherwise-eligible stream; the flag alone must gate it out.
+    fn byte_aligned_k_ge_0_is_skipped() {
+        // Byte-aligned G3 stays declined: fax's G3 decoder would decode
+        // this EOL-framed stream without checking any alignment, so the
+        // flag alone must gate it out, under either target.
         let rows = doc_rows(W, 256);
-        let mut parms = g3_parms(W, 256);
-        parms.set("EncodedByteAlign", true);
+        for k in [0, 1] {
+            let mut parms = g3_parms(W, 256);
+            parms.set("K", k);
+            parms.set("EncodedByteAlign", true);
+            let pdf = bitonal_pdf(
+                image_dict(W, 256, "CCITTFaxDecode", Some(parms)),
+                g3_of(&rows),
+            );
+            for o in [opts(), OptimizeOptions::default()] {
+                let out = optimize_with_options(&pdf, o);
+                assert_eq!(out, pdf, "byte-aligned K={k} must be a fail-safe skip");
+            }
+        }
+    }
+
+    fn eba_g4_parms(w: usize, h: usize) -> Dictionary {
+        let mut p = g4_parms(w, h);
+        p.set("EncodedByteAlign", true);
+        p
+    }
+
+    #[test]
+    fn byte_aligned_g4_is_restored_as_jbig2_by_default() {
+        let rows = doc_rows(W, H);
+        let data = crate::ccitt::tests::g4_encode(&rows, true);
+        assert_ne!(data, g4_of(&rows), "fixture must carry fill bits");
+        for black_is_1 in [false, true] {
+            let mut parms = eba_g4_parms(W, H);
+            parms.set("BlackIs1", black_is_1);
+            let pdf = bitonal_pdf(
+                image_dict(W, H, "CCITTFaxDecode", Some(parms)),
+                data.clone(),
+            );
+            let out = optimize_with_options(&pdf, OptimizeOptions::default());
+            assert!(out.len() < pdf.len(), "output must be smaller");
+            assert_jbig2_with_samples(&out, W, H, &pack_samples(&rows, black_is_1));
+            let twice = optimize_with_options(&out, OptimizeOptions::default());
+            assert_eq!(twice, out, "second pass must be a no-op");
+        }
+    }
+
+    #[test]
+    fn byte_aligned_g4_image_mask_is_restored_as_jbig2() {
+        let rows = doc_rows(281, 601);
+        let dict = dictionary! {
+            "Type" => "XObject",
+            "Subtype" => "Image",
+            "Width" => 281,
+            "Height" => 601,
+            "ImageMask" => true,
+            "Filter" => "CCITTFaxDecode",
+            "DecodeParms" => eba_g4_parms(281, 601),
+        };
+        let pdf = bitonal_pdf(dict, crate::ccitt::tests::g4_encode(&rows, true));
+        let out = optimize_with_options(&pdf, OptimizeOptions::default());
+        let img = assert_jbig2_with_samples(&out, 281, 601, &pack_samples(&rows, false));
+        assert!(matches!(
+            img.dict.get(b"ImageMask"),
+            Ok(Object::Boolean(true))
+        ));
+    }
+
+    #[test]
+    fn byte_aligned_g4_target_writes_unaligned_parms() {
+        // The G4 target re-encodes into a continuous stream, so the
+        // rewritten /DecodeParms must not keep /EncodedByteAlign.
+        let rows = doc_rows(W, H);
         let pdf = bitonal_pdf(
-            image_dict(W, 256, "CCITTFaxDecode", Some(parms)),
-            g3_of(&rows),
+            image_dict(W, H, "CCITTFaxDecode", Some(eba_g4_parms(W, H))),
+            crate::ccitt::tests::g4_encode(&rows, true),
         );
         let out = optimize_with_options(&pdf, opts());
-        assert_eq!(out, pdf, "/EncodedByteAlign true must be a fail-safe skip");
+        let img = assert_g4_with_samples(&out, W, H, &pack_samples(&rows, false));
+        let parms = img.dict.get(b"DecodeParms").unwrap().as_dict().unwrap();
+        assert!(parms.get(b"EncodedByteAlign").is_err());
+    }
+
+    #[test]
+    fn corrupt_byte_aligned_g4_returns_exact_original_bytes() {
+        let rows = doc_rows(W, H);
+        let (data, fills) = crate::ccitt::tests::g4_encode_aligned(&rows);
+        // The byte that starts row H/2: every row starts on a byte, so it
+        // is the byte right after the H/2-th row's last fill bit.
+        let row_starts: Vec<usize> = fills
+            .windows(2)
+            .filter(|f| f[1] != f[0] + 1)
+            .map(|f| f[0] / 8 + 1)
+            .collect();
+        let mid = row_starts[row_starts.len() / 2];
+        let mut variants: Vec<(&str, Vec<u8>)> = Vec::new();
+        // A fill bit set to 1 in the middle of the image.
+        let mut v = data.clone();
+        let bit = fills[fills.len() / 2];
+        v[bit / 8] ^= 0x80 >> (bit % 8);
+        variants.push(("nonzero fill bit", v));
+        // A row that opens with an uncompressed-mode (extension) code.
+        let mut v = data.clone();
+        v[mid] = 0x02;
+        variants.push(("extension code in a row", v));
+        // A row replaced by an EOL (early end of the image).
+        let mut v = data[..mid].to_vec();
+        v.extend_from_slice(&[0x00, 0x10, 0x01]);
+        variants.push(("EOFB before the last row", v));
+        // Trailing garbage after the EOFB.
+        let mut v = data.clone();
+        v.push(0x55);
+        variants.push(("byte after the EOFB", v));
+        // EOFB missing.
+        variants.push(("no EOFB", data[..data.len() - 3].to_vec()));
+        for (what, content) in variants {
+            let pdf = bitonal_pdf(
+                image_dict(W, H, "CCITTFaxDecode", Some(eba_g4_parms(W, H))),
+                content,
+            );
+            for o in [opts(), OptimizeOptions::default()] {
+                assert_eq!(optimize_with_options(&pdf, o), pdf, "{what}");
+            }
+        }
+        // Control: the intact stream converts under the same options.
+        let pdf = bitonal_pdf(
+            image_dict(W, H, "CCITTFaxDecode", Some(eba_g4_parms(W, H))),
+            data,
+        );
+        assert_ne!(optimize_with_options(&pdf, OptimizeOptions::default()), pdf);
     }
 
     #[test]
