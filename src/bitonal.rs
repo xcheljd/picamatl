@@ -1355,11 +1355,12 @@ mod tests {
     /// Streams the PDF/A-declining passes would rewrite in a document without
     /// a claim: a subsettable embedded TrueType program (font subsetting),
     /// an ASCIIHex data stream (legacy transcode), a padded, weakly
-    /// deflated content stream (content minifier + re-deflate), a JPEG with
-    /// the fixed Annex K tables (Huffman re-optimization), and an unfiltered
-    /// row ramp deflated without a predictor (row-filter choice). Plus one
-    /// CCITT G4 image for the JBIG2 re-store. Returns the document and the
-    /// ids of those five target streams.
+    /// deflated page content stream (content minifier; its re-deflate is
+    /// the other PDF/A exemption), a JPEG with the fixed Annex K tables
+    /// (Huffman re-optimization), and an unfiltered row ramp deflated
+    /// without a predictor (row-filter choice). Plus one CCITT G4 image for
+    /// the JBIG2 re-store. Returns the document and the ids of those five
+    /// target streams, the content stream third.
     fn every_pass_fixture() -> (Document, Vec<lopdf::ObjectId>) {
         use crate::fonts::tests::{build_text_pdf, gids_for, FontSpec};
         use lopdf::Object;
@@ -1501,14 +1502,38 @@ mod tests {
         assert!(out.len() < plain.len());
         assert_eq!(untouched(&doc, &targets, &out), Vec::new());
 
-        // With the claim, only the CCITT image changes (to JBIG2); every
-        // other target ships byte-for-byte, and the label survives.
+        // With the claim, the CCITT image changes (to JBIG2) and the page
+        // content stream is re-deflated to the SAME decoded bytes (never
+        // minified); every other target ships byte-for-byte, and the label
+        // survives.
         let pdf = with_pdfa_claim(doc.clone());
         let claimed = Document::load_mem(&pdf).unwrap();
+        let content = targets[2];
+        let others: Vec<_> = targets
+            .iter()
+            .copied()
+            .filter(|&id| id != content)
+            .collect();
+        let content_in = claimed.get_object(content).unwrap().as_stream().unwrap();
+        let content_plain = content_in.decompressed_content().unwrap();
         for opts in [defaults, all] {
             let out = optimize_with_options(&pdf, opts);
             assert!(out.len() < pdf.len());
-            assert_eq!(untouched(&claimed, &targets, &out), targets);
+            assert_eq!(untouched(&claimed, &targets, &out), others);
+            let shipped = Document::load_mem(&out).unwrap();
+            let redeflated = shipped
+                .objects
+                .values()
+                .filter_map(|o| o.as_stream().ok())
+                .filter(|s| s.dict.get(b"Subtype").is_err())
+                .any(|s| {
+                    s.content.len() < content_in.content.len()
+                        && s.decompressed_content().ok().as_ref() == Some(&content_plain)
+                });
+            assert!(
+                redeflated,
+                "the page content must be re-deflated, not minified"
+            );
             let filters: Vec<_> = Document::load_mem(&out)
                 .unwrap()
                 .objects

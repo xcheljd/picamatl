@@ -373,9 +373,11 @@ pub struct OptimizeOptions {
     /// the file on it (adobe-spec: 860 KB, 12%). Because the output then
     /// carries no PDF/A claim, the passes that decline PDF/A-declared
     /// documents (font subsetting and conversion, hint stripping, form
-    /// flattening, content minification, the lossless re-encodes) run on
-    /// them too — otherwise a second run over the output would do that work
-    /// and the result would not be idempotent. Default: `false`.
+    /// flattening, content minification, and the lossless re-encodes, bar
+    /// the JBIG2 re-store and the page-content re-deflate, which run on
+    /// PDF/A claims anyway) run on them too — otherwise a second run over the
+    /// output would do that work and the result would not be idempotent.
+    /// Default: `false`.
     pub strip_metadata: bool,
 
     /// If true, remove every `/PieceInfo` entry — the "page-piece"
@@ -478,9 +480,9 @@ pub struct OptimizeOptions {
     /// other key keep their meaning, so the page renders pixel-identically.
     /// A stream is replaced only when the JBIG2 stream is strictly smaller
     /// AND picamatl's decoder reproduces the source samples exactly; images
-    /// already stored as JBIG2 are never touched. Declined on documents
-    /// claiming PDF/A and on encrypted ones, like every other re-encoding
-    /// pass. When [`recompress_bitonal_images`](Self::recompress_bitonal_images)
+    /// already stored as JBIG2 are never touched. Declined on encrypted
+    /// documents; runs on documents claiming PDF/A (PDF/A-1 and PDF/A-2 both
+    /// allow `/JBIG2Decode`). When [`recompress_bitonal_images`](Self::recompress_bitonal_images)
     /// is also on, Flate 1-bit images get the JBIG2 candidate too and the
     /// smaller of G4 and JBIG2 wins. Default: `true`.
     pub jbig2_bitonal_images: bool,
@@ -4049,8 +4051,11 @@ fn replan_content(
 /// re-print longer as `0.1531`), which is exactly why every stream keeps its
 /// original bytes unless the rewrite wins.
 ///
-/// Declined wholesale for encrypted, PDF/A-declared, and signed documents,
-/// same posture as `redeflate_flate_streams`.
+/// Declined wholesale for encrypted and PDF/A-declared documents: under a
+/// PDF/A claim the decoded content is never re-emitted (re-spelling `1.0` as
+/// `1` can push a PDF/A-2 real past the integer limit; see
+/// docs/hunts/pdfa-content-redeflate-notes.md), and only
+/// `redeflate_flate_streams` may re-deflate the page content's payload.
 fn minify_content_streams(doc: &mut Document, backend: DeflateBackend, pdfa: bool) -> bool {
     if doc.is_encrypted() || pdfa {
         return false;
@@ -4771,7 +4776,8 @@ fn try_optimize(input: &[u8], options: OptimizeOptions) -> Result<OptimizeOutcom
     }
 
     // Last planning-free pass: re-deflate every already-Flate stream with the
-    // configured backend (zlib level 9, or zopfli when opted in).
+    // configured backend (zlib level 9, or zopfli when opted in). Under a
+    // PDF/A claim, page content streams only.
     // Runs after EVERY other decision (images, fonts, bitonal, lossy, dedup,
     // prune, compress) so it is purely a serialization improvement and can
     // never influence, or be influenced by, what the planners chose.
@@ -4984,10 +4990,15 @@ fn reoptimize_jpeg_streams(doc: &mut Document, pdfa: bool) -> bool {
 /// Idempotent: a second pass re-deflates already-level-9 output to the same
 /// size, which fails the strictly-smaller test and changes nothing.
 ///
-/// Declined wholesale for encrypted documents (stream bytes are ciphertext)
-/// and PDF/A-declared documents. Signed documents are NOT declined: see the
-/// module header of `src/signatures.rs` for why a signature guard here
-/// protects nothing.
+/// Declined wholesale for encrypted documents (stream bytes are ciphertext).
+/// On a PDF/A-declared document (`pdfa`) only page content streams — every
+/// stream a page names in `/Contents` — are re-deflated: same decoded bytes,
+/// same `/Filter` and `/DecodeParms`, and Flate is allowed by every PDF/A
+/// part, so veraPDF raises nothing new (see
+/// docs/hunts/pdfa-content-redeflate-notes.md). Every other stream of such a
+/// document, Form XObjects and the catalog XMP included, is left exactly as
+/// it arrived. Signed documents are NOT declined: see the module header of
+/// `src/signatures.rs` for why a signature guard here protects nothing.
 ///
 /// `skip` holds the images [`refilter_flate_images`] just re-encoded with this
 /// same backend, whose re-deflate could only reproduce the payload they
@@ -4998,9 +5009,15 @@ fn redeflate_flate_streams(
     pdfa: bool,
     skip: &HashSet<ObjectId>,
 ) {
-    if doc.is_encrypted() || pdfa {
+    if doc.is_encrypted() {
         return;
     }
+    // Under a PDF/A claim only page content streams are re-deflated: their
+    // decoded bytes stay identical, `/Filter` and `/DecodeParms` stay as
+    // they are, and Flate is allowed by every PDF/A part, so nothing a
+    // validator checks moves (docs/hunts/pdfa-content-redeflate-notes.md).
+    // Every other stream of a PDF/A document is still left as it arrived.
+    let pdfa_contents: Option<HashSet<ObjectId>> = pdfa.then(|| page_content_ids(doc));
 
     // Collect first: classification resolves references against the immutable
     // document, while the deflate work itself happens off the document
@@ -5013,6 +5030,9 @@ fn redeflate_flate_streams(
                 return None;
             };
             if skip.contains(&id) {
+                return None;
+            }
+            if pdfa_contents.as_ref().is_some_and(|ids| !ids.contains(&id)) {
                 return None;
             }
             // Object and cross-reference streams are the writer's business:
@@ -5039,6 +5059,15 @@ fn redeflate_flate_streams(
             stream.set_content(content); // keeps /Length in sync
         }
     }
+}
+
+/// Every stream some page names in its `/Contents` (a single stream or the
+/// elements of an array), as `Document::get_page_contents` resolves them.
+fn page_content_ids(doc: &Document) -> HashSet<ObjectId> {
+    doc.get_pages()
+        .into_values()
+        .flat_map(|page_id| doc.get_page_contents(page_id))
+        .collect()
 }
 
 /// Inflate and re-deflate one Flate payload. `None` (leave the stream exactly
@@ -6175,6 +6204,250 @@ mod tests {
 
     fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
         haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    /// A PDF/A-`part` document (`part` 0: no claim) the default run
+    /// rewrites: a loosely spelled page content stream stored at deflate
+    /// level 0 (the re-deflate's target, and the minifier's), two
+    /// byte-identical image XObjects and a Form XObject with the same loose
+    /// content, all also stored at level 0. Merging the image pair is work no
+    /// PDF/A claim gates, so the file is rewritten rather than handed back;
+    /// the slack in the image and the form belongs to passes a claim still
+    /// declines (the re-deflate of every other stream, the row-filter choice,
+    /// the minifier). Returns the file, the decoded page content and the
+    /// stored content length.
+    fn build_pdfa_content_fixture(part: u8) -> (Vec<u8>, Vec<u8>, usize) {
+        use std::io::Write;
+        let level0 = |data: &[u8]| {
+            let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::none());
+            enc.write_all(data).unwrap();
+            enc.finish().unwrap()
+        };
+        let mut payload = Vec::new();
+        for i in 0..2_000u32 {
+            payload.extend_from_slice(
+                format!(
+                    "q   0.50000 0 0 0.50000 {}.00000 {}.00000 cm   BT /F1 12 Tf (row {i}) Tj ET   Q\n",
+                    i % 97,
+                    i % 89
+                )
+                .as_bytes(),
+            );
+        }
+        let stored = level0(&payload);
+        let stored_len = stored.len();
+        let mut doc = Document::with_version("1.4");
+        let content_id = doc.add_object(Stream::new(
+            dictionary! { "Filter" => "FlateDecode" },
+            stored,
+        ));
+        let image = || {
+            Stream::new(
+                dictionary! {
+                    "Type" => "XObject",
+                    "Subtype" => "Image",
+                    "Width" => 32_i64,
+                    "Height" => 32_i64,
+                    "ColorSpace" => "DeviceRGB",
+                    "BitsPerComponent" => 8_i64,
+                    "Filter" => "FlateDecode",
+                },
+                // A smooth ramp: plenty of slack a level-9 re-deflate or a row
+                // filter would take, if the claim did not decline them.
+                level0(
+                    &(0..32 * 32 * 3)
+                        .map(|i| (i % 251) as u8)
+                        .collect::<Vec<u8>>(),
+                ),
+            )
+        };
+        let im0 = doc.add_object(image());
+        let im1 = doc.add_object(image());
+        let fm0 = doc.add_object(Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Form",
+                "BBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+                "Filter" => "FlateDecode",
+            },
+            level0(&payload[..payload.len() / 4]),
+        ));
+        let pages_id = doc.new_object_id();
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "Contents" => content_id,
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Resources" => dictionary! {
+                "XObject" => dictionary! { "Im0" => im0, "Im1" => im1, "Fm0" => fm0 },
+            },
+        });
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages", "Kids" => vec![page_id.into()], "Count" => 1,
+            }),
+        );
+        let catalog_id = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+        if part != 0 {
+            let xmp = doc.add_object(Stream::new(
+                dictionary! { "Type" => "Metadata", "Subtype" => "XML" },
+                format!(
+                    "<x:xmpmeta><rdf:Description xmlns:pdfaid=\"http://www.aiim.org/pdfa/ns/id/\"><pdfaid:part>{part}</pdfaid:part><pdfaid:conformance>B</pdfaid:conformance></rdf:Description></x:xmpmeta>"
+                )
+                .into_bytes(),
+            ));
+            if let Ok(Object::Dictionary(cat)) = doc.get_object_mut(catalog_id) {
+                cat.set("Metadata", xmp);
+            }
+        }
+        doc.trailer.set("Root", catalog_id);
+        let mut pdf = Vec::new();
+        doc.save_to(&mut pdf).unwrap();
+        (pdf, payload, stored_len)
+    }
+
+    /// The page content stream of a one-page document: (dict, stored bytes).
+    fn only_page_content(doc: &Document) -> (lopdf::Dictionary, Vec<u8>) {
+        let (_, page) = doc.get_pages().into_iter().next().unwrap();
+        let ids = doc.get_page_contents(page);
+        assert_eq!(ids.len(), 1, "/Contents must stay a single stream");
+        let s = doc.get_object(ids[0]).unwrap().as_stream().unwrap();
+        (s.dict.clone(), s.content.clone())
+    }
+
+    /// Stored bytes of the first stream of `doc` whose `/Subtype` is `subtype`.
+    fn stored_of_subtype(doc: &Document, subtype: &[u8]) -> Vec<u8> {
+        doc.objects
+            .values()
+            .filter_map(|o| o.as_stream().ok())
+            .find(|s| matches!(s.dict.get(b"Subtype"), Ok(Object::Name(n)) if n == subtype))
+            .unwrap()
+            .content
+            .clone()
+    }
+
+    /// The options of every opt-in except `--strip-metadata` (which removes
+    /// the claim): the "all options, label kept" lane.
+    fn all_options_label_kept() -> OptimizeOptions {
+        OptimizeOptions::default()
+            .with_strip_accessibility(true)
+            .with_strip_private_data(true)
+            .with_convert_type1(true)
+            .with_strip_hinting(true)
+            .with_recompress_bitonal_images(true)
+            .with_allow_lossy_reencode(true)
+            .with_collapse_gray_images(true)
+            .with_flatten_forms(true)
+    }
+
+    /// Under a PDF/A-`part` claim the page content stream is re-deflated —
+    /// smaller stored bytes, the same decoded bytes (so not minified), same
+    /// `/Filter`, no `/DecodeParms` — while every other stream (the image,
+    /// the Form XObject) keeps its stored bytes and the label survives.
+    /// Idempotent.
+    fn assert_pdfa_content_redeflated(part: u8) {
+        let (pdf, payload, stored_len) = build_pdfa_content_fixture(part);
+        let input = Document::load_mem(&pdf).unwrap();
+        let image_bytes = stored_of_subtype(&input, b"Image");
+        let form_bytes = stored_of_subtype(&input, b"Form");
+        let xmp_in = {
+            let id = input.catalog().unwrap().get(b"Metadata").unwrap();
+            let s = input.get_object(id.as_reference().unwrap()).unwrap();
+            s.as_stream().unwrap().content.clone()
+        };
+        for opts in [OptimizeOptions::default(), all_options_label_kept()] {
+            let out = optimize_with_options(&pdf, opts);
+            assert!(out.len() < pdf.len(), "{} -> {}", pdf.len(), out.len());
+            let doc = Document::load_mem(&out).unwrap();
+            let (dict, stored) = only_page_content(&doc);
+            assert!(
+                stored.len() < stored_len,
+                "PDF/A-{part}: the content stream must be re-deflated: {stored_len} -> {}",
+                stored.len()
+            );
+            assert_eq!(
+                inflate_capped(&stored, payload.len()).unwrap(),
+                payload,
+                "PDF/A-{part}: decoded content must be byte-identical (never minified)"
+            );
+            assert_eq!(
+                dict.get(b"Filter").unwrap(),
+                &Object::Name(b"FlateDecode".to_vec())
+            );
+            assert!(dict.get(b"DecodeParms").is_err());
+            // The surviving image of the merged pair keeps its level-0
+            // bytes: the claim still declines every other stream.
+            let images: Vec<&Stream> = doc
+                .objects
+                .values()
+                .filter_map(|o| o.as_stream().ok())
+                .filter(|s| matches!(s.dict.get(b"Subtype"), Ok(Object::Name(n)) if n == b"Image"))
+                .collect();
+            assert_eq!(images.len(), 1, "the identical pair must merge");
+            assert_eq!(images[0].content, image_bytes);
+            assert_eq!(stored_of_subtype(&doc, b"Form"), form_bytes);
+            // The label survives; under PDF/A-1 the XMP stays unfiltered and
+            // the file keeps a classic cross-reference table.
+            let meta = doc.catalog().unwrap().get(b"Metadata").unwrap();
+            let meta = doc.get_object(meta.as_reference().unwrap()).unwrap();
+            let meta = meta.as_stream().unwrap();
+            if part == 1 {
+                assert_eq!(meta.content, xmp_in);
+                assert!(meta.dict.get(b"Filter").is_err());
+                assert!(!contains_subslice(&out, b"/XRef"));
+                assert!(!contains_subslice(&out, b"/ObjStm"));
+            } else {
+                let xmp = meta
+                    .decompressed_content()
+                    .unwrap_or_else(|_| meta.content.clone());
+                assert_eq!(xmp, xmp_in);
+            }
+            assert_eq!(
+                optimize_with_options(&out, opts),
+                out,
+                "PDF/A-{part}: a second pass must be byte-identical"
+            );
+        }
+    }
+
+    #[test]
+    fn pdfa1_page_content_is_redeflated_losslessly() {
+        assert_pdfa_content_redeflated(1);
+    }
+
+    #[test]
+    fn pdfa2_page_content_is_redeflated_losslessly() {
+        assert_pdfa_content_redeflated(2);
+    }
+
+    /// Control for the two tests above: without a claim the same fixture's
+    /// image and Form XObject ARE rewritten (and the page content minified),
+    /// so their unchanged bytes under a claim are the PDF/A gates at work,
+    /// not a fixture nothing would touch.
+    #[test]
+    fn pdfa_content_fixture_without_a_claim_rewrites_every_stream() {
+        let (pdf, payload, stored_len) = build_pdfa_content_fixture(0);
+        let input = Document::load_mem(&pdf).unwrap();
+        for opts in [OptimizeOptions::default(), all_options_label_kept()] {
+            let out = optimize_with_options(&pdf, opts);
+            let doc = Document::load_mem(&out).unwrap();
+            assert_ne!(
+                stored_of_subtype(&doc, b"Image"),
+                stored_of_subtype(&input, b"Image")
+            );
+            assert_ne!(
+                stored_of_subtype(&doc, b"Form"),
+                stored_of_subtype(&input, b"Form")
+            );
+            let (_, stored) = only_page_content(&doc);
+            assert!(stored.len() < stored_len);
+            assert_ne!(
+                inflate_capped(&stored, payload.len()).unwrap(),
+                payload,
+                "without a claim the minifier runs"
+            );
+        }
     }
 
     #[test]
