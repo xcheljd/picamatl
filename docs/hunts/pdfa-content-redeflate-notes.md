@@ -127,3 +127,50 @@ PDF/A files and is listed for the owner's decision with these numbers.
 
 Scripts (pica-builder `workspace/reports/pdfac/`): `run-lanes.sh`,
 `vera-run.sh`, `vera-summary.py`, `minify-census.py`, `string-diff.py`.
+
+## Results: the shipped change (A), committed binary
+
+Commit `7748746` (code + tests; `c1f9d9b` adds only docs), reference binary
+`workspace/bin/picamatl-pdfac-c1f9d9b`. Its outputs are byte-identical to
+the measurement build A on all 96 runs below.
+
+32-file accuracy set (`workspace/acc-files.txt`), main `7636820` vs this
+branch, three lanes (all 96 runs exit 0):
+
+- defaults: 28 files byte-identical; usgs-pp150 -125,823 B, usgs-bul1100
+  -23,794 B, usgs-pp250 -14,314 B, usgs-bul1000 -4,670 B. nbs-circ539v1 is
+  a passthrough on both. Total 96,140,482 B -> 95,971,881 B (-168,601 B).
+- all options, label kept: 27 files byte-identical; the same four plus
+  nbs-circ539v1 -11,525 B. Total 86,672,826 B -> 86,492,700 B (-180,126 B).
+- kitchen (all options with `--strip-metadata`, claim removed): all 32
+  byte-identical, 85,364,280 B.
+
+No output is larger than main's or than its input; a second pass of the
+branch binary over each of its 96 outputs is byte-identical.
+
+Changed outputs (9: four in defaults, five in all options), each against
+main's output of the same lane:
+
+- decoded page content: every page's `/Contents` shape and every stream's
+  decoded bytes identical (pikepdf);
+- renders: every page identical at 100 and 300 dpi (pdftoppm, sha256 per
+  page); against the ORIGINAL at 100 dpi the branch differs on exactly the
+  pages main does (bul1100 4, pp150 23, the rest 0);
+- `pdftotext` identical; Ghostscript `nullpage` exit 0 with no messages.
+
+Positive control: the bul1000 output with a 20 pt black square appended to
+page 3's content is flagged on page 3 only, in the decoded content and at
+both resolutions.
+
+Stale trailer keys (`workspace/scripts/stale.py`): all 96 outputs clean.
+
+veraPDF on the committed binary's outputs, flavour as claimed:
+
+- usgs-bul1000 1b: original pass, main pass, branch pass (defaults and all)
+- usgs-bul1100 1b: original pass, main pass, branch pass (defaults and all)
+- usgs-pp150 1b: original pass, main pass, branch pass (defaults and all)
+- usgs-pp250 2b: original pass, main pass, branch pass (defaults and all)
+- nbs-circ539v1 2b: original pass, main pass, branch pass (defaults and all)
+
+PDF/A-1b: 129 rules passed, 0 failed; PDF/A-2b: 144 passed, 0 failed, on
+every file in every column.
