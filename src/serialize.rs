@@ -106,8 +106,11 @@ pub(crate) fn save_document(
 ///
 /// lopdf raises the header to 1.5 on its own when it writes a stream xref,
 /// but by plain string comparison; doing it here first keeps every rule in
-/// one place. A version string that is not `<digits>.<digits>` is left as
-/// it is: there is no number to compare, so nothing can be shown too low.
+/// one place. (That string comparison still runs after this, so a
+/// non-standard two-digit minor such as `1.10` comes out as `1.5` on an
+/// xref-stream save, as it did before.) A version string that is not
+/// `<digits>.<digits>` is left as it is: there is no number to compare, so
+/// nothing can be shown too low.
 /// A PDF/A-1 document (classic table, no object streams) can reach at most
 /// 1.4 here unless the input already carried a PDF 1.5+ feature PDF/A-1
 /// forbids.
