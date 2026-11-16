@@ -174,3 +174,28 @@ veraPDF on the committed binary's outputs, flavour as claimed:
 
 PDF/A-1b: 129 rules passed, 0 failed; PDF/A-2b: 144 passed, 0 failed, on
 every file in every column.
+
+## Fuzzing
+
+`cargo +nightly fuzz build -O` (exit 0). Seeds: every `optimize`,
+`optimize_all` and `optimize_nopack` seed was timed through the release CLI
+(best of 3); 36 `optimize` seeds at 100 ms or more were moved to
+`corpus/optimize.slow/` (none deleted), none in the other two. Twenty new
+PDF/A-labelled seeds went into `optimize` and `optimize_nopack` (2.6 to
+5.5 ms each): PDF/A-1 and PDF/A-2 claims on two small form fixtures with
+their page content stored at zlib level 0, and synthetic 1-3 page files
+shaped like the unit-test fixture (content at level 0, one page in two as
+a 2-element `/Contents` array, a pair of identical images). Each one comes
+out smaller from this branch than from main.
+
+`MINUTES=10 ./campaign.sh`: optimize 188 runs, optimize_all 360,
+optimize_nopack 21,297, ccitt 30,746; 0 oom/timeout/crash, no findings.
+It exited 1 because this worktree had no corpus dirs for the nine small
+targets (DID NOT RUN). Those nine then ran 10 minutes with the campaign's
+flags from empty corpora: jpeghuff, type1, cff, cff_font, truetype,
+deflate, content, lzw and jbig2, 205,628 to 55,680,280 runs each, no
+findings. The pipeline targets get few runs in the campaign because the
+sanitizer's first pass over 2,000+ seeds takes most of the 10 minutes, so
+a focused 10-minute pass followed with 100 seeds per target (the 10 new
+ones plus 90 random PDF/A-labelled corpus seeds): optimize 87,720 runs,
+optimize_nopack 30,947, no findings.
