@@ -162,8 +162,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `with_jbig2_bitonal_images(false)`) keeps CCITT for readers without JBIG2
   support. Encrypted documents are declined, existing JBIG2 images are
   never touched, and a pre-1.4 header is raised to 1.4. Documents claiming
-  PDF/A are re-stored too (every other PDF/A-gated pass still declines
-  them): PDF/A-1 and PDF/A-2 both allow JBIG2Decode, and the veraPDF
+  PDF/A are re-stored too (of the other PDF/A-gated passes, only the
+  page-content re-deflate below runs on them): PDF/A-1 and PDF/A-2 both
+  allow JBIG2Decode, and the veraPDF
   validator finds no new failed rule on the rewritten PDF/A scans; on
   usgs-bul1000 (PDF/A-1b) that is a further 1,001,008 B (23.7% of its
   default output). Before that exemption, over the 17-file corpus and 15
@@ -190,6 +191,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   PDF/A-1b profile; adobe-spec (four masks) by 61,613 B. Every other file's
   output is byte-identical. Byte-aligned `/K >= 0` (G3) streams are still
   skipped; none occur in those files.
+- **Page content in PDF/A files is re-deflated.** The final re-deflate
+  skipped every stream of a file claiming PDF/A. It now re-deflates the
+  page content streams of such a file (the streams a page names in
+  `/Contents`) at the configured level, keeping a new payload only when it
+  is strictly smaller and inflates back to the same bytes. The decoded
+  content, `/Filter` and `/DecodeParms` do not change, and every PDF/A part
+  allows Flate. Every other stream of a PDF/A file keeps its stored bytes,
+  and the content minifier still skips these files, because re-spelling a
+  real such as `1.0` as the integer `1` could push a PDF/A-2 value past the
+  integer limit. The five PDF/A scans still pass veraPDF (PDF/A-1b or
+  PDF/A-2b, as each claims). Over the 17-file corpus and 15 scans, default
+  outputs shrink by 168,601 B: usgs-pp150 by 125,823 B (0.7%), usgs-bul1100
+  by 23,794 B (0.5%), usgs-pp250 by 14,314 B and usgs-bul1000 by 4,670 B
+  (0.1% each). nbs-circ539v1 is still returned unchanged on defaults: a
+  re-deflate alone never makes picamatl rewrite a file. With every option
+  except `--strip-metadata` it shrinks by a further 11,525 B (180,126 B in
+  total). Every other file's output is byte-identical, and with
+  `--strip-metadata`, which removes the claim, nothing changes.
 - **Flate images get the best PNG row filter.** In a file picamatl
   rewrites, every 8-bit `/FlateDecode` image and soft mask is decoded to its
   samples and stored again under plain rows or the best of the four uniform

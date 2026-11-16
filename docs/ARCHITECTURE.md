@@ -92,9 +92,10 @@ Executed in this order; each pass reports whether it did work.
   JBIG2 sources are CCITT images — plus Flate 1-bit images only when G4 is
   also on, because a G4 output is a CCITT source on the next run (the
   idempotence reason; the G4-vs-JBIG2 tie-break charges G4 its 80 B parms
-  overhead on both runs). Declined on encrypted documents. It is the one
-  re-encoding pass that runs on PDF/A claims (it ignores `pdfa`; every
-  other `pdfa`-gated pass still declines): the samples are identical, and
+  overhead on both runs). Declined on encrypted documents. It is one of
+  the two re-encoding passes that run on PDF/A claims (it ignores `pdfa`;
+  the other is the page-content re-deflate in Phase D, and every other
+  `pdfa`-gated pass still declines): the samples are identical, and
   veraPDF finds no new failed rule on the PDF/A-1b and PDF/A-2b scans it
   rewrites (docs/hunts/pdfa-jbig2-notes.md). Existing `/JBIG2Decode`
   images are never touched. The JBIG2 it writes (PDF 1.4) is covered by
@@ -130,7 +131,14 @@ Executed in this order; each pass reports whether it did work.
   work, like the re-deflate.
 - `redeflate_flate_streams` — re-deflate every Flate stream at max level via
   zlib-rs (or zopfli backend), strictly-smaller-guarded (skips the images the
-  row-filter pass just wrote).
+  row-filter pass just wrote). Under `pdfa` it re-deflates page content
+  streams only (every stream a page names in `/Contents`): the decoded bytes,
+  `/Filter` and `/DecodeParms` are unchanged and every PDF/A part allows
+  Flate, so veraPDF raises nothing new on the five PDF/A scans
+  (docs/hunts/pdfa-content-redeflate-notes.md). Form XObjects, the catalog
+  XMP and every other stream of a PDF/A file keep their stored bytes, and the
+  content minifier still declines (its `1.0` -> `1` re-spelling could push a
+  PDF/A-2 real past the integer limit).
 - `reoptimize_jpeg_streams` — rebuild Huffman tables on untouched JPEGs
   (jpegtran-equivalent), strictly lossless, verified by decode-back.
 - `pack_object_streams` (default ON) → puts a PDF 1.5 floor on output;
@@ -156,7 +164,10 @@ Everything from `pack_object_streams` down is `save_document` in
 
 **PDF/A decisions (both made once, on the input, at the top of
 `try_optimize`).** `pdfa` (`fonts::pdfa_declined`): any PDF/A claim the
-output will carry makes every structural and re-encoding pass decline.
+output will carry makes every structural and re-encoding pass decline, with
+two lossless exemptions: the JBIG2 re-store (ignores `pdfa`) and the final
+re-deflate, which under `pdfa` still re-deflates page content streams and
+nothing else.
 `pdfa1` (`fonts::pdfa1_kept`): the catalog XMP claims `pdfaid:part` = 1
 (element or attribute spelling, any prefix bound to the PDF/A id
 namespace) and `--strip-metadata` is off. It changes two things and
