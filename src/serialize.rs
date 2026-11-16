@@ -36,12 +36,19 @@ pub(crate) fn save_document(
     literals: &reals::RealLiterals,
     pdfa1: bool,
 ) -> Result<Vec<u8>, lopdf::Error> {
-    let out = if options.pack_object_streams && !pdfa1 {
+    let packed = options.pack_object_streams && !pdfa1;
+    if pdfa1 {
+        doc.reference_table.cross_reference_type = XrefType::CrossReferenceTable;
+    }
+    let xref_stream = packed
+        || matches!(
+            doc.reference_table.cross_reference_type,
+            XrefType::CrossReferenceStream
+        );
+    raise_header_to_feature_floor(doc, xref_stream);
+    let out = if packed {
         pack_and_save(doc)?
     } else {
-        if pdfa1 {
-            doc.reference_table.cross_reference_type = XrefType::CrossReferenceTable;
-        }
         if matches!(
             doc.reference_table.cross_reference_type,
             XrefType::CrossReferenceTable
@@ -71,6 +78,131 @@ pub(crate) fn save_document(
     // decline any xref stream that already carries a `/Filter`, so neither may
     // ever see the compressed or predicted form.
     Ok(compress_xref_stream(out, options.deflate_backend))
+}
+
+/// Raise `doc.version` (the `%PDF-x.y` header lopdf writes) to the lowest
+/// version that covers every feature the document about to be written uses.
+/// The one place picamatl sets the header; it never lowers it and never
+/// touches the catalog `/Version`.
+///
+/// Derived from what is in the output, not from which pass ran: it reads
+/// the objects the writer is about to emit, plus the cross-reference form
+/// the chosen save path writes (`xref_stream`: the packed path always, the
+/// classic path when the kept form is a stream). Minimum versions, from the
+/// "(PDF 1.x)" annotations of ISO 32000-1:2008:
+///
+/// - `/FlateDecode` 1.2, `/JBIG2Decode` 1.4, `/JPXDecode` 1.5, `/Crypt` 1.5
+///   (Table 6; the other standard filters carry no annotation, so 1.0).
+/// - `/FontFile2` 1.1 and `/FontFile3` 1.2 (Table 122); a `/FontFile3`
+///   program's `/Subtype` `/Type1C` 1.2, `/CIDFontType0C` 1.3, `/OpenType`
+///   1.6 (Tables 126 and 127).
+/// - Object streams (7.5.7) and cross-reference streams (7.5.8) 1.5.
+///
+/// The set is the encoding-level features picamatl writes (Flate, JBIG2,
+/// Type1C, object and xref streams) plus their siblings of the same kind.
+/// Document-level features an input can carry under too old a header
+/// (a catalog `/Metadata` stream, 1.4, under `%PDF-1.3`) are not counted:
+/// picamatl never adds one.
+///
+/// lopdf raises the header to 1.5 on its own when it writes a stream xref,
+/// but by plain string comparison; doing it here first keeps every rule in
+/// one place. A version string that is not `<digits>.<digits>` is left as
+/// it is: there is no number to compare, so nothing can be shown too low.
+/// A PDF/A-1 document (classic table, no object streams) can reach at most
+/// 1.4 here unless the input already carried a PDF 1.5+ feature PDF/A-1
+/// forbids.
+fn raise_header_to_feature_floor(doc: &mut Document, xref_stream: bool) {
+    let Some(declared) = parse_version(&doc.version) else {
+        return;
+    };
+    let floor = feature_floor(doc, xref_stream);
+    if floor > declared {
+        doc.version = format!("{}.{}", floor.0, floor.1);
+    }
+}
+
+/// `"<major>.<minor>"` as numbers; `None` for anything else.
+fn parse_version(v: &str) -> Option<(u32, u32)> {
+    let (major, minor) = v.split_once('.')?;
+    let num = |s: &str| {
+        if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+            None
+        } else {
+            s.parse::<u32>().ok()
+        }
+    };
+    Some((num(major)?, num(minor)?))
+}
+
+/// The highest minimum version among the features `doc` uses (see
+/// [`raise_header_to_feature_floor`]); `(1, 0)` when it uses none.
+///
+/// One pass over the top-level objects, skipping the three kinds the writer
+/// regenerates or drops (`/ObjStm`, `/XRef`, `/Linearized`, lopdf's
+/// `is_regenerated_on_save`), so a feature only the input's own layout had
+/// is not counted. Font descriptors are indirect objects (Tables 111, 112
+/// and 117 require an indirect `/FontDescriptor`), so their keys are read at
+/// the top level; a filter given as an indirect reference is followed once.
+fn feature_floor(doc: &Document, xref_stream: bool) -> (u32, u32) {
+    let mut floor = (1, 0);
+    if xref_stream {
+        floor = (1, 5);
+    }
+    let filter_version = |name: &[u8]| match name {
+        b"FlateDecode" | b"Fl" => (1, 2),
+        b"JBIG2Decode" => (1, 4),
+        b"JPXDecode" | b"Crypt" => (1, 5),
+        _ => (1, 0),
+    };
+    fn resolve<'a>(doc: &'a Document, o: &'a Object) -> &'a Object {
+        match o {
+            Object::Reference(id) => doc.get_object(*id).unwrap_or(o),
+            _ => o,
+        }
+    }
+    for object in doc.objects.values() {
+        let dict = match object {
+            Object::Stream(stream) => &stream.dict,
+            Object::Dictionary(dict) => dict,
+            _ => continue,
+        };
+        if matches!(dict.get(b"Type"), Ok(Object::Name(n))
+            if n == b"ObjStm" || n == b"XRef" || n == b"Linearized")
+        {
+            continue;
+        }
+        if dict.get(b"FontFile2").is_ok() {
+            floor = floor.max((1, 1));
+        }
+        if dict.get(b"FontFile3").is_ok() {
+            floor = floor.max((1, 2));
+        }
+        let Object::Stream(stream) = object else {
+            continue;
+        };
+        if let Ok(filter) = stream.dict.get(b"Filter") {
+            match resolve(doc, filter) {
+                Object::Name(name) => floor = floor.max(filter_version(name)),
+                Object::Array(names) => {
+                    for name in names {
+                        if let Object::Name(name) = resolve(doc, name) {
+                            floor = floor.max(filter_version(name));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let Ok(Object::Name(subtype)) = stream.dict.get(b"Subtype") {
+            floor = floor.max(match subtype.as_slice() {
+                b"Type1C" => (1, 2),
+                b"CIDFontType0C" => (1, 3),
+                b"OpenType" => (1, 6),
+                _ => (1, 0),
+            });
+        }
+    }
+    floor
 }
 
 /// Drop the keys only a cross-reference STREAM dictionary has (`/Type /XRef`,
@@ -1374,5 +1506,365 @@ mod pdfa1_tests {
         let out2 = optimize(&pdf2);
         assert!(out2.len() < pdf2.len(), "{} -> {}", pdf2.len(), out2.len());
         assert_packed_layout(&out2, "PDF/A-2 control");
+    }
+}
+
+/// The `%PDF-x.y` header covers every feature the output uses
+/// (`raise_header_to_feature_floor`), never goes down, and a file that
+/// cannot be made smaller still comes back byte for byte, header included.
+#[cfg(test)]
+mod header_version_tests {
+    use lopdf::xref::XrefType;
+    use lopdf::{dictionary, Document, Object, Stream};
+
+    use super::{feature_floor, find_sub, parse_version, raise_header_to_feature_floor};
+    use crate::deflate::deflate_level9;
+    use crate::{optimize_with_options, try_optimize, OptimizeOptions};
+
+    fn no_pack() -> OptimizeOptions {
+        OptimizeOptions::default().with_pack_object_streams(false)
+    }
+
+    /// A one-page document saved with a classic xref table under header
+    /// `version`, using no versioned feature: its content stream is
+    /// unfiltered and highly compressible, so the rewrite deflates it
+    /// (`/FlateDecode`, PDF 1.2). Two identical unfiltered images are the
+    /// real work that makes picamatl rewrite the file at all (deflating
+    /// alone is a serialization detail, not work).
+    fn unfiltered_content_pdf(version: &str) -> Vec<u8> {
+        let mut doc = Document::with_version(version);
+        doc.reference_table.cross_reference_type = XrefType::CrossReferenceTable;
+        let content = doc.add_object(Stream::new(
+            dictionary! {},
+            b"0 0 m 100 100 l S\n".repeat(400),
+        ));
+        let image = || {
+            Stream::new(
+                dictionary! {
+                    "Type" => "XObject", "Subtype" => "Image", "Width" => 4,
+                    "Height" => 4, "ColorSpace" => "DeviceGray",
+                    "BitsPerComponent" => 8,
+                },
+                (0u8..16).collect(),
+            )
+        };
+        let im1 = doc.add_object(image());
+        let im2 = doc.add_object(image());
+        let pages_id = doc.new_object_id();
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "Contents" => content,
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Resources" => dictionary! {
+                "XObject" => dictionary! { "Im1" => im1, "Im2" => im2 },
+            },
+        });
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages", "Kids" => vec![page_id.into()], "Count" => 1,
+            }),
+        );
+        let catalog_id = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+        doc.trailer.set("Root", catalog_id);
+        let mut pdf = Vec::new();
+        doc.save_to(&mut pdf).unwrap();
+        assert!(pdf.starts_with(format!("%PDF-{version}\n").as_bytes()));
+        pdf
+    }
+
+    #[test]
+    fn flate_under_a_pre_1_2_header_raises_it_to_1_2() {
+        for version in ["1.0", "1.1"] {
+            let pdf = unfiltered_content_pdf(version);
+            let out = optimize_with_options(&pdf, no_pack());
+            assert!(out.len() < pdf.len(), "{version}: must be a real rewrite");
+            assert!(
+                find_sub(&out, b"/FlateDecode", 0).is_some(),
+                "{version}: the content stream is deflated"
+            );
+            assert!(
+                out.starts_with(b"%PDF-1.2\n"),
+                "{version}: /FlateDecode is PDF 1.2, header was {:?}",
+                String::from_utf8_lossy(&out[..8])
+            );
+            // Catalog /Version untouched (none in, none out).
+            let doc = Document::load_mem(&out).unwrap();
+            assert!(doc.catalog().unwrap().get(b"Version").is_err());
+            assert_eq!(optimize_with_options(&out, no_pack()), out, "second pass");
+            // Packing writes object and xref streams: 1.5.
+            let packed = optimize_with_options(&pdf, OptimizeOptions::default());
+            assert!(packed.starts_with(b"%PDF-1.5\n"), "{version}: packed");
+        }
+    }
+
+    #[test]
+    fn a_header_that_already_covers_the_output_is_kept() {
+        for version in ["1.2", "1.3", "1.4", "1.7", "2.0"] {
+            let pdf = unfiltered_content_pdf(version);
+            let out = optimize_with_options(&pdf, no_pack());
+            assert!(out.len() < pdf.len(), "{version}: must be a real rewrite");
+            assert!(
+                out.starts_with(format!("%PDF-{version}\n").as_bytes()),
+                "{version}: never lowered, never raised past what is used"
+            );
+        }
+        // 1.7 and 2.0 already cover the packed layout's 1.5.
+        for version in ["1.7", "2.0"] {
+            let pdf = unfiltered_content_pdf(version);
+            let out = optimize_with_options(&pdf, OptimizeOptions::default());
+            assert!(out.starts_with(format!("%PDF-{version}\n").as_bytes()));
+        }
+    }
+
+    /// A compact classic-table document under header `version`, written with
+    /// less framing than lopdf writes (`N 0 obj<<...>>endobj`), whose only
+    /// work is merging two identical small Flate images (so the input itself
+    /// already carries `/FlateDecode`). 400 filler objects make the classic
+    /// rewrite's extra framing outweigh the merge.
+    fn compact_flate_pdf(version: &str) -> Vec<u8> {
+        let mut bodies: Vec<Vec<u8>> = Vec::new();
+        let add = |bodies: &mut Vec<Vec<u8>>, obj: Object| {
+            let mut body = Vec::new();
+            lopdf::Writer::write_object(&mut body, &obj).unwrap();
+            bodies.push(body);
+            bodies.len() as u32
+        };
+        let image = || {
+            Object::Stream(Stream::new(
+                dictionary! {
+                    "Type" => "XObject", "Subtype" => "Image", "Width" => 4,
+                    "Height" => 4, "ColorSpace" => "DeviceGray",
+                    "BitsPerComponent" => 8, "Filter" => "FlateDecode",
+                },
+                deflate_level9(&(0u8..16).collect::<Vec<u8>>()).unwrap(),
+            ))
+        };
+        let im1 = add(&mut bodies, image());
+        let im2 = add(&mut bodies, image());
+        let fillers: Vec<Object> = (0..400)
+            .map(|i| Object::Reference((add(&mut bodies, dictionary! { "F" => i }.into()), 0)))
+            .collect();
+        let page = bodies.len() as u32 + 1;
+        let pages = page + 1;
+        add(
+            &mut bodies,
+            dictionary! {
+                "Type" => "Page", "Parent" => (pages, 0),
+                "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+                "Resources" => dictionary! {
+                    "XObject" => dictionary! { "Im1" => (im1, 0), "Im2" => (im2, 0) },
+                },
+            }
+            .into(),
+        );
+        add(
+            &mut bodies,
+            dictionary! {
+                "Type" => "Pages", "Kids" => vec![Object::Reference((page, 0))], "Count" => 1,
+            }
+            .into(),
+        );
+        let catalog = add(
+            &mut bodies,
+            dictionary! { "Type" => "Catalog", "Pages" => (pages, 0), "Fillers" => fillers }.into(),
+        );
+        let mut pdf = format!("%PDF-{version}\n").into_bytes();
+        pdf.extend_from_slice(b"%\xe2\xe3\xcf\xd3\n");
+        let mut offsets = Vec::new();
+        for (i, body) in bodies.iter().enumerate() {
+            offsets.push(pdf.len());
+            pdf.extend_from_slice(format!("{} 0 obj", i + 1).as_bytes());
+            pdf.extend_from_slice(body);
+            pdf.extend_from_slice(b"endobj\n");
+        }
+        let xref_at = pdf.len();
+        pdf.extend_from_slice(
+            format!("xref\n0 {}\n0000000000 65535 f \n", bodies.len() + 1).as_bytes(),
+        );
+        for off in offsets {
+            pdf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+        }
+        pdf.extend_from_slice(
+            format!(
+                "trailer\n<</Root {catalog} 0 R/Size {}>>\nstartxref\n{xref_at}\n%%EOF",
+                bodies.len() + 1
+            )
+            .as_bytes(),
+        );
+        pdf
+    }
+
+    #[test]
+    fn a_file_that_cannot_shrink_keeps_its_old_header() {
+        let pdf = compact_flate_pdf("1.1");
+        Document::load_mem(&pdf).expect("fixture must load");
+        let (rewrite, _) = try_optimize(&pdf, no_pack()).unwrap();
+        let rewrite = rewrite.expect("the image merge is real work");
+        // The rewrite declares what it uses ...
+        assert!(rewrite.starts_with(b"%PDF-1.2\n"), "rewrite header raised");
+        assert!(
+            rewrite.len() >= pdf.len(),
+            "fixture must make the rewrite grow: {} -> {}",
+            pdf.len(),
+            rewrite.len()
+        );
+        // ... but it is not kept, so the input comes back untouched.
+        assert_eq!(optimize_with_options(&pdf, no_pack()), pdf);
+    }
+
+    fn stream(dict: lopdf::Dictionary) -> Object {
+        Object::Stream(Stream::new(dict, vec![0]))
+    }
+
+    #[test]
+    fn feature_floor_counts_every_versioned_feature() {
+        let cases: Vec<(&str, Vec<Object>, (u32, u32))> = vec![
+            ("nothing", vec![dictionary! { "A" => 1 }.into()], (1, 0)),
+            (
+                "unversioned filters",
+                vec![
+                    stream(dictionary! { "Filter" => "DCTDecode" }),
+                    stream(dictionary! { "Filter" => "CCITTFaxDecode" }),
+                    stream(dictionary! { "Filter" => "LZWDecode" }),
+                    stream(dictionary! { "Filter" => vec![
+                        Object::Name(b"ASCII85Decode".to_vec()),
+                        Object::Name(b"RunLengthDecode".to_vec()),
+                        Object::Name(b"ASCIIHexDecode".to_vec()),
+                    ] }),
+                ],
+                (1, 0),
+            ),
+            (
+                "FontFile2",
+                vec![dictionary! { "FontFile2" => (9, 0) }.into()],
+                (1, 1),
+            ),
+            (
+                "FontFile3",
+                vec![dictionary! { "FontFile3" => (9, 0) }.into()],
+                (1, 2),
+            ),
+            (
+                "Flate",
+                vec![stream(dictionary! { "Filter" => "FlateDecode" })],
+                (1, 2),
+            ),
+            (
+                "Flate in a filter array",
+                vec![stream(dictionary! { "Filter" => vec![
+                    Object::Name(b"ASCII85Decode".to_vec()),
+                    Object::Name(b"FlateDecode".to_vec()),
+                ] })],
+                (1, 2),
+            ),
+            (
+                "Type1C",
+                vec![stream(dictionary! { "Subtype" => "Type1C" })],
+                (1, 2),
+            ),
+            (
+                "CIDFontType0C",
+                vec![stream(dictionary! { "Subtype" => "CIDFontType0C" })],
+                (1, 3),
+            ),
+            (
+                "JBIG2",
+                vec![stream(dictionary! { "Filter" => "JBIG2Decode" })],
+                (1, 4),
+            ),
+            (
+                "JPX",
+                vec![stream(dictionary! { "Filter" => "JPXDecode" })],
+                (1, 5),
+            ),
+            (
+                "Crypt",
+                vec![stream(dictionary! { "Filter" => vec![
+                    Object::Name(b"Crypt".to_vec()),
+                ] })],
+                (1, 5),
+            ),
+            (
+                "OpenType",
+                vec![stream(dictionary! { "Subtype" => "OpenType" })],
+                (1, 6),
+            ),
+            (
+                "the highest wins",
+                vec![
+                    stream(dictionary! { "Filter" => "FlateDecode" }),
+                    stream(dictionary! { "Filter" => "JBIG2Decode" }),
+                    stream(dictionary! { "Subtype" => "Type1C" }),
+                ],
+                (1, 4),
+            ),
+            // The writer regenerates or drops these; their filters say
+            // nothing about the output.
+            (
+                "regenerated objects",
+                vec![
+                    stream(dictionary! { "Type" => "ObjStm", "Filter" => "FlateDecode" }),
+                    stream(dictionary! { "Type" => "XRef", "Filter" => "FlateDecode" }),
+                    dictionary! { "Type" => "Linearized", "FontFile3" => 1 }.into(),
+                ],
+                (1, 0),
+            ),
+            (
+                "an image subtype is not a font format",
+                vec![stream(dictionary! { "Subtype" => "Image" })],
+                (1, 0),
+            ),
+        ];
+        for (what, objects, want) in cases {
+            let mut doc = Document::with_version("1.0");
+            for o in objects {
+                doc.add_object(o);
+            }
+            assert_eq!(feature_floor(&doc, false), want, "{what}");
+            assert_eq!(
+                feature_floor(&doc, true),
+                want.max((1, 5)),
+                "{what} + xref stream"
+            );
+        }
+        // A filter given by reference is followed.
+        let mut doc = Document::with_version("1.0");
+        let name = doc.add_object(Object::Name(b"JBIG2Decode".to_vec()));
+        doc.add_object(stream(dictionary! { "Filter" => name }));
+        assert_eq!(feature_floor(&doc, false), (1, 4), "indirect filter");
+    }
+
+    #[test]
+    fn the_header_is_only_ever_raised() {
+        let with_flate = |version: &str| {
+            let mut doc = Document::with_version(version);
+            doc.add_object(stream(dictionary! { "Filter" => "FlateDecode" }));
+            doc
+        };
+        for (from, xref_stream, to) in [
+            ("1.0", false, "1.2"),
+            ("1.1", false, "1.2"),
+            ("1.2", false, "1.2"),
+            ("1.1", true, "1.5"),
+            ("1.6", true, "1.6"),
+            ("2.0", true, "2.0"),
+            // Numeric, not string, comparison: 1.10 is above 1.5.
+            ("1.10", true, "1.10"),
+            // No number to compare: left exactly as it is.
+            ("", false, ""),
+            ("1", false, "1"),
+            ("1.", false, "1."),
+            ("1.2.3", false, "1.2.3"),
+        ] {
+            let mut doc = with_flate(from);
+            raise_header_to_feature_floor(&mut doc, xref_stream);
+            assert_eq!(doc.version, to, "{from:?} xref_stream={xref_stream}");
+        }
+        assert_eq!(parse_version("1.4"), Some((1, 4)));
+        assert_eq!(parse_version("2.0"), Some((2, 0)));
+        assert_eq!(parse_version("1.x"), None);
+        assert_eq!(parse_version("+1.4"), None);
     }
 }

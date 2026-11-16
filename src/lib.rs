@@ -4591,7 +4591,6 @@ fn try_optimize(input: &[u8], options: OptimizeOptions) -> Result<OptimizeOutcom
     // Apply bitonal replacements: new payload plus its filter — G4 with
     // normalized parms, or JBIG2, which needs none. `/Width`/`/Height` are
     // untouched — neither transform resamples.
-    let mut wrote_jbig2 = false;
     for r in bitonal_plans {
         if let Ok(Object::Stream(stream)) = doc.get_object_mut(r.id) {
             stream.set_content(r.content);
@@ -4615,16 +4614,12 @@ fn try_optimize(input: &[u8], options: OptimizeOptions) -> Result<OptimizeOutcom
                         .dict
                         .set("Filter", Object::Name(b"JBIG2Decode".to_vec()));
                     stream.dict.remove(b"DecodeParms");
-                    wrote_jbig2 = true;
                 }
             }
         }
     }
-    // `/JBIG2Decode` is PDF 1.4. The object-stream save path raises the
-    // header to 1.5 on its own; the classic path writes `doc.version` as is.
-    if wrote_jbig2 && doc.version.as_str() < "1.4" {
-        doc.version = "1.4".to_string();
-    }
+    // `/JBIG2Decode` is PDF 1.4: `serialize::save_document` raises the
+    // header for it (and every other feature the output uses) at save time.
 
     // Apply JPX→JPEG conversions: raw JPEG payload, explicit /ColorSpace
     // (the JP2 box that used to supply it is gone with the old payload),
