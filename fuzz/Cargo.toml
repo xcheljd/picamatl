@@ -80,6 +80,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "optimize_nopack"
+path = "fuzz_targets/optimize_nopack.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "optimize_all"
 path = "fuzz_targets/optimize_all.rs"
 test = false
@@ -117,6 +124,13 @@ bench = false
 [[bin]]
 name = "jbig2_seeds"
 path = "tools/jbig2_seeds.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "xref_seeds"
+path = "tools/xref_seeds.rs"
 test = false
 doc = false
 bench = false

@@ -17,7 +17,7 @@ raw=$(mktemp -d)
 trap 'rm -rf "$raw"' EXIT
 cargo run --quiet --release --bin extract_seeds -- "$raw" "$@"
 
-mkdir -p corpus/optimize corpus/optimize_all corpus/cff
+mkdir -p corpus/optimize corpus/optimize_all corpus/optimize_nopack corpus/cff
 for t in truetype cff_font jpeghuff content type1 deflate; do mkdir -p "corpus/$t"; done
 for t in truetype cff_font jpeghuff content; do
     [ -d "$raw/$t" ] && cp "$raw/$t/"* "corpus/$t/"
@@ -82,5 +82,10 @@ for f in "$pages"/*.pdf; do
     [ -f "$f" ] || continue
     cp "$f" corpus/optimize/
     cp "$f" corpus/optimize_all/
+    cp "$f" corpus/optimize_nopack/
 done
+# optimize_nopack also gets tiny synthetic files in every xref layout the
+# classic save path inherits (classic table, xref stream, hybrid /XRefStm),
+# with stale trailer keys, PDF/A-1 labels and 1.0-1.7 headers.
+cargo run --quiet --release --bin xref_seeds -- corpus/optimize_nopack
 for d in corpus/*; do echo "$(basename "$d"): $(ls "$d" | wc -l) seeds"; done

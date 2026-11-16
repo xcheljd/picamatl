@@ -42,6 +42,7 @@ summary. Reproduce a finding with
 |---|---|---|
 | `optimize` | the whole pipeline, default options | never panics out; output never larger; a rewrite always loads |
 | `optimize_all` | the whole pipeline, every opt-in pass on | same |
+| `optimize_nopack` | the whole pipeline, defaults with `--no-pack-object-streams` (lopdf's classic writer on every input, not only PDF/A-1) | same, plus, read back from the rewrite: no trailer key of the input's xref section survives (`/Prev /XRefStm /F /FFilter /FDecodeParms /DL`; on a classic table also `/Type /XRef /W /Index /Filter /DecodeParms /Length`), and the `%PDF-` header covers the output's xref form and filters |
 | `jpeghuff` | lossless JPEG Huffman re-table | no panic, hang or runaway allocation |
 | `type1` | Type1 font parse + CFF conversion | same |
 | `cff` | CFF hint stripping + two-fragment merge | same |
@@ -77,6 +78,17 @@ in force), and an out-of-memory abort is the one failure picamatl's
   keeps adding new inputs to it. Pipeline targets run at ~5-10 inputs per
   second under the sanitizer; the focused targets at hundreds to tens of
   thousands. Give the pipeline targets the longest runs.
+- `optimize_nopack` is its own target rather than a mode byte on `optimize`:
+  a leading option byte would turn every existing `optimize` seed (a PDF
+  starting `%PDF`) into a different input and split that target's budget.
+  Its seeds are the same page cuts plus `tools/xref_seeds.rs` (written by
+  `seed.sh`): one-page files in a classic table, an xref stream, and a
+  hybrid table with `/XRefStm`, carrying the `/Type/XRef/W/Index` trailer a
+  Distiller classic table ships (the Adobe PDF 1.7 specification file),
+  the generic stream keys, PDF/A-1 labels, and headers 1.0 to 1.7. Real
+  small PDFs given a PDF/A-1B catalog XMP (unfiltered, classic table) are
+  worth adding by hand. Keep every pipeline seed under 100 ms in the
+  release CLI.
 - The sanitizer build is ~20x slower than release, so `campaign.sh` gives the
   whole-pipeline targets a 60 s hang limit (10 s for the rest). A `timeout-*`
   artifact that is just one of your seed PDFs, unchanged, is that slowdown,
