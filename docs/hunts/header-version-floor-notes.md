@@ -71,3 +71,51 @@ Feature presence over the 32 originals: Flate 25 files, FontFile2 12,
 ObjStm 11, xref stream 8, FontFile3 6 (Type1C 4, CIDFontType0C 2), JBIG2 4,
 JPX 2; informational: catalog /Metadata 19, StructTreeRoot 12, MarkInfo 11,
 SMask 8, transparency groups 8, OutputIntents 5, OCProperties 1.
+
+## The fix and what it changed
+
+`serialize::save_document` now calls `raise_header_to_feature_floor` before
+either save path writes anything: the header becomes the higher of the
+input's header and the floor of every filter, embedded font format and
+xref form in the objects about to be written (the list above, minus the
+informational document-level entries). The JBIG2-only raise after the
+bitonal apply is gone; the floor covers it. Headers that are not
+`<digits>.<digits>` are left as they are, and the comparison is numeric.
+
+Known leftover, shared with main (not changed here): lopdf's own 1.5 raise
+for an xref-stream save compares version STRINGS (`writer.rs`:
+`self.version.as_str() < "1.5"`), so a non-standard header such as
+`%PDF-1.10` (numerically above 1.5, string-wise below) is rewritten to
+`%PDF-1.5` on any save that writes an xref stream. Measured on a synthetic
+seed: main and the fix both turn `%PDF-1.10` into `%PDF-1.5`, packed or
+not (the seed's xref is a stream); `%PDF-1.9` is kept by both. No real PDF
+version has a two-digit minor, so this needs a hand-made header.
+
+Fixed binary vs main, same 8 lanes x 32 files (`compare.py`):
+
+- 254/256 outputs byte-identical. The other 2 are us10174323 and
+  us10522188 in `nojbig2-nopack`: `%PDF-1.1` -> `%PDF-1.2`, same size,
+  every other byte identical.
+- Lane totals unchanged: defaults 96,140,482 B, `--no-pack-object-streams`
+  113,923,150 B, for 176,457,911 B of originals.
+- Feature census on the fixed outputs: 0 under-declared by any covered
+  feature. Left: gao-077234 and gao-104000 in `nojbig2-nopack` keep
+  `%PDF-1.3` under a catalog `/Metadata` stream (PDF 1.4) the original
+  already had under the same header.
+- Second pass on its own output, same flags: 256/256 byte-identical.
+- Stale-key check (`stale.py`): 256/256 clean.
+- libqpdf `check_pdf_syntax` over def, nopack, nojbig2-nopack,
+  kitchen-nopack: 126/128 clean; the 2 are irs-1040gi in the two no-pack
+  lanes, a passthrough whose ORIGINAL carries the same warning.
+- Ghostscript nullpage over def, nopack, nojbig2-nopack: 96/96 exit 0, silent.
+- us10174323 (60 pages) and us10522188 (34 pages) in `nojbig2-nopack`:
+  every page renders identical at 100 dpi to main's output and to the
+  original; pdftotext identical to main; pdfinfo reports PDF version 1.2.
+- veraPDF on the five PDF/A files, defaults and `--no-pack-object-streams`:
+  all compliant (usgs-bul1000, usgs-bul1100, usgs-pp150 1b 129/0;
+  usgs-pp250, nbs-circ539v1 2b 144/0); those outputs are byte-identical to
+  main's.
+- Synthetic xref seeds (`fuzz/tools/xref_seeds.rs`, 24 files) with
+  `--no-pack-object-streams`: main under-declares on 12 (1.0/1.1 headers
+  carrying `/FlateDecode`, PDF/A-1-labelled ones included); the fix on 0.
+  The 6 trailer seeds from the previous card: identical outputs, clean.
