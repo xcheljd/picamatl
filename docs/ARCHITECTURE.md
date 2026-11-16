@@ -97,9 +97,9 @@ Executed in this order; each pass reports whether it did work.
   other `pdfa`-gated pass still declines): the samples are identical, and
   veraPDF finds no new failed rule on the PDF/A-1b and PDF/A-2b scans it
   rewrites (docs/hunts/pdfa-jbig2-notes.md). Existing `/JBIG2Decode`
-  images are never touched. Raises a
-  pre-1.4 header to 1.4 when it writes JBIG2 (the object-stream path's 1.5
-  floor already covers the default save). Memory: planned in
+  images are never touched. The JBIG2 it writes (PDF 1.4) is covered by
+  the header floor `serialize::save_document` sets from the whole output
+  (Phase D). Memory: planned in
   `budget_batches` of 1 GiB at 4x each image's packed sample size.
 - JPX→DCT conversion (opt-in `--allow-lossy`).
 - Gray-collapse detection (`--collapse-gray-images`).
@@ -140,6 +140,13 @@ Executed in this order; each pass reports whether it did work.
   `/Type /XRef`, `/W`, `/Index` in `save_document`), compressed xref stream
   (PNG-Up-predicted when strictly smaller; applied last, after the passes
   that rewrite raw xref rows).
+- `raise_header_to_feature_floor` — the one place the `%PDF-` header is
+  set: the higher of the input's header and the minimum version of every
+  feature in the objects about to be written (Flate 1.2, JBIG2 1.4,
+  JPX/Crypt 1.5, FontFile2 1.1, FontFile3 1.2 with Type1C 1.2 /
+  CIDFontType0C 1.3 / OpenType 1.6) and of the xref form the chosen path
+  writes (stream: 1.5). Never lowered; catalog `/Version` untouched; a
+  version that is not `<digits>.<digits>` is left alone.
 - The real-literal restoration pass (`src/reals.rs`) splices the input's own
   literals back into the saved file — f32-parsing otherwise loses precision on
   e.g. `/MediaBox [0 0 595.91998 841.91998]`.

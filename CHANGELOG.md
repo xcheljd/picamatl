@@ -44,6 +44,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   external file. No tested reader (libqpdf, Ghostscript, poppler, pypdf)
   complained about either; output with packing on (the default) is
   unchanged on the test corpus.
+- **The `%PDF-` header now covers every feature the output uses.** It was
+  raised only for object and xref streams (PDF 1.5) and for JBIG2 images
+  (PDF 1.4). With `--no-jbig2-bitonal-images --no-pack-object-streams`, two
+  PDF 1.1 patent scans came out still saying 1.1 while carrying 60 and 34
+  deflated streams (`FlateDecode` is PDF 1.2). The header is now set in one
+  place when the file is written: the higher of the input's header and the
+  minimum version of every filter, embedded font format and
+  cross-reference form in the output (ISO 32000-1 Tables 6, 122, 126 and
+  127; sections 7.5.7 and 7.5.8). It is never lowered, and the catalog
+  `/Version` is untouched. On the 32-file test set, across eight option
+  lanes, only those two outputs change, by their header digit alone (same
+  size); everything else is byte-identical.
 - **Font subsetting now tracks the text font through `q`/`Q`.** The font is
   part of the graphics state, so text shown after a `Q` is drawn in the font
   that was current at the matching `q`. The glyph walk credited it to the
