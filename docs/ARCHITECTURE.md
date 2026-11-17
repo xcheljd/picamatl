@@ -67,9 +67,10 @@ Executed in this order; each pass reports whether it did work.
   `rendered_w/h_pts` per image XObject → **effective DPI** per axis
   (`px / rendered_inches`). This is the core idea: downsample only images that
   are genuinely over-resolved *for how they are drawn*.
-- Font subsets: plan per `/FontDescriptor` (read-only). Type0/CIDFontType2
-  Identity-H/V + simple TrueType; Type1C merges. Never rewrites content-stream
-  text bytes.
+- Font subsets: plan per embedded font program, grouping every font
+  dictionary and descriptor that shares it (read-only). Type0/CIDFontType2
+  Identity-H/V + simple TrueType + Type1 → Type1C; Type1C merges. Never
+  rewrites content-stream text bytes.
 - Bitonal re-encodes (`src/bitonal.rs`): CCITT → JBIG2 generic region
   (default on; `--no-jbig2-bitonal-images` opts out) and → CCITT G4 (opt-in
   `--recompress-bitonal-images`). One planner decodes each 1-bit image with
