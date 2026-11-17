@@ -145,7 +145,7 @@ for f in files:
             if best_gs is None or s < best_gs[1]:
                 best_gs = (p, s)
     if os.path.exists(kpath) and best_gs:
-        w = "AMATL" if os.path.getsize(kpath) < best_gs[1] else "gs"
+        w = "picamatl" if os.path.getsize(kpath) < best_gs[1] else "gs"
         wins[w.lower()] += 1
         which = "gs-custom" if best_gs[0].endswith("custom/" + name + ".pdf") else "gs"
         print(f"  winner: {w} (vs best gs lane: {which})")
@@ -156,5 +156,5 @@ print("TOTALS:")
 for sub in ("lossless", "lossy", "kitchen", "gs", "gs-custom"):
     if sub in totals:
         print(f"  {sub}: {kb(totals[sub])} ({100*totals[sub]/ti:.1f}%)")
-print(f"  head-to-head (kitchen vs gs): AMATL {wins['picamatl']}, gs {wins['gs']}")
+print(f"  head-to-head (kitchen vs gs): picamatl {wins['picamatl']}, gs {wins['gs']}")
 PYEOF
