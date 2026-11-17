@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`--jbig2-bitonal-images` / `--no-jbig2-bitonal-images`** (library:
+  `OptimizeOptions::jbig2_bitonal_images`, `with_jbig2_bitonal_images`),
+  on by default: the lossless JBIG2 re-store of CCITT images described
+  under Changed. `--no-jbig2-bitonal-images` keeps CCITT images as stored.
+- A `fuzzing` Cargo feature that exposes internal decoders to the
+  in-repository cargo-fuzz harness (`fuzz/`). It is not a public API and
+  nothing outside `fuzz/` should enable it.
+
+No CLI flag or library item was removed.
+
 ### Fixed
 
 - **PDF/A-1 files stay valid PDF/A-1.** ISO 19005-1 forbids cross-reference
@@ -173,8 +185,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   by about 3.2 MB each (48%), nasa-tn-d162, gao-104000, fbi-custodial,
   naca-19930081614, us6811268 and gao-077234 by 243,672 to 1,343,318 B
   (14.5% to 41.6%). Scans take longer
-  to optimize: each image is encoded up to 14 times. The bitonal pass
-  also reads `/DecodeParms` given as a one-element array or as a reference.
+  to optimize: each image is encoded up to 14 times, though a candidate
+  stops as soon as its finished bytes show it can no longer be strictly
+  smaller than the stored stream or the best so far (same pick as the full
+  search; a 16384 × 16384 blank CCITT image went from 15.9 s to 3.0 s).
+  The bitonal pass also reads `/DecodeParms` given as a one-element array
+  or as a reference.
 - **Byte-aligned CCITT G4 images reach the JBIG2 re-store.** G4 streams
   stored with `/EncodedByteAlign true` (fill bits before every coding line)
   were skipped, because the `fax` crate's decoder cannot skip fill bits.
@@ -284,6 +300,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lopdf's `d0`/`d1` tokenizing (now correct upstream), and a forms fixture
   whose appearance stream is now built from integers so it stays in compact
   form under lopdf's new whole-number real printing.
+- **Documentation re-measured.** Every benchmark table and measured number
+  in the README was re-run on 2026-11-17 against `main` at `4e85845` with
+  Ghostscript 10.08.0 (they dated from 0.4.0). Claims the code had outgrown
+  are corrected: CCITT scans are now re-stored as lossless JBIG2 by
+  default, so the README no longer says picamatl leaves JBIG2 alone in both
+  directions, and `docs/ARCHITECTURE.md` lists exactly which passes run on
+  PDF/A-labelled files. Notes and commands: `docs/hunts/docs-refresh-notes.md`.
 
 ## [0.4.4] - 2026-09-08
 

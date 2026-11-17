@@ -93,9 +93,9 @@ Executed in this order; each pass reports whether it did work.
   also on, because a G4 output is a CCITT source on the next run (the
   idempotence reason; the G4-vs-JBIG2 tie-break charges G4 its 80 B parms
   overhead on both runs). Declined on encrypted documents. It is one of
-  the two re-encoding passes that run on PDF/A claims (it ignores `pdfa`;
-  the other is the page-content re-deflate in Phase D, and every other
-  `pdfa`-gated pass still declines): the samples are identical, and
+  the two lossless re-encodes exempt from the PDF/A decline (it ignores
+  `pdfa`; the other is the page-content re-deflate in Phase D, and every
+  other `pdfa`-gated pass still declines): the samples are identical, and
   veraPDF finds no new failed rule on the PDF/A-1b and PDF/A-2b scans it
   rewrites (docs/hunts/pdfa-jbig2-notes.md). Existing `/JBIG2Decode`
   images are never touched. The JBIG2 it writes (PDF 1.4) is covered by
@@ -105,18 +105,32 @@ Executed in this order; each pass reports whether it did work.
 - JPX→DCT conversion (opt-in `--allow-lossy`).
 - Gray-collapse detection (`--collapse-gray-images`).
 
+**The "any work at all" check:** when nothing above qualified (no image,
+font, bitonal, JPX or gray-collapse plan, no strip, dedup, minify, flatten or
+transcode), the JPEG Huffman re-table runs right here as the last question;
+if it, and the opt-in Type1C hint strip, find nothing either, the input is
+returned byte for byte. The serialization passes in Phase D never count as
+work.
+
 **Phase C — apply:**
 - Each `Replacement` applied; every candidate that fails strictly-smaller is
   skipped (per-stream guard). Then the bitonal, JPX and legacy-filter image
-  plans.
-- Fonts applied; strips (accessibility / metadata / private-data / hinting)
-  applied; then `dedup_objects` + `dedup_streams` again (the dedup passes are
+  plans, then the gray collapse (planned now, against the post-replacement
+  pixels).
+- Fonts applied (subsets, Type1C merges, then the opt-in Type1C hint
+  strip); strips (accessibility / metadata / private-data) applied; then
+  `dedup_objects` + `dedup_streams` to a fixpoint (the dedup passes are
   mutually-interfering, so they run both sides of the apply phase).
 
 **Phase D — prune & serialize:**
 - `doc.prune_objects()` — drop now-orphaned objects (struct elems, stripped
   metadata/private-data, unused font programs).
+- PDF/A-1 only: the catalog `/Metadata` stream is exempted from the next
+  step (see the PDF/A decisions below).
 - `doc.compress()` — lopdf's stream compression.
+- `reoptimize_jpeg_streams` — rebuild Huffman tables on JPEGs
+  (jpegtran-equivalent), strictly lossless, verified by decode-back. Skipped
+  here when the "any work" check already ran it.
 - `refilter_flate_images` — lossless row-filter choice for 8-bit Flate image
   XObjects and soft masks: decode to samples, re-encode under plain rows or
   the best uniform PNG filter (None/Sub/Up/Avg/Paeth, predictor charged
@@ -139,15 +153,11 @@ Executed in this order; each pass reports whether it did work.
   XMP and every other stream of a PDF/A file keep their stored bytes, and the
   content minifier still declines (its `1.0` -> `1` re-spelling could push a
   PDF/A-2 real past the integer limit).
-- `reoptimize_jpeg_streams` — rebuild Huffman tables on untouched JPEGs
-  (jpegtran-equivalent), strictly lossless, verified by decode-back.
-- `pack_object_streams` (default ON) → puts a PDF 1.5 floor on output;
-  opt out for pre-Acrobat-6 readers. Overridden for PDF/A-1 (below).
-- `renumber_objects`, `strip_stale_xref_trailer_keys` (the input's xref keys
-  and the generic stream keys, every path; a classic trailer also drops
-  `/Type /XRef`, `/W`, `/Index` in `save_document`), compressed xref stream
-  (PNG-Up-predicted when strictly smaller; applied last, after the passes
-  that rewrite raw xref rows).
+- `renumber_objects`, then `strip_stale_xref_trailer_keys` (the input's xref
+  keys and the generic stream keys, every path).
+
+Then `save_document` in `src/serialize.rs`, the single exit every optimized
+document takes, in this order:
 - `raise_header_to_feature_floor` — the one place the `%PDF-` header is
   set: the higher of the input's header and the minimum version of every
   feature in the objects about to be written (Flate 1.2, JBIG2 1.4,
@@ -155,19 +165,30 @@ Executed in this order; each pass reports whether it did work.
   CIDFontType0C 1.3 / OpenType 1.6) and of the xref form the chosen path
   writes (stream: 1.5). Never lowered; catalog `/Version` untouched; a
   version that is not `<digits>.<digits>` is left alone.
+- `pack_object_streams` (default ON) → object streams behind an xref
+  stream, a PDF 1.5 floor on output; opt out for pre-Acrobat-6 readers.
+  Overridden for PDF/A-1 (below). Otherwise lopdf's plain writer, which
+  keeps the input's xref form; a classic table's trailer also drops
+  `/Type /XRef`, `/W`, `/Index`.
 - The real-literal restoration pass (`src/reals.rs`) splices the input's own
   literals back into the saved file — f32-parsing otherwise loses precision on
   e.g. `/MediaBox [0 0 595.91998 841.91998]`.
-
-Everything from `pack_object_streams` down is `save_document` in
-`src/serialize.rs`, the single exit every optimized document takes.
+- Under `--deflate-backend zopfli`, every `ObjStm` is re-deflated with
+  zopfli.
+- Compressed xref stream (PNG-Up-predicted when strictly smaller), applied
+  last, after the passes that rewrite raw xref rows.
 
 **PDF/A decisions (both made once, on the input, at the top of
 `try_optimize`).** `pdfa` (`fonts::pdfa_declined`): any PDF/A claim the
-output will carry makes every structural and re-encoding pass decline, with
-two lossless exemptions: the JBIG2 re-store (ignores `pdfa`) and the final
-re-deflate, which under `pdfa` still re-deflates page content streams and
-nothing else.
+output will carry makes these passes decline: the legacy-filter transcode,
+form flattening, the content minifier, font subsetting, Type1 → Type1C
+conversion, Type1C merges and hint stripping, the JPEG Huffman re-table and
+the row-filter choice. The final re-deflate under `pdfa` re-deflates page
+content streams and nothing else. The JBIG2 re-store ignores `pdfa`. The
+passes that take no `pdfa` argument run on PDF/A files as on any other:
+the dedup passes, the image downsampling and requantization planners
+(`plan_replacement`), JPX conversion and gray collapse when their flags are
+on, the opt-in strips, and packing (except under `pdfa1`).
 `pdfa1` (`fonts::pdfa1_kept`): the catalog XMP claims `pdfaid:part` = 1
 (element or attribute spelling, any prefix bound to the PDF/A id
 namespace) and `--strip-metadata` is off. It changes two things and
@@ -185,29 +206,31 @@ unchanged: a PDF/A-1 rewrite that is not strictly smaller ships the input.
 
 ## Source layout
 
+Line counts are `wc -l` at `4e85845` and include each module's unit tests.
+
 | File | Lines | What lives there |
 |---|---|---|
-| `src/lib.rs` | ~9K | The orchestrator: `OptimizeOptions`, placement walk, the `plan_*` family, `try_optimize`, the fail-safe boundary, and the bulk of tests |
-| `src/fonts.rs` | ~3.4K | Font subsetting + Type1→CFF conversion |
-| `src/type1.rs` | ~2K | Type1 interpreter |
-| `src/jpeghuff.rs` | ~1.8K | Lossless Huffman-table re-encoder |
-| `src/forms.rs` | ~1.2K | Form flattening |
-| `src/cffhint.rs` | ~1K | Type2 hint stripping |
-| `src/cmyk.rs` | ~1K | CMYK/YCCK JPEG decode/resample/encode/verify + the shared JPEG frame-header reader |
-| `src/signatures.rs` | ~1K | Digital-signature detection (`SignatureInfo`/`SignatureKind` live here; re-exported from `lib.rs`) |
-| `src/reals.rs` | ~1K | Real-literal splice-back |
+| `src/lib.rs` | ~12.2K | The orchestrator: `OptimizeOptions`, placement walk, the `plan_*` family, `try_optimize`, the fail-safe boundary, the `fuzz_api` module (`fuzzing` feature only), and the bulk of tests |
+| `src/fonts.rs` | ~4.3K | Font subsetting + Type1→CFF conversion, and the PDF/A decisions (`pdfa_declined`, `pdfa1_kept`) |
+| `src/type1.rs` | ~2.1K | Type1 interpreter |
+| `src/jpeghuff.rs` | ~1.9K | Lossless Huffman-table re-encoder |
+| `src/serialize.rs` | ~1.9K | `save_document`: the header feature floor, both save paths + the xref-stream / `ObjStm` byte-level post-passes |
+| `src/bitonal.rs` | ~1.6K | Bitonal re-encodes: strict CCITT/Flate 1-bit decode, G4 and JBIG2 candidates, the never-larger choice |
+| `src/forms.rs` | ~1.3K | Form flattening |
+| `src/cffhint.rs` | ~1.1K | Type2 hint stripping |
+| `src/reals.rs` | ~1.1K | Real-literal splice-back |
+| `src/signatures.rs` | ~1.1K | Digital-signature detection (`SignatureInfo`/`SignatureKind` live here; re-exported from `lib.rs`) |
+| `src/cmyk.rs` | ~1.1K | CMYK/YCCK JPEG decode/resample/encode/verify + the shared JPEG frame-header reader |
+| `src/jbig2.rs` | ~1.0K | JBIG2 generic region: T.88 MQ arithmetic encoder/decoder, templates 0-3, TPGD, AT pixels, PDF embedded-stream framing and its strict decode-back parser |
 | `src/encodings.rs` | ~0.9K | Font encoding tables, generated mechanically from ISO 32000-1 Annex D.1/D.2 plus Adobe's BSD-3-Clause Adobe Glyph List, cross-checked against Python's `cp1252`/`mac_roman` (provenance in the module header) |
 | `src/cffmerge.rs` | ~0.8K | Type1C same-family union merges |
-| `src/bitonal.rs` | ~1.3K | Bitonal re-encodes: strict CCITT/Flate 1-bit decode, G4 and JBIG2 candidates, the never-larger choice |
-| `src/jbig2.rs` | ~0.9K | JBIG2 generic region: T.88 MQ arithmetic encoder/decoder, templates 0-3, TPGD, AT pixels, PDF embedded-stream framing and its strict decode-back parser |
-| `src/ccitt.rs` | ~0.6K | Strict CCITT G4 (T.6) decoder with `/EncodedByteAlign` support: own 2D line coding and bit positioning over the `fax` code tables (plus a fuzzing/test-only byte-aligned encoder) |
-| `src/truetype.rs` | ~0.7K | TrueType subset cmap synthesis |
-| `src/serialize.rs` | ~0.6K | `save_document`: both save paths + the xref-stream / `ObjStm` byte-level post-passes |
-| `src/classify.rs` | ~0.5K | Line-art guard and the `--figure-dpi` figure classifier, with their tuning constants |
-| `src/main.rs` | ~0.4K | CLI (every flag maps 1:1 to an `OptimizeOptions` builder method) |
-| `src/deflate.rs` | ~0.2K | Deflate/inflate backends, the capped inflate, PNG row-filter codec |
+| `src/truetype.rs` | ~0.8K | TrueType subset cmap synthesis |
+| `src/classify.rs` | ~0.7K | Line-art guard, the `--figure-dpi` figure classifier and the flat-ink mask test (D-M4), with their tuning constants |
 | `src/legacy.rs` | ~0.7K | Legacy-filter → Flate transcode: chain/parms rules, strict ASCII85/ASCIIHex/RunLength decoders |
+| `src/main.rs` | ~0.7K | CLI (every flag maps 1:1 to an `OptimizeOptions` builder method) and the atomic `--force` write |
+| `src/ccitt.rs` | ~0.6K | Strict CCITT G4 (T.6) decoder with `/EncodedByteAlign` support: own 2D line coding and bit positioning over the `fax` code tables (plus a fuzzing/test-only byte-aligned encoder) |
 | `src/lzw.rs` | ~0.4K | Strict, capped `/LZWDecode` decoder (EarlyChange 0/1) |
+| `src/deflate.rs` | ~0.2K | Deflate/inflate backends, the capped inflate, PNG row-filter codec |
 
 `try_optimize` and the `plan_*` family deliberately stay together in `lib.rs`:
 they are one pipeline, and the pass ordering above is the reason.
@@ -264,15 +287,42 @@ The suite is the best documentation of the invariants. Key groups:
 - The `figure_metrics_separate_charts_from_photos_and_line_art` /
   `line_art_metrics_*` tests — the classifier calibration
 
+## Fuzzing
+
+`fuzz/` is a cargo-fuzz harness (local only, no CI job; how to seed and run
+it is in `fuzz/README.md`). Thirteen targets:
+
+- Whole pipeline: `optimize` (defaults), `optimize_all` (every opt-in pass
+  on), `optimize_nopack` (defaults with `--no-pack-object-streams`, so
+  lopdf's classic writer runs on every input; also checks the trailer keys
+  and the header version read back from the rewrite).
+- Focused, through `picamatl::fuzz_api` (the `fuzzing` feature):
+  `jpeghuff`, `type1`, `cff`, `cff_font`, `truetype`, `deflate`, `content`,
+  `lzw` (all four legacy decoders), `jbig2` (decode gate + encoder round
+  trip) and `ccitt` (the strict G4 decoder, differential against the
+  `fax`-based path, plus byte-aligned round trips).
+
+The other three `[[bin]]`s in `fuzz/Cargo.toml` (`extract_seeds`,
+`jbig2_seeds`, `xref_seeds`, under `fuzz/tools/`) build seed corpora; they
+are not targets.
+
 ## Reproducing benchmarks
 
 - `scripts/bench-full.sh` — five-lane matrix (lossless/lossy/kitchen/gs/
-  gs-custom) over the corpus; prints per-file paragraphs.
+  gs-custom) over the corpus; prints per-file paragraphs. Its kitchen lane
+  is the consolidated-table kitchen sink in the README (every opt-in flag,
+  `--flatten-forms` and `--deflate-backend zopfli` included); its "lossy"
+  lane is that minus `--strip-accessibility` and `--flatten-forms`.
 - `scripts/bench-vs-gs.sh` — fixture vs Ghostscript.
+- `scripts/forms-vs-gs.sh` and `scripts/forms-verify.py` — the form
+  fixtures and the filled dynamic XFA form, and the page-render comparison
+  against the original.
 - NASA TM-20210010291: input re-downloadable from
-  [ntrs.nasa.gov](https://ntrs.nasa.gov/citations/20210010291). Defaults →
-  4,443,883 B (73.6%); `--figure-dpi 195` → 5,404,689 B (67.8%);
-  `--target-dpi 0` → 15,654,875 B (93.2%, pixel-exact).
+  [ntrs.nasa.gov](https://ntrs.nasa.gov/citations/20210010291). At
+  `4e85845` (2026-11-17): defaults → 4,297,986 B (25.6% of input, 74.4%
+  saved); `--figure-dpi 195` → 5,258,830 B (31.3%); `--target-dpi 0` →
+  15,587,943 B (92.8%, no image resampled). The commands and every other
+  number are in `docs/hunts/docs-refresh-notes.md`.
 
 ## Maintenance notes
 

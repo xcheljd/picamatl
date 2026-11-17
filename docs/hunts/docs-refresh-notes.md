@@ -75,7 +75,11 @@ wiki, total):
 
 Consolidated kitchen sink, all 16 files: 11,882,097 B of 56,196,624
 (21.1%); gs forced 29,541,711 (52.6%). Smaller than gs on 14 of 16; the
-two exceptions are the dynamic XFA forms.
+two exceptions are the dynamic XFA forms. Against gs `/ebook` (22,797,444
+B, 40.6%): lossless defaults (21,562,045 B, 38.4%) are smaller on 7 of 16,
+the kitchen sink on 12 of 16 (not arxiv-attention 957,557 vs 216,743,
+cmyk-jpeg 11,919 vs 8,398, or the two dynamic XFA forms). Lossless
+defaults are smaller than gs forced on 9 of 16.
 
 Forms: irs-w2 defaults 1,369,502; `--flatten-forms` 229,153; kitchen +
 flatten 124,220; gs `/ebook` 183,761. Page renders vs the original at 150
