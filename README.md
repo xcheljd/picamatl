@@ -645,7 +645,7 @@ The full corpus — both earlier sweeps plus the XFA fixtures added with
 | wiki-pdf | 2,196,261 B | 22.7% | 205.3%⁴ | 🏆 picamatl |
 | xfa_filled (dynamic) | 3,023,968 B | 10.4% | 0.2%³ | not comparable³ |
 | xfa_issue14315 (dynamic) | 11,568 B | 52.6% | 28.8%³ | not comparable³ |
-| **TOTAL** | **56,196,624 B** | **21.1%** | 52.6% | 🏆 **picamatl** |
+| **TOTAL** | **56,196,624 B** | **21.1%** | 52.6%⁴ | 🏆 **picamatl** |
 
 ¹ `--allow-lossy --strip-accessibility --strip-metadata --strip-private-data
 --convert-type1 --strip-hinting --recompress-bitonal-images
@@ -657,15 +657,19 @@ filled form data is destroyed. picamatl declines the XFA model (no static
 fallback), compresses everything else, and keeps the data, so the two
 results are not comparable.
 ⁴ Ghostscript 10.08.0's output is larger than the input on the two
-Chrome-printed Wikipedia files; 10.07.1 gave 37.1% and 65.8% with the same
+Chrome-printed Wikipedia files, and on wiki-pdf it prints "Cannot use
+DeviceIndependentColor for a Blending colour space" while writing it;
+10.07.1 gave 37.1% and 65.8% with the same
 command in August 2026. Without those two files the totals are 20.9%
 (picamatl) and 41.8% (gs).
 
 Reading the consolidated matrix:
 
-- **Every non-dynamic-XFA file is a picamatl win.** Total: **21.1% of input
-  vs gs's 52.6%** across the 56 MB corpus (20.9% vs 41.8% without the two
-  files of footnote 4) while preserving form data and provenance unless
+- **Every non-dynamic-XFA file is a picamatl win.** Leaving out the two
+  files where Ghostscript 10.08.0's output grew (footnote 4), the total is
+  **20.9% of input vs gs's 41.8%**; with them it is 21.1% vs 52.6%, a gap
+  that flatters picamatl. picamatl also wins both of those files against
+  10.07.1's August numbers. Form data and provenance are kept unless
   explicitly stripped.
 - **irs-w2 flips with `--flatten-forms`**: 2.15 MB → 121 KB (5.8%) — and
   the flattened output keeps the filled values. The AcroForm flatten path is
